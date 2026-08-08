@@ -6,6 +6,8 @@
   <xacro:arg name="initial_positions_file" default="initial_positions.yaml" />
   <xacro:arg name="tcp_offset_xyz" default="0 0 0" />
   <xacro:arg name="tcp_offset_rpy" default="0 0 0" />
+  <xacro:arg name="camera_mount_xyz" default="0.05 -0.04 0.06" />
+  <xacro:arg name="camera_mount_rpy" default="0 0.3 0" />
 
   <xacro:property name="arm_type" value="$(arg arm_type)" />
   <xacro:property name="flange_link" value="${'link7' if arm_type == 'nero' else 'link6'}" />
@@ -31,6 +33,25 @@
     <parent link="${flange_link}" />
     <child link="tcp_link" />
     <origin xyz="$(arg tcp_offset_xyz)" rpy="$(arg tcp_offset_rpy)" />
+  </joint>
+
+  <!-- Nominal wrist camera mount. Replace with calibrated hand-eye extrinsics. -->
+  <link name="camera_link">
+    <visual>
+      <geometry><box size="0.09 0.025 0.025" /></geometry>
+      <material name="camera_black"><color rgba="0.1 0.1 0.1 1" /></material>
+    </visual>
+  </link>
+  <joint name="camera_mount_joint" type="fixed">
+    <parent link="${flange_link}" />
+    <child link="camera_link" />
+    <origin xyz="$(arg camera_mount_xyz)" rpy="$(arg camera_mount_rpy)" />
+  </joint>
+  <link name="camera_color_optical_frame" />
+  <joint name="camera_to_color_optical" type="fixed">
+    <parent link="camera_link" />
+    <child link="camera_color_optical_frame" />
+    <origin xyz="0 0 0" rpy="-1.5708 0 -1.5708" />
   </joint>
 
   <xacro:include filename="agx_arm.ros2_control.xacro" />

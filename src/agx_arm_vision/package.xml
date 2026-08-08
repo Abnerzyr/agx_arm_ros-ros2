@@ -1,0 +1,44 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://download.ros.org/schema/package_format3.xsd"?>
+<package format="3">
+  <name>agx_arm_vision</name>
+  <version>0.1.0</version>
+  <description>RealSense ArUco vision and grasp execution for the AGX Nero arm.</description>
+  <maintainer email="s1@todo.todo">s1</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <depend>rclpy</depend>
+  <depend>geometry_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>aruco_opencv_msgs</depend>
+  <depend>cv_bridge</depend>
+  <depend>image_geometry</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf2_geometry_msgs</depend>
+  <depend>moveit_msgs</depend>
+  <depend>shape_msgs</depend>
+  <depend>control_msgs</depend>
+  <depend>trajectory_msgs</depend>
+  <depend>builtin_interfaces</depend>
+  <depend>std_srvs</depend>
+  <depend>launch</depend>
+  <depend>launch_ros</depend>
+  <depend>ament_index_python</depend>
+
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>realsense2_camera</exec_depend>
+  <exec_depend>aruco_opencv</exec_depend>
+  <exec_depend>rqt_image_view</exec_depend>
+  <exec_depend>agx_arm_moveit</exec_depend>
+  <exec_depend>agx_arm_ctrl</exec_depend>
+
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

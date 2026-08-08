@@ -101,7 +101,7 @@ def _build_ros2_controllers_file(arm_type, effector_type, revo2_type, namespace)
 
 def _build_namespaced_moveit_rviz_config(package_path, namespace):
     """Generate a temporary RViz config with namespace-specific MoveGroup target."""
-    base_rviz = package_path / "config/moveit.rviz"
+    base_rviz = package_path / "config/default_config.rviz"
     content = base_rviz.read_text(encoding="utf-8")
 
     ns = namespace.strip("/")
