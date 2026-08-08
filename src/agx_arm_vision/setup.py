@@ -29,6 +29,7 @@ setup(
             'virtual_aruco_pub = agx_arm_vision.virtual_aruco_pub:main',
             'virtual_depth_camera = agx_arm_vision.virtual_depth_camera:main',
             'grasp_executor = agx_arm_vision.grasp_executor:main',
+            'manual_arm_move = agx_arm_vision.manual_arm_move:main',
         ],
     },
 )

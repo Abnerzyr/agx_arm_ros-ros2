@@ -16,18 +16,23 @@ from shape_msgs.msg import SolidPrimitive
 class MoveIt2:
     def __init__(
             self, node, base_link, end_effector, group_name,
-            action_name='/move_action', constrain_orientation=False):
+            action_name='/move_action', constrain_orientation=False,
+            position_tolerance=0.01, orientation_tolerance=0.15):
         self.node = node
         self.base_link = base_link
         self.end_effector = end_effector
         self.group_name = group_name
         self.constrain_orientation = constrain_orientation
+        self.position_tolerance = position_tolerance
+        self.orientation_tolerance = orientation_tolerance
         self.action = ActionClient(node, MoveGroup, action_name)
         self.done = False
         self.success = False
         self.plan_only = False
 
-    def move_to_pose(self, pose, frame_id=None, plan_only=False):
+    def move_to_pose(
+            self, pose, frame_id=None, plan_only=False,
+            velocity_scaling=0.2):
         frame_id = frame_id or self.base_link
         self.done = False
         self.success = False
@@ -38,8 +43,8 @@ class MoveIt2:
         goal.request.group_name = self.group_name
         goal.request.start_state.is_diff = True
         goal.request.allowed_planning_time = 3.0 if plan_only else 10.0
-        goal.request.max_velocity_scaling_factor = 0.2
-        goal.request.max_acceleration_scaling_factor = 0.2
+        goal.request.max_velocity_scaling_factor = velocity_scaling
+        goal.request.max_acceleration_scaling_factor = velocity_scaling
         goal.request.num_planning_attempts = 20
         goal.request.goal_constraints = [Constraints()]
         goal.planning_options.plan_only = plan_only
@@ -52,7 +57,7 @@ class MoveIt2:
         position.constraint_region = BoundingVolume()
         position.constraint_region.primitives = [SolidPrimitive(
             type=SolidPrimitive.SPHERE,
-            dimensions=[0.01],
+            dimensions=[self.position_tolerance],
         )]
         position.constraint_region.primitive_poses = [Pose()]
         position.constraint_region.primitive_poses[0].position = pose.position
@@ -65,9 +70,9 @@ class MoveIt2:
             orientation.header.frame_id = frame_id
             orientation.link_name = self.end_effector
             orientation.orientation = pose.orientation
-            orientation.absolute_x_axis_tolerance = 0.15
-            orientation.absolute_y_axis_tolerance = 0.15
-            orientation.absolute_z_axis_tolerance = 0.15
+            orientation.absolute_x_axis_tolerance = self.orientation_tolerance
+            orientation.absolute_y_axis_tolerance = self.orientation_tolerance
+            orientation.absolute_z_axis_tolerance = self.orientation_tolerance
             orientation.weight = 1.0
             goal.request.goal_constraints[0].orientation_constraints = [
                 orientation]
