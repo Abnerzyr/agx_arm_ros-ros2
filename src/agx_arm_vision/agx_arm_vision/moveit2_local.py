@@ -25,20 +25,26 @@ class MoveIt2:
         self.action = ActionClient(node, MoveGroup, action_name)
         self.done = False
         self.success = False
+        self.plan_only = False
 
-    def move_to_pose(self, pose, frame_id=None):
+    def move_to_pose(self, pose, frame_id=None, plan_only=False):
         frame_id = frame_id or self.base_link
         self.done = False
         self.success = False
+        self.plan_only = plan_only
 
         goal = MoveGroup.Goal()
         goal.request = MotionPlanRequest()
         goal.request.group_name = self.group_name
-        goal.request.allowed_planning_time = 10.0
+        goal.request.start_state.is_diff = True
+        goal.request.allowed_planning_time = 3.0 if plan_only else 10.0
         goal.request.max_velocity_scaling_factor = 0.2
         goal.request.max_acceleration_scaling_factor = 0.2
         goal.request.num_planning_attempts = 20
         goal.request.goal_constraints = [Constraints()]
+        goal.planning_options.plan_only = plan_only
+        goal.planning_options.planning_scene_diff.is_diff = True
+        goal.planning_options.planning_scene_diff.robot_state.is_diff = True
 
         position = PositionConstraint()
         position.header.frame_id = frame_id
@@ -87,8 +93,11 @@ class MoveIt2:
         result = future.result().result
         self.success = result.error_code.val == 1
         if not self.success:
-            self.node.get_logger().error(
-                f'MoveIt failed with code {result.error_code.val}')
+            message = f'MoveIt failed with code {result.error_code.val}'
+            if self.plan_only:
+                self.node.get_logger().warning(message)
+            else:
+                self.node.get_logger().error(message)
         self.done = True
 
     def is_done(self):

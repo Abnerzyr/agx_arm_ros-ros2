@@ -76,6 +76,10 @@ def build_moveit_config(context):
         "arm_type": arm_type,
         "effector_type": effector_type,
         "revo2_type": revo2_type,
+        "initial_positions_file": (
+            "nero_initial_positions.yaml"
+            if arm_type == "nero" else "initial_positions.yaml"
+        ),
         "tcp_offset_xyz": f"{tcp_offset[0]} {tcp_offset[1]} {tcp_offset[2]}",
         "tcp_offset_rpy": f"{tcp_offset[3]} {tcp_offset[4]} {tcp_offset[5]}",
     }

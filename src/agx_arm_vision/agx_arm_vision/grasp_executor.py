@@ -29,6 +29,7 @@ class GraspExecutor(Node):
         self.declare_parameter('gripper_open', 0.1)
         self.declare_parameter('gripper_closed', 0.0)
         self.declare_parameter('target_z_offset', 0.0)
+        self.declare_parameter('rejected_target_distance', 0.1)
         self.declare_parameter(
             'constrain_orientation', False)
 
@@ -38,6 +39,8 @@ class GraspExecutor(Node):
         self.gripper_open = self.get_parameter('gripper_open').value
         self.gripper_closed = self.get_parameter('gripper_closed').value
         self.target_z_offset = self.get_parameter('target_z_offset').value
+        self.rejected_target_distance = self.get_parameter(
+            'rejected_target_distance').value
         self.arm = MoveIt2(
             node=self,
             base_link=self.base_link,
@@ -56,9 +59,11 @@ class GraspExecutor(Node):
 
         self.state = self.IDLE
         self.triggered = False
+        self.validating_target = False
         self.gripper_done = True
         self.target_pose = None
         self.target_frame = None
+        self.rejected_target = None
 
         self.create_subscription(
             PoseStamped, '/grasp_pose', self.grasp_callback, 10)
@@ -66,8 +71,17 @@ class GraspExecutor(Node):
         self.get_logger().info('Nero seven-axis grasp executor ready')
 
     def grasp_callback(self, msg):
-        if self.state != self.IDLE:
+        if self.state != self.IDLE or self.validating_target:
             return
+        position = msg.pose.position
+        if self.rejected_target is not None:
+            frame, x, y, z = self.rejected_target
+            distance = ((position.x - x) ** 2 +
+                        (position.y - y) ** 2 +
+                        (position.z + self.target_z_offset - z) ** 2) ** 0.5
+            if (msg.header.frame_id == frame and
+                    distance < self.rejected_target_distance):
+                return
         self.target_pose = Pose(
             position=Point(
                 x=msg.pose.position.x,
@@ -82,10 +96,12 @@ class GraspExecutor(Node):
             ),
         )
         self.target_frame = msg.header.frame_id
-        self.state = self.OPEN_GRIPPER
+        self.validating_target = True
+        self.arm.move_to_pose(
+            self.target_pose, self.target_frame, plan_only=True)
         p = self.target_pose.position
         self.get_logger().info(
-            f'Accepted target in {self.target_frame}: '
+            f'Validating target in {self.target_frame}: '
             f'({p.x:.3f}, {p.y:.3f}, {p.z:.3f})')
 
     def send_gripper(self, position):
@@ -118,6 +134,25 @@ class GraspExecutor(Node):
         self.gripper_done = True
 
     def tick(self):
+        if self.state == self.IDLE and self.validating_target:
+            if not self.arm.is_done():
+                return
+            self.validating_target = False
+            if self.arm.success:
+                self.rejected_target = None
+                self.state = self.OPEN_GRIPPER
+                self.get_logger().info(
+                    'Target is reachable; starting grasp sequence')
+            else:
+                p = self.target_pose.position
+                self.rejected_target = (
+                    self.target_frame, p.x, p.y, p.z)
+                self.target_pose = None
+                self.target_frame = None
+                self.get_logger().warning(
+                    'Target is unreachable; remaining IDLE')
+            return
+
         if self.state == self.IDLE:
             return
         if self.state == self.OPEN_GRIPPER:

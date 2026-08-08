@@ -132,8 +132,8 @@ def generate_launch_description():
         DeclareLaunchArgument('use_real_arm', default_value='false'),
         DeclareLaunchArgument('use_real_camera', default_value='true'),
         DeclareLaunchArgument(
-            'execute_grasp', default_value='false',
-            description='Execute one grasp after a target is detected'),
+            'execute_grasp', default_value='true',
+            description='Execute grasp sequences for detected targets'),
         DeclareLaunchArgument('can_port', default_value='can0'),
         DeclareLaunchArgument('auto_enable', default_value='false'),
         DeclareLaunchArgument('speed_percent', default_value='10'),
