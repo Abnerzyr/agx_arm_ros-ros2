@@ -7,7 +7,7 @@
   <xacro:arg name="tcp_offset_xyz" default="0 0 0" />
   <xacro:arg name="tcp_offset_rpy" default="0 0 0" />
   <xacro:arg name="camera_mount_xyz" default="0.0585 0.0 -0.0225" />
-  <xacro:arg name="camera_mount_rpy" default="0 0 -1.5708" />
+  <xacro:arg name="camera_mount_rpy" default="-1.5708 0 -1.5708" />
 
   <xacro:property name="arm_type" value="$(arg arm_type)" />
   <xacro:property name="flange_link" value="${'link7' if arm_type == 'nero' else 'link6'}" />
@@ -51,7 +51,7 @@
   <joint name="camera_to_color_optical" type="fixed">
     <parent link="camera_link" />
     <child link="camera_color_optical_frame" />
-    <origin xyz="0.035 0 -0.055" rpy="0 0 0" />
+    <origin xyz="0.035 0 -0.055" rpy="-1.5708 0 -1.5708" />
   </joint>
 
   <xacro:include filename="agx_arm.ros2_control.xacro" />

@@ -31,6 +31,7 @@ setup(
             'grasp_executor = agx_arm_vision.grasp_executor:main',
             'manual_arm_move = agx_arm_vision.manual_arm_move:main',
             'manual_gripper = agx_arm_vision.manual_gripper:main',
+            'pointcloud_grasp = agx_arm_vision.pointcloud_grasp_node:main',
         ],
     },
 )
