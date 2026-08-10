@@ -20,11 +20,12 @@ class ManualArmMove(Node):
         self.declare_parameter('base_link', 'base_link')
         self.declare_parameter('end_effector_link', 'tcp_link')
         self.declare_parameter('arm_group', 'arm')
-        self.declare_parameter('max_step', 0.03)
+        self.declare_parameter('max_step', 0.05)
         self.declare_parameter('min_z', 0.10)
         self.declare_parameter('max_z', 0.90)
         self.declare_parameter('max_radius', 0.75)
         self.declare_parameter('velocity_scaling', 0.05)
+        self.declare_parameter('constrain_orientation', True)
 
         self.base_link = self.get_parameter('base_link').value
         self.end_effector = self.get_parameter('end_effector_link').value
@@ -39,9 +40,10 @@ class ManualArmMove(Node):
             base_link=self.base_link,
             end_effector=self.end_effector,
             group_name=self.get_parameter('arm_group').value,
-            constrain_orientation=True,
+            constrain_orientation=self.get_parameter(
+                'constrain_orientation').value,
             position_tolerance=0.002,
-            orientation_tolerance=0.05,
+            orientation_tolerance=0.1,
         )
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)

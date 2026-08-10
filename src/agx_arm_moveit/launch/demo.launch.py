@@ -162,6 +162,7 @@ def _build_moveit(context):
                 {
                     "status_topics": [
                         "arm_controller/follow_joint_trajectory/_action/status",
+                        "gripper_controller/follow_joint_trajectory/_action/status",
                     ],
                     "gate_service_name": LaunchConfiguration("control_gate_service"),
                 }

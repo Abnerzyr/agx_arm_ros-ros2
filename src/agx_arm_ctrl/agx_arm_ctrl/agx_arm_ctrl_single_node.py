@@ -91,6 +91,17 @@ class AgxArmRosNode(Node):
         ### services
         self._setup_services()
 
+        ### auto home
+        if self.get_parameter("auto_home").value:
+            home_joints = self.get_parameter("home_joints").value
+            self.get_logger().info(
+                f'Auto-homing to {home_joints}')
+            try:
+                self.agx_arm.move_j(home_joints)
+            except Exception as exc:
+                self.get_logger().error(
+                    f'Auto-home failed: {exc}')
+
         ### publisher thread
         self.publisher_thread = threading.Thread(target=self._publish_thread)
         self.publisher_thread.start()
@@ -110,6 +121,10 @@ class AgxArmRosNode(Node):
         self.declare_parameter("tcp_offset", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
         self.declare_parameter("gripper_default_effort", 1.0)
         self.declare_parameter("control_enabled", True)
+        self.declare_parameter("auto_home", True)
+        self.declare_parameter(
+            "home_joints",
+            [-0.001, -0.39, 0.009, 2.147, 0.016, 0.0, 0.903])
 
     def _load_parameters(self):
         self.can_port = self.get_parameter("can_port").value
@@ -200,6 +215,16 @@ class AgxArmRosNode(Node):
             )
         else:
             firmware = None
+            # V111: CAN push may not be active yet; try enable with set_normal_mode first
+            if self.is_nero and hasattr(self.agx_arm, 'set_normal_mode'):
+                self.get_logger().info('Trying enable with set_normal_mode...')
+                start = time.time()
+                while time.time() - start < self.enable_timeout:
+                    self.agx_arm.set_normal_mode()
+                    if self.agx_arm.enable():
+                        break
+                    time.sleep(0.01)
+
             start_time = time.time()
             while time.time() - start_time < self.enable_timeout:
                 firmware = self.agx_arm.get_firmware()
@@ -208,7 +233,9 @@ class AgxArmRosNode(Node):
                 time.sleep(0.005)
 
             if not firmware:
-                self.get_logger().error("Failed to get firmware version")
+                self.get_logger().error(
+                    "Failed to get firmware version "
+                    "(check CAN connection and arm power)")
                 exit(1)
 
             firmware_version = firmware["software_version"]
@@ -244,6 +271,16 @@ class AgxArmRosNode(Node):
             )
             self.agx_arm = AgxArmFactory.create_arm(config)
             self.agx_arm.connect()
+
+            if self.is_nero and firmeware_version == NeroFW.V111:
+                start = time.time()
+                while time.time() - start < self.enable_timeout:
+                    self.agx_arm.set_normal_mode()
+                    if self.agx_arm.enable():
+                        self.get_logger().info(
+                            'Enabled with set_normal_mode (V111)')
+                        break
+                    time.sleep(0.01)
 
         if 0 < self.speed_percent <= 100:
             self.agx_arm.set_speed_percent(self.speed_percent)
