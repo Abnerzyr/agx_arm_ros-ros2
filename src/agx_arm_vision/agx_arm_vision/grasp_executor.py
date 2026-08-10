@@ -16,7 +16,8 @@ class GraspExecutor(Node):
     IDLE = 0
     OPEN_GRIPPER = 1
     MOVE_TO_TARGET = 2
-    CLOSE_GRIPPER = 3
+    WAIT_REACH = 3
+    CLOSE_GRIPPER = 4
 
     def __init__(self):
         super().__init__('grasp_executor')
@@ -30,6 +31,9 @@ class GraspExecutor(Node):
         self.declare_parameter('gripper_closed', 0.0)
         self.declare_parameter('target_z_offset', 0.0)
         self.declare_parameter('rejected_target_distance', 0.1)
+        self.declare_parameter('force_threshold', 1.0)
+        self.declare_parameter('reach_tolerance', 0.03)
+        self.declare_parameter('reach_timeout', 10.0)
         self.declare_parameter(
             'constrain_orientation', False)
 
@@ -41,6 +45,9 @@ class GraspExecutor(Node):
         self.target_z_offset = self.get_parameter('target_z_offset').value
         self.rejected_target_distance = self.get_parameter(
             'rejected_target_distance').value
+        self.force_threshold = self.get_parameter('force_threshold').value
+        self.reach_tolerance = self.get_parameter('reach_tolerance').value
+        self.reach_timeout = self.get_parameter('reach_timeout').value
         self.arm = MoveIt2(
             node=self,
             base_link=self.base_link,
@@ -67,6 +74,13 @@ class GraspExecutor(Node):
 
         self.create_subscription(
             PoseStamped, '/grasp_pose', self.grasp_callback, 10)
+        try:
+            from agx_arm_msgs.msg import GripperStatus
+            self.create_subscription(
+                GripperStatus, '/feedback/gripper_status',
+                self.gripper_feedback_cb, 10)
+        except ImportError:
+            self.get_logger().warning('GripperStatus import failed')
         self.create_timer(0.1, self.tick)
         self.get_logger().info('Nero seven-axis grasp executor ready')
 
@@ -126,12 +140,27 @@ class GraspExecutor(Node):
             self.get_logger().error('Gripper goal rejected')
             self.gripper_done = True
             return
+        self.grasp_goal_handle = goal_handle
         result_future = goal_handle.get_result_async()
         result_future.add_done_callback(self.gripper_result_response)
 
     def gripper_result_response(self, future):
         del future
         self.gripper_done = True
+        self.grasp_goal_handle = None
+
+    def gripper_feedback_cb(self, msg):
+        self.current_force = msg.force
+        if (self.state == self.CLOSE_GRIPPER
+                and self.triggered
+                and msg.force > self.force_threshold):
+            self.get_logger().info(
+                f'Object grasped! force={msg.force:.2f} N, '
+                f'width={msg.width:.3f} m')
+            if self.grasp_goal_handle is not None:
+                self.grasp_goal_handle.cancel_goal_async()
+                self.grasp_goal_handle = None
+            self.gripper_done = True
 
     def tick(self):
         if self.state == self.IDLE and self.validating_target:
@@ -139,7 +168,6 @@ class GraspExecutor(Node):
                 return
             self.validating_target = False
             if self.arm.success:
-                self.rejected_target = None
                 self.state = self.OPEN_GRIPPER
                 self.get_logger().info(
                     'Target is reachable; starting grasp sequence')
@@ -169,21 +197,59 @@ class GraspExecutor(Node):
                 self.triggered = True
             elif self.arm.is_done():
                 if self.arm.success:
-                    self.report_position_error()
-                    self.state = self.CLOSE_GRIPPER
+                    self.state = self.WAIT_REACH
+                    self.reach_wait_start = self.get_clock().now().nanoseconds * 1e-9
                 else:
                     self.get_logger().error('Arm motion failed')
                     self.state = self.IDLE
                 self.triggered = False
             return
+        if self.state == self.WAIT_REACH:
+            error = self._tcp_error()
+            if error is not None and error <= self.reach_tolerance:
+                self.get_logger().info(
+                    f'TCP reached target (error={error:.4f} m)')
+                self.state = self.CLOSE_GRIPPER
+                return
+            elapsed = (
+                self.get_clock().now().nanoseconds * 1e-9
+                - self.reach_wait_start)
+            if elapsed > self.reach_timeout:
+                self.get_logger().warning(
+                    f'TCP reach timeout ({self.reach_timeout:.1f}s), '
+                    f'error={error}')
+                self.state = self.IDLE
+            return
         if self.state == self.CLOSE_GRIPPER:
             if not self.triggered:
+                self.current_force = 0.0
                 self.send_gripper(self.gripper_closed)
                 self.triggered = True
             elif self.gripper_done:
-                self.get_logger().info('Grasp sequence completed')
+                if self.current_force > self.force_threshold:
+                    self.get_logger().info(
+                        'Grasp sequence completed (object held)')
+                else:
+                    self.get_logger().info(
+                        'Grasp sequence completed (nothing grasped)')
                 self.state = self.IDLE
                 self.triggered = False
+
+    def _tcp_error(self):
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.target_frame,
+                self.end_effector,
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=1.0),
+            )
+        except TransformException:
+            return None
+        actual = transform.transform.translation
+        target = self.target_pose.position
+        return ((actual.x - target.x) ** 2 +
+                (actual.y - target.y) ** 2 +
+                (actual.z - target.z) ** 2) ** 0.5
 
     def report_position_error(self):
         try:

@@ -1,5 +1,4 @@
 #!/bin/bash
-set -e
 cd /home/s1/tiaozhanbei/agx_arm_ros-ros2
 source install/setup.bash
 
@@ -68,7 +67,7 @@ ros2 launch agx_arm_ctrl start_single_agx_arm_moveit.launch.py \
   can_port:=$CAN_PORT \
   arm_type:=nero \
   effector_type:=agx_gripper \
-  auto_enable:=false \
+  auto_enable:=true \
   auto_control_gate:=true \
   speed_percent:=5 \
   fw_version:=v111 \
@@ -78,6 +77,15 @@ MOVEIT_PID=$!
 
 echo "=== Waiting for MoveIt ... ==="
 sleep 10
+echo "=== Verifying controllers ==="
+for i in $(seq 1 10); do
+    if ros2 action list 2>/dev/null | grep -q gripper; then
+        echo "  controllers ready"
+        break
+    fi
+    echo "  waiting for controllers... ($i)"
+    sleep 2
+done
 
 echo "=== Starting camera ==="
 ros2 run realsense2_camera realsense2_camera_node \
@@ -95,6 +103,19 @@ ros2 run aruco_opencv aruco_tracker_autostart \
   -p marker_size:=0.05 &
 ARUCO_PID=$!
 
+sleep 3
+
+echo "=== Starting vision + grasp ==="
+ros2 run agx_arm_vision vision_grasp_node \
+  --ros-args -p target_marker_id:=-1 &>/tmp/nero_vision.log &
+VISION_PID=$!
+echo "  vision_grasp_node PID=$VISION_PID"
+sleep 2
+ros2 run agx_arm_vision grasp_executor \
+  --ros-args -p force_threshold:=1.5 &>/tmp/nero_grasp.log &
+EXEC_PID=$!
+echo "  grasp_executor PID=$EXEC_PID"
+
 echo "=== All started ==="
-echo "CAN=$CAN_PORT  MoveIt PID=$MOVEIT_PID  Camera PID=$CAM_PID  ArUco PID=$ARUCO_PID"
+echo "CAN=$CAN_PORT  MoveIt=$MOVEIT_PID  Cam=$CAM_PID  ArUco=$ARUCO_PID  Vision=$VISION_PID  Exec=$EXEC_PID"
 wait

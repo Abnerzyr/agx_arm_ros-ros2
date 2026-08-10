@@ -81,11 +81,16 @@ class VisionGraspNode(Node):
         return float(value) / 1000.0
 
     def aruco_callback(self, msg):
-        marker = next(
-            (item for item in msg.markers
-             if item.marker_id == self.target_marker_id),
-            None,
-        )
+        if not msg.markers:
+            return
+        if self.target_marker_id >= 0:
+            marker = next(
+                (item for item in msg.markers
+                 if item.marker_id == self.target_marker_id),
+                None,
+            )
+        else:
+            marker = msg.markers[0]
         if marker is None:
             return
 
@@ -142,7 +147,7 @@ class VisionGraspNode(Node):
         self.grasp_pub.publish(base_pose)
 
         self.log_count += 1
-        if self.log_count % 30 == 1:
+        if self.log_count % 30 == 1 or True:
             p = base_pose.pose.position
             self.get_logger().info(
                 f'ArUco {marker.marker_id} in {self.base_frame}: '
