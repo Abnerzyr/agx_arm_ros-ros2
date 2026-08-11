@@ -35,6 +35,7 @@ setup(
             'pointcloud_grasp = agx_arm_vision.pointcloud_grasp_node:main',
             'ggcnn_grasp = agx_arm_vision.ggcnn_grasp_node:main',
             'grconvnet_grasp = agx_arm_vision.grconvnet_grasp_node:main',
+            'yolo_grasp = agx_arm_vision.yolo_grasp_node:main',
         ],
     },
 )

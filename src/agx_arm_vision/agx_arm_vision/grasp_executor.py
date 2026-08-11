@@ -6,6 +6,8 @@ from control_msgs.action import FollowJointTrajectory
 from geometry_msgs.msg import Point, Pose, PoseStamped, Quaternion
 from rclpy.action import ActionClient
 from rclpy.node import Node
+from sensor_msgs.msg import JointState
+from std_msgs.msg import Empty as EmptyMsg
 from tf2_ros import Buffer, TransformException, TransformListener
 from trajectory_msgs.msg import JointTrajectoryPoint
 
@@ -18,6 +20,8 @@ class GraspExecutor(Node):
     MOVE_TO_TARGET = 2
     WAIT_REACH = 3
     CLOSE_GRIPPER = 4
+    MOVE_HOME = 5
+    WAIT_RELEASE = 6
 
     def __init__(self):
         super().__init__('grasp_executor')
@@ -31,11 +35,11 @@ class GraspExecutor(Node):
         self.declare_parameter('gripper_closed', 0.0)
         self.declare_parameter('target_z_offset', 0.0)
         self.declare_parameter('rejected_target_distance', 0.1)
-        self.declare_parameter('force_threshold', 1.0)
+        self.declare_parameter('force_threshold', 1.5)
         self.declare_parameter('reach_tolerance', 0.03)
         self.declare_parameter('reach_timeout', 10.0)
         self.declare_parameter(
-            'constrain_orientation', False)
+            'constrain_orientation', True)
 
         self.base_link = self.get_parameter('base_link').value
         self.end_effector = self.get_parameter('end_effector_link').value
@@ -71,9 +75,20 @@ class GraspExecutor(Node):
         self.target_pose = None
         self.target_frame = None
         self.rejected_target = None
+        self.grasp_goal_handle = None
+        self.current_force = 0.0
+        self.reach_wait_start = 0.0
+        self.stored_pose = None
+        self.stored_frame = None
+        self.move_j_pub = self.create_publisher(
+            JointState, '/control/move_j', 10)
 
         self.create_subscription(
             PoseStamped, '/grasp_pose', self.grasp_callback, 10)
+        self.create_subscription(
+            EmptyMsg, '/manual_grasp_start', self.manual_start_cb, 10)
+        self.create_subscription(
+            EmptyMsg, '/manual_release', self.manual_release_cb, 10)
         try:
             from agx_arm_msgs.msg import GripperStatus
             self.create_subscription(
@@ -82,21 +97,13 @@ class GraspExecutor(Node):
         except ImportError:
             self.get_logger().warning('GripperStatus import failed')
         self.create_timer(0.1, self.tick)
+        self._init_timer = self.create_timer(0.5, self._init_open)
         self.get_logger().info('Nero seven-axis grasp executor ready')
 
     def grasp_callback(self, msg):
-        if self.state != self.IDLE or self.validating_target:
+        if self.state != self.IDLE:
             return
-        position = msg.pose.position
-        if self.rejected_target is not None:
-            frame, x, y, z = self.rejected_target
-            distance = ((position.x - x) ** 2 +
-                        (position.y - y) ** 2 +
-                        (position.z + self.target_z_offset - z) ** 2) ** 0.5
-            if (msg.header.frame_id == frame and
-                    distance < self.rejected_target_distance):
-                return
-        self.target_pose = Pose(
+        self.stored_pose = Pose(
             position=Point(
                 x=msg.pose.position.x,
                 y=msg.pose.position.y,
@@ -109,14 +116,36 @@ class GraspExecutor(Node):
                 w=msg.pose.orientation.w,
             ),
         )
-        self.target_frame = msg.header.frame_id
+        self.stored_frame = msg.header.frame_id
+        self.get_logger().info(
+            f'Target stored: ({msg.pose.position.x:.3f}, '
+            f'{msg.pose.position.y:.3f}, '
+            f'{msg.pose.position.z:.3f}). '
+            f'Waiting for /manual_grasp_start')
+
+    def manual_start_cb(self, msg):
+        del msg
+        if self.state != self.IDLE or self.stored_pose is None:
+            self.get_logger().warning(
+                'Not ready for manual grasp start')
+            return
+        self.target_pose = self.stored_pose
+        self.target_frame = self.stored_frame
         self.validating_target = True
         self.arm.move_to_pose(
             self.target_pose, self.target_frame, plan_only=True)
         p = self.target_pose.position
         self.get_logger().info(
-            f'Validating target in {self.target_frame}: '
+            f'Manual grasp triggered, validating: '
             f'({p.x:.3f}, {p.y:.3f}, {p.z:.3f})')
+
+    def manual_release_cb(self, msg):
+        del msg
+        if self.state != self.WAIT_RELEASE:
+            return
+        self.get_logger().info('Manual release triggered')
+        self.state = self.OPEN_GRIPPER
+        self.triggered = False
 
     def send_gripper(self, position):
         self.gripper_done = False
@@ -232,8 +261,30 @@ class GraspExecutor(Node):
                 else:
                     self.get_logger().info(
                         'Grasp sequence completed (nothing grasped)')
-                self.state = self.IDLE
+                self.state = self.MOVE_HOME
                 self.triggered = False
+            return
+        if self.state == self.MOVE_HOME:
+            if not self.triggered:
+                msg = JointState()
+                msg.name = ['joint1', 'joint2', 'joint3', 'joint4',
+                            'joint5', 'joint6', 'joint7']
+                msg.position = [-0.001, -0.39, 0.009, 2.147, 0.016, 0.0, 0.903]
+                self.move_j_pub.publish(msg)
+                self.get_logger().info('Moving to home position')
+                self.triggered = True
+            else:
+                self.state = self.WAIT_RELEASE
+                self.triggered = False
+                self.get_logger().info(
+                    'At home. Send /manual_release to open gripper')
+            return
+        if self.state == self.WAIT_RELEASE:
+            return
+
+    def _init_open(self):
+        self.send_gripper(self.gripper_open)
+        self._init_timer.cancel()
 
     def _tcp_error(self):
         try:

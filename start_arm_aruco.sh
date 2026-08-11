@@ -110,10 +110,15 @@ ARUCO_PID=$!
 sleep 3
 
 echo "=== All started (ArUco) ==="
-echo "CAN=$CAN_PORT  MoveIt=$MOVEIT_PID  Cam=$CAM_PID  ArUco=$ARUCO_PID"
+echo "CAN=$CAN_PORT  MoveIt=$MOVEIT_PID  Cam=$CAM_PID  ArUco=$ARUCO_PID  Grasp=$GRASP_PID"
 echo ""
+
+echo "=== Starting grasp executor ==="
+ros2 run agx_arm_vision grasp_executor &>/tmp/grasp.log &
+GRASP_PID=$!
+echo "  grasp_executor PID=$GRASP_PID"
+
 echo "Manual commands:"
 echo "  ros2 run agx_arm_vision vision_grasp_node --ros-args -p target_marker_id:=-1 &>/tmp/aruco.log &"
-echo "  ros2 run agx_arm_vision grasp_executor --ros-args -p force_threshold:=1.5 -p constrain_orientation:=true &>/tmp/grasp.log &"
 echo "  ros2 service call /move_home std_srvs/srv/Empty"
 wait
