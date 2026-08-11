@@ -17,7 +17,7 @@ class MoveIt2:
     def __init__(
             self, node, base_link, end_effector, group_name,
             action_name='/move_action', constrain_orientation=False,
-            position_tolerance=0.01, orientation_tolerance=0.15):
+            position_tolerance=0.01, orientation_tolerance=0.10):
         self.node = node
         self.base_link = base_link
         self.end_effector = end_effector
@@ -42,7 +42,7 @@ class MoveIt2:
         goal.request = MotionPlanRequest()
         goal.request.group_name = self.group_name
         goal.request.start_state.is_diff = True
-        goal.request.allowed_planning_time = 3.0 if plan_only else 10.0
+        goal.request.allowed_planning_time = 5.0 if plan_only else 3.0
         goal.request.max_velocity_scaling_factor = velocity_scaling
         goal.request.max_acceleration_scaling_factor = velocity_scaling
         goal.request.num_planning_attempts = 20

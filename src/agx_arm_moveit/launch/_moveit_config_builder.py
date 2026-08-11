@@ -110,4 +110,20 @@ def build_moveit_config(context):
             "joint5", "joint6", "joint7",
         ]
 
+    moveit_config.planning_pipelines["ompl"].update({
+        "arm": {
+            "default_planner_config": "RRTstar",
+            "planner_configs": {
+                "RRTstar": {
+                    "type": "geometric::RRTstar",
+                    "range": 0.3,
+                    "goal_bias": 0.05,
+                    "delay_collision_checking": 1,
+                },
+            },
+        },
+        "simplify_solutions": True,
+        "path_tolerance": 0.05,
+    })
+
     return moveit_config
