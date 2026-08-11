@@ -60,6 +60,9 @@ pkill -9 -f rviz2 2>/dev/null || true
 pkill -9 -f agx_arm_ctrl_single 2>/dev/null || true
 pkill -9 -f realsense2_camera 2>/dev/null || true
 pkill -9 -f aruco_tracker 2>/dev/null || true
+pkill -9 -f pointcloud_grasp 2>/dev/null || true
+pkill -9 -f grasp_executor 2>/dev/null || true
+pkill -9 -f vision_grasp_node 2>/dev/null || true
 sleep 1
 
 echo "=== Launching MoveIt + Arm ($CAN_PORT) ==="
@@ -95,27 +98,11 @@ CAM_PID=$!
 
 sleep 3
 
-echo "=== Starting ArUco ==="
-ros2 run aruco_opencv aruco_tracker_autostart \
-  --ros-args \
-  -p cam_base_topic:=/camera/camera/color/image_raw \
-  -p marker_dict:=4X4_50 \
-  -p marker_size:=0.05 &
-ARUCO_PID=$!
-
-sleep 3
-
-echo "=== Starting vision + grasp ==="
-ros2 run agx_arm_vision vision_grasp_node \
-  --ros-args -p target_marker_id:=-1 &>/tmp/nero_vision.log &
-VISION_PID=$!
-echo "  vision_grasp_node PID=$VISION_PID"
-sleep 2
-ros2 run agx_arm_vision grasp_executor \
-  --ros-args -p force_threshold:=1.5 &>/tmp/nero_grasp.log &
-EXEC_PID=$!
-echo "  grasp_executor PID=$EXEC_PID"
-
-echo "=== All started ==="
-echo "CAN=$CAN_PORT  MoveIt=$MOVEIT_PID  Cam=$CAM_PID  ArUco=$ARUCO_PID  Vision=$VISION_PID  Exec=$EXEC_PID"
+echo "=== All started (PointCloud) ==="
+echo "CAN=$CAN_PORT  MoveIt=$MOVEIT_PID  Cam=$CAM_PID"
+echo ""
+echo "Manual commands:"
+echo "  ros2 run agx_arm_vision pointcloud_grasp &>/tmp/pc.log &"
+echo "  ros2 run agx_arm_vision grasp_executor --ros-args -p force_threshold:=1.5 -p constrain_orientation:=true &>/tmp/grasp.log &"
+echo "  ros2 service call /move_home std_srvs/srv/Empty"
 wait

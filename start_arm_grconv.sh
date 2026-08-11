@@ -60,7 +60,8 @@ pkill -9 -f rviz2 2>/dev/null || true
 pkill -9 -f agx_arm_ctrl_single 2>/dev/null || true
 pkill -9 -f realsense2_camera 2>/dev/null || true
 pkill -9 -f aruco_tracker 2>/dev/null || true
-pkill -9 -f pointcloud_grasp 2>/dev/null || true
+pkill -9 -f grconvnet_grasp 2>/dev/null || true
+sleep 1
 pkill -9 -f grasp_executor 2>/dev/null || true
 pkill -9 -f vision_grasp_node 2>/dev/null || true
 sleep 1
@@ -98,11 +99,17 @@ CAM_PID=$!
 
 sleep 3
 
-echo "=== All started ==="
-echo "CAN=$CAN_PORT  MoveIt=$MOVEIT_PID  Cam=$CAM_PID"
+echo "=== Starting GR-ConvNet ==="
+ros2 run agx_arm_vision grconvnet_grasp &>/tmp/grconv.log &
+GRCONV_PID=$!
+echo "  grconvnet_grasp PID=$GRCONV_PID"
+
+sleep 2
+
+echo "=== All started (GR-ConvNet) ==="
+echo "CAN=$CAN_PORT  MoveIt=$MOVEIT_PID  Cam=$CAM_PID  GRConv=$GRCONV_PID"
 echo ""
 echo "Manual commands:"
-echo "  ros2 run agx_arm_vision pointcloud_grasp &>/tmp/pc.log &"
 echo "  ros2 run agx_arm_vision grasp_executor --ros-args -p force_threshold:=1.5 -p constrain_orientation:=true &>/tmp/grasp.log &"
 echo "  ros2 service call /move_home std_srvs/srv/Empty"
 wait

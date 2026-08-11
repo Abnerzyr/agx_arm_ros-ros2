@@ -17,6 +17,7 @@ setup(
         (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
     ],
     install_requires=['setuptools'],
+    package_data={'agx_arm_vision': ['models/*.pt', 'models/*.py', 'models/grconvnet/*', 'models/inference/**/*.py']},
     zip_safe=True,
     maintainer='s1',
     maintainer_email='s1@todo.todo',
@@ -32,6 +33,8 @@ setup(
             'manual_arm_move = agx_arm_vision.manual_arm_move:main',
             'manual_gripper = agx_arm_vision.manual_gripper:main',
             'pointcloud_grasp = agx_arm_vision.pointcloud_grasp_node:main',
+            'ggcnn_grasp = agx_arm_vision.ggcnn_grasp_node:main',
+            'grconvnet_grasp = agx_arm_vision.grconvnet_grasp_node:main',
         ],
     },
 )
