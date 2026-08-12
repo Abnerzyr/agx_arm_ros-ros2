@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 
 import rclpy
-from builtin_interfaces.msg import Duration
-from control_msgs.action import FollowJointTrajectory
 from geometry_msgs.msg import Point, Pose, PoseStamped, Quaternion
-from rclpy.action import ActionClient
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Empty as EmptyMsg
 from tf2_ros import Buffer, TransformException, TransformListener
-from trajectory_msgs.msg import JointTrajectoryPoint
 
 from agx_arm_vision.moveit2_local import MoveIt2
 
@@ -60,11 +56,8 @@ class GraspExecutor(Node):
             constrain_orientation=self.get_parameter(
                 'constrain_orientation').value,
         )
-        self.gripper = ActionClient(
-            self,
-            FollowJointTrajectory,
-            self.get_parameter('gripper_action').value,
-        )
+        self.gripper_pub = self.create_publisher(
+            JointState, '/control/gripper_target', 1)
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
@@ -75,7 +68,6 @@ class GraspExecutor(Node):
         self.target_pose = None
         self.target_frame = None
         self.rejected_target = None
-        self.grasp_goal_handle = None
         self.current_force = 0.0
         self.reach_wait_start = 0.0
         self.reach_ok_count = 0
@@ -155,34 +147,15 @@ class GraspExecutor(Node):
 
     def send_gripper(self, position):
         self.gripper_done = False
-        if not self.gripper.wait_for_server(timeout_sec=3.0):
-            self.get_logger().error('Gripper trajectory action is unavailable')
-            self.gripper_done = True
-            return
+        msg = JointState()
+        msg.name = [self.gripper_joint]
+        msg.position = [float(position)]
+        self.gripper_pub.publish(msg)
+        self._gripper_timer = self.create_timer(1.5, self._on_gripper_done)
 
-        goal = FollowJointTrajectory.Goal()
-        goal.trajectory.joint_names = [self.gripper_joint]
-        point = JointTrajectoryPoint()
-        point.positions = [float(position)]
-        point.time_from_start = Duration(sec=1)
-        goal.trajectory.points = [point]
-        future = self.gripper.send_goal_async(goal)
-        future.add_done_callback(self.gripper_goal_response)
-
-    def gripper_goal_response(self, future):
-        goal_handle = future.result()
-        if goal_handle is None or not goal_handle.accepted:
-            self.get_logger().error('Gripper goal rejected')
-            self.gripper_done = True
-            return
-        self.grasp_goal_handle = goal_handle
-        result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(self.gripper_result_response)
-
-    def gripper_result_response(self, future):
-        del future
+    def _on_gripper_done(self):
         self.gripper_done = True
-        self.grasp_goal_handle = None
+        self._gripper_timer.cancel()
 
     def gripper_feedback_cb(self, msg):
         self.current_force = msg.force
@@ -192,9 +165,6 @@ class GraspExecutor(Node):
             self.get_logger().info(
                 f'Object grasped! force={msg.force:.2f} N, '
                 f'width={msg.width:.3f} m')
-            if self.grasp_goal_handle is not None:
-                self.grasp_goal_handle.cancel_goal_async()
-                self.grasp_goal_handle = None
             self.gripper_done = True
 
     def joint_feedback_cb(self, msg):
@@ -277,6 +247,12 @@ class GraspExecutor(Node):
                 self.send_gripper(self.gripper_closed)
                 self.triggered = True
             elif self.gripper_done:
+                if not hasattr(self, '_home_wait'):
+                    self._home_wait = 0
+                if self._home_wait < 5:
+                    self._home_wait += 1
+                    return
+                self._home_wait = 0
                 if self.current_force > self.force_threshold:
                     self.get_logger().info(
                         'Grasp sequence completed (object held)')

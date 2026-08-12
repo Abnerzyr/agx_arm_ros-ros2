@@ -383,6 +383,9 @@ class AgxArmRosNode(Node):
                 HandPositionTimeCmd, "control/hand_position_time", 
                 self._hand_position_time_cmd_callback, 1
             )
+        self.create_subscription(
+            JointState, "control/gripper_target",
+            self._gripper_target_callback, 1)
 
     def _setup_services(self):
         self.create_service(SetBool, "enable_agx_arm", self._enable_callback)
@@ -768,13 +771,20 @@ class AgxArmRosNode(Node):
             name: self._safe_get_value(msg.position, idx)
             for idx, name in enumerate(msg.name)
         }
-        joint_effort = {
-            name: self._safe_get_value(msg.effort, idx)
+        self._control_arm_joints(joint_pos)
+        self._control_hand_joints(joint_pos)
+
+    def _gripper_target_callback(self, msg: JointState):
+        if not self.agx_arm.is_ok():
+            return
+        if not self.enable_flag:
+            return
+
+        joint_pos = {
+            name: self._safe_get_value(msg.position, idx)
             for idx, name in enumerate(msg.name)
         }
-        self._control_arm_joints(joint_pos)
-        self._control_gripper_joint(joint_pos, joint_effort)
-        self._control_hand_joints(joint_pos)
+        self._control_gripper_joint(joint_pos, {})
 
     def _move_j_callback(self, msg: JointState):
         if not self._check_can_control():

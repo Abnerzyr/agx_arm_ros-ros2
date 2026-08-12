@@ -108,7 +108,7 @@ class PointCloudGraspNode(Node):
         uu = uu[valid]
         vv = vv[valid]
         x = (uu - cx) * z / fx
-        y = (cy - vv) * z / fy
+        y = (vv - cy) * z / fy
         return np.stack([x, y, z], axis=1)
 
     def _remove_plane(self, points):
@@ -180,7 +180,7 @@ class PointCloudGraspNode(Node):
         from scipy.spatial.transform import Rotation as R
         mat = R.from_quat([q.x, q.y, q.z, q.w]).as_matrix()
         p = (mat @ points.T).T + np.array([tx, ty, tz])
-        p[:, 1] = -p[:, 1]
+
         cloud = PointCloud2()
         cloud.header = hdr
         cloud.height = 1

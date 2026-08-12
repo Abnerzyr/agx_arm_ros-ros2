@@ -110,6 +110,9 @@ def build_moveit_config(context):
             "joint5", "joint6", "joint7",
         ]
 
+    moveit_config.trajectory_execution[
+        "allowed_start_tolerance"] = 0.05
+
     moveit_config.planning_pipelines["ompl"].update({
         "arm": {
             "default_planner_config": "RRTstar",
