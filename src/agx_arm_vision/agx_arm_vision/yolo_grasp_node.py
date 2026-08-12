@@ -246,7 +246,7 @@ class YoloGraspNode(Node):
         pose.pose.orientation.z = q[2]
         pose.pose.orientation.w = q[3]
         base_pose = do_transform_pose_stamped(pose, transform)
-        base_pose.pose.position.y = -base_pose.pose.position.y
+        base_pose.pose.position.y = base_pose.pose.position.y
         self.grasp_pub.publish(base_pose)
         self.get_logger().info(
             f'Grasp: ({base_pose.pose.position.x:.3f}, '

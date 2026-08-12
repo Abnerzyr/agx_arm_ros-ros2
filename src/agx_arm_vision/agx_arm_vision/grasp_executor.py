@@ -289,15 +289,15 @@ class GraspExecutor(Node):
         if self.state == self.MOVE_HOME:
             if not self.triggered:
                 self.arm.move_to_joints(
-                    [-0.001, -0.39, 0.009, 2.147, 0.016, 0.0, 0.903])
+                    [-1.751, -0.342, 1.656, 1.036, 0.360, 0.074, 1.570])
                 self.home_start_time = (
                     self.get_clock().now().nanoseconds * 1e-9)
                 self.get_logger().info('Moving to home position')
                 self.triggered = True
             elif self.arm.is_done():
                 if self.arm.success:
-                    home = [-0.001, -0.39, 0.009, 2.147,
-                            0.016, 0.0, 0.903]
+                    home = [-1.751, -0.342, 1.656, 1.036,
+                            0.360, 0.074, 1.570]
                     errors = [abs(self.current_joints[i] - home[i])
                               for i in range(7)]
                     if max(errors) < 0.05:

@@ -105,6 +105,12 @@ def generate_launch_description():
         description='Whether to accept /control/* commands.',
     )
 
+    home_joints_arg = DeclareLaunchArgument(
+        'home_joints',
+        default_value='[-1.751, -0.342, 1.656, 1.036, 0.360, 0.074, 1.570]',
+        description='Home joint angles (radians) for auto-homing.',
+    )
+
     # node
     agx_arm_node = Node(
         package='agx_arm_ctrl',
@@ -127,6 +133,7 @@ def generate_launch_description():
             'tcp_offset': LaunchConfiguration('tcp_offset'),
             'gripper_default_effort': LaunchConfiguration('gripper_default_effort'),
             'control_enabled': LaunchConfiguration('control_enabled'),
+            'home_joints': LaunchConfiguration('home_joints'),
         }],
         remappings=[
             # feedback topics
@@ -174,6 +181,7 @@ def generate_launch_description():
         tcp_offset_arg,
         gripper_default_effort_arg,
         control_enabled_arg,
+        home_joints_arg,
         # node
         agx_arm_node,
     ])

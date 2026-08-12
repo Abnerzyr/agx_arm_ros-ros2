@@ -1,5 +1,6 @@
 #!/bin/bash
 cd /home/s1/tiaozhanbei/agx_arm_ros-ros2
+rm -f /dev/shm/fastrtps_port* 2>/dev/null
 source install/setup.bash
 
 echo "=== Activating CAN ==="

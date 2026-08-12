@@ -126,6 +126,12 @@ def generate_launch_description():
         description='Open control gate only during MoveIt execute stage.',
     )
 
+    home_joints_arg = DeclareLaunchArgument(
+        'home_joints',
+        default_value='[-1.751, -0.342, 1.656, 1.036, 0.360, 0.074, 1.570]',
+        description='Home joint angles (radians) for auto-homing.',
+    )
+
     control_gate_service_arg = DeclareLaunchArgument(
         'control_gate_service',
         default_value='control_enable',
@@ -166,6 +172,7 @@ def generate_launch_description():
                 if_value='false',
                 else_value='true',
             ),
+            'home_joints': LaunchConfiguration('home_joints'),
         }.items(),
     )
 
@@ -212,6 +219,7 @@ def generate_launch_description():
         feedback_topic_arg,
         control_topic_arg,
         auto_control_gate_arg,
+        home_joints_arg,
         control_gate_service_arg,
         # launches
         agx_arm_launch,

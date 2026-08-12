@@ -1,5 +1,6 @@
 #!/bin/bash
 cd /home/s1/tiaozhanbei/agx_arm_ros-ros2
+rm -f /dev/shm/fastrtps_port* 2>/dev/null
 source install/setup.bash
 
 echo "=== Activating CAN ==="
@@ -76,6 +77,7 @@ ros2 launch agx_arm_ctrl start_single_agx_arm_moveit.launch.py \
   speed_percent:=5 \
   fw_version:=v111 \
   auto_home:=true \
+  home_joints:=[-0.001,-0.39,0.009,2.147,0.016,0.0,0.903] \
   follow:=true &
 MOVEIT_PID=$!
 
