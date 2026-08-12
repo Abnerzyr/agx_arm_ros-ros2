@@ -1,12 +1,12 @@
 initial_positions:
-  joint1: 0.0
-  joint2: -0.390
-  joint3: 0.009
-  joint4: 2.147
-  joint5: 0.0
-  joint6: 0.0
-  joint7: 0.903
-  gripper: 0.0
+  joint1: -1.751
+  joint2: -0.342
+  joint3: 1.656
+  joint4: 1.036
+  joint5: 0.360
+  joint6: 0.074
+  joint7: 1.570
+  gripper: 0.1
   left_thumb_metacarpal_joint: 0.0
   left_thumb_proximal_joint: 0.0
   left_index_proximal_joint: 0.0

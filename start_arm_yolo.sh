@@ -13,7 +13,7 @@ echo "=== Auto-detecting arm CAN port ==="
 CAN_PORT=""
 for iface in can0 can1; do
     HAS_ERR=$(ip -details link show $iface 2>/dev/null | grep -c 'BUS-OFF\|NO-CARRIER' || true)
-    if [ "$HAS_ERR" -gt 0 ]; then
+    if [ "$HAS_ERR" -gt 0 ]; thenAuto-homing to [-1.751, -0.342, 1.656, 1.036, 0.36, 0.074, 1.57]
         echo "  $iface: BUS-OFF/NO-CARRIER, skip"
         continue
     fi
@@ -93,7 +93,7 @@ for i in $(seq 1 10); do
 done
 
 echo "=== Starting RViz ==="
-rviz2 -d /home/s1/tiaozhanbei/agx_arm_ros-ros2/src/yolo_config.rviz &
+rviz2 -d /home/s1/tiaozhanbei/agx_arm_ros-ros2/src/config/yolo_config.rviz &
 RVIZ_PID=$!
 echo "  rviz PID=$RVIZ_PID"
 

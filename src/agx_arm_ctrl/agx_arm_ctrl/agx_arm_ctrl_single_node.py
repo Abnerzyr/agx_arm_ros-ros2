@@ -124,7 +124,7 @@ class AgxArmRosNode(Node):
         self.declare_parameter("auto_home", True)
         self.declare_parameter(
             "home_joints",
-            [-0.001, -0.39, 0.009, 2.147, 0.016, 0.0, 0.903])
+            [-1.751, -0.342, 1.656, 1.036, 0.360, 0.074, 1.570])
 
     def _load_parameters(self):
         self.can_port = self.get_parameter("can_port").value
@@ -140,6 +140,7 @@ class AgxArmRosNode(Node):
         self.tcp_offset = self.get_parameter("tcp_offset").value
         self.gripper_default_effort = self.get_parameter("gripper_default_effort").value
         self.control_enabled = self.get_parameter("control_enabled").value
+        self.home_joints = self.get_parameter("home_joints").value
 
         if self.fw_version and not re.fullmatch(r"v\d{3,4}", self.fw_version):
             self.get_logger().error(
@@ -383,6 +384,9 @@ class AgxArmRosNode(Node):
                 HandPositionTimeCmd, "control/hand_position_time", 
                 self._hand_position_time_cmd_callback, 1
             )
+        self.create_subscription(
+            JointState, "control/gripper_target",
+            self._gripper_target_callback, 1)
 
     def _setup_services(self):
         self.create_service(SetBool, "enable_agx_arm", self._enable_callback)
@@ -768,13 +772,18 @@ class AgxArmRosNode(Node):
             name: self._safe_get_value(msg.position, idx)
             for idx, name in enumerate(msg.name)
         }
-        joint_effort = {
-            name: self._safe_get_value(msg.effort, idx)
+        self._control_arm_joints(joint_pos)
+        self._control_hand_joints(joint_pos)
+
+    def _gripper_target_callback(self, msg: JointState):
+        if not self._check_can_control():
+            return
+
+        joint_pos = {
+            name: self._safe_get_value(msg.position, idx)
             for idx, name in enumerate(msg.name)
         }
-        self._control_arm_joints(joint_pos)
-        self._control_gripper_joint(joint_pos, joint_effort)
-        self._control_hand_joints(joint_pos)
+        self._control_gripper_joint(joint_pos, {})
 
     def _move_j_callback(self, msg: JointState):
         if not self._check_can_control():
@@ -945,9 +954,9 @@ class AgxArmRosNode(Node):
                         return response
                     
                 if self.is_mit_mode:
-                    self.agx_arm.move_js([0] * self.arm_joint_count)
+                    self.agx_arm.move_js(self.home_joints)
                 else:
-                    self.agx_arm.move_j([0] * self.arm_joint_count)
+                    self.agx_arm.move_j(self.home_joints)
                 if self._wait_motion_done():
                     self.get_logger().info("Agx_arm moved to home position successfully")
         except Exception as e:
@@ -998,15 +1007,15 @@ class AgxArmRosNode(Node):
                 return response
 
             if arm_status is not None and arm_status.msg.ctrl_mode == self.agx_arm.ARM_STATUS.CtrlMode.TEACHING_MODE:
-                self.agx_arm.move_js([0] * self.arm_joint_count)
+                self.agx_arm.move_js(self.home_joints)
                 time.sleep(2)
                 self.agx_arm.electronic_emergency_stop()
-                self.agx_arm.move_j([0] * self.arm_joint_count)
+                self.agx_arm.move_j(self.home_joints)
                 time.sleep(0.3)
                 self.agx_arm.reset()
                 time.sleep(0.5)
                 self._enable_arm(True)
-                self.agx_arm.move_j([0] * self.arm_joint_count)
+                self.agx_arm.move_j(self.home_joints)
                 self.get_logger().info("Exited teach mode successfully")
             else:
                 self.get_logger().info("Agx_arm is not in teach mode")

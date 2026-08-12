@@ -1,0 +1,10 @@
+# Nero arm previous home position (balanced pose - backup)
+# DO NOT use for runtime; new values are in respective configs
+balanced:
+  joint1: -0.001
+  joint2: -0.39
+  joint3: 0.009
+  joint4: 2.147
+  joint5: 0.016
+  joint6: 0.0
+  joint7: 0.903
