@@ -29,6 +29,7 @@ class GGCNNGraspNode(Node):
             'info_topic', '/camera/camera/color/camera_info')
         self.declare_parameter('model_path', '')
         self.declare_parameter('quality_threshold', 0.3)
+        self.quality_threshold = self.get_parameter('quality_threshold').value
 
         self.base_frame = self.get_parameter('base_frame').value
 
