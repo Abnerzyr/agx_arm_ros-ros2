@@ -5,6 +5,7 @@ from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import (
     BoundingVolume,
     Constraints,
+    JointConstraint,
     MotionPlanRequest,
     OrientationConstraint,
     PositionConstraint,
@@ -104,6 +105,40 @@ class MoveIt2:
             else:
                 self.node.get_logger().error(message)
         self.done = True
+
+    def move_to_joints(self, positions, velocity_scaling=0.2):
+        self.done = False
+        self.success = False
+        self.plan_only = False
+
+        goal = MoveGroup.Goal()
+        goal.request = MotionPlanRequest()
+        goal.request.group_name = self.group_name
+        goal.request.start_state.is_diff = True
+        goal.request.allowed_planning_time = 3.0
+        goal.request.max_velocity_scaling_factor = velocity_scaling
+        goal.request.max_acceleration_scaling_factor = velocity_scaling
+        goal.request.num_planning_attempts = 1
+        goal.request.goal_constraints = [Constraints()]
+
+        joint_names = ['joint1', 'joint2', 'joint3', 'joint4',
+                       'joint5', 'joint6', 'joint7']
+        for name, pos in zip(joint_names, positions):
+            jc = JointConstraint()
+            jc.joint_name = name
+            jc.position = float(pos)
+            jc.tolerance_above = 0.01
+            jc.tolerance_below = 0.01
+            jc.weight = 1.0
+            goal.request.goal_constraints[0].joint_constraints.append(jc)
+
+        if not self.action.wait_for_server(timeout_sec=5.0):
+            self.node.get_logger().error('/move_action is unavailable')
+            self.done = True
+            return
+
+        future = self.action.send_goal_async(goal)
+        future.add_done_callback(self.goal_response)
 
     def is_done(self):
         return self.done

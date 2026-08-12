@@ -78,6 +78,9 @@ class GraspExecutor(Node):
         self.grasp_goal_handle = None
         self.current_force = 0.0
         self.reach_wait_start = 0.0
+        self.reach_ok_count = 0
+        self.current_joints = [0.0] * 7
+        self.home_start_time = 0.0
         self.stored_pose = None
         self.stored_frame = None
         self.move_j_pub = self.create_publisher(
@@ -96,6 +99,9 @@ class GraspExecutor(Node):
                 self.gripper_feedback_cb, 10)
         except ImportError:
             self.get_logger().warning('GripperStatus import failed')
+        self.create_subscription(
+            JointState, '/feedback/joint_states',
+            self.joint_feedback_cb, 10)
         self.create_timer(0.1, self.tick)
         self._init_timer = self.create_timer(0.5, self._init_open)
         self.get_logger().info('Nero seven-axis grasp executor ready')
@@ -191,13 +197,22 @@ class GraspExecutor(Node):
                 self.grasp_goal_handle = None
             self.gripper_done = True
 
+    def joint_feedback_cb(self, msg):
+        names = ['joint1', 'joint2', 'joint3', 'joint4',
+                 'joint5', 'joint6', 'joint7']
+        for n, name in enumerate(names):
+            if name in msg.name:
+                idx = msg.name.index(name)
+                if idx < len(msg.position):
+                    self.current_joints[n] = msg.position[idx]
+
     def tick(self):
         if self.state == self.IDLE and self.validating_target:
             if not self.arm.is_done():
                 return
             self.validating_target = False
             if self.arm.success:
-                self.state = self.OPEN_GRIPPER
+                self.state = self.MOVE_TO_TARGET
                 self.get_logger().info(
                     'Target is reachable; starting grasp sequence')
             else:
@@ -217,7 +232,7 @@ class GraspExecutor(Node):
                 self.send_gripper(self.gripper_open)
                 self.triggered = True
             elif self.gripper_done:
-                self.state = self.MOVE_TO_TARGET
+                self.state = self.IDLE
                 self.triggered = False
             return
         if self.state == self.MOVE_TO_TARGET:
@@ -230,24 +245,31 @@ class GraspExecutor(Node):
                     self.reach_wait_start = self.get_clock().now().nanoseconds * 1e-9
                 else:
                     self.get_logger().error('Arm motion failed')
-                    self.state = self.IDLE
+                    self.state = self.MOVE_HOME
                 self.triggered = False
             return
         if self.state == self.WAIT_REACH:
+            elapsed = (
+                self.get_clock().now().nanoseconds * 1e-9
+                - self.reach_wait_start)
+            if elapsed < 1.0:
+                self.reach_ok_count = 0
+                return
             error = self._tcp_error()
             if error is not None and error <= self.reach_tolerance:
+                self.reach_ok_count += 1
+            else:
+                self.reach_ok_count = 0
+            if self.reach_ok_count >= 3:
                 self.get_logger().info(
                     f'TCP reached target (error={error:.4f} m)')
                 self.state = self.CLOSE_GRIPPER
                 return
-            elapsed = (
-                self.get_clock().now().nanoseconds * 1e-9
-                - self.reach_wait_start)
             if elapsed > self.reach_timeout:
                 self.get_logger().warning(
                     f'TCP reach timeout ({self.reach_timeout:.1f}s), '
                     f'error={error}')
-                self.state = self.IDLE
+                self.state = self.MOVE_HOME
             return
         if self.state == self.CLOSE_GRIPPER:
             if not self.triggered:
@@ -266,24 +288,43 @@ class GraspExecutor(Node):
             return
         if self.state == self.MOVE_HOME:
             if not self.triggered:
-                msg = JointState()
-                msg.name = ['joint1', 'joint2', 'joint3', 'joint4',
-                            'joint5', 'joint6', 'joint7']
-                msg.position = [-0.001, -0.39, 0.009, 2.147, 0.016, 0.0, 0.903]
-                self.move_j_pub.publish(msg)
+                self.arm.move_to_joints(
+                    [-0.001, -0.39, 0.009, 2.147, 0.016, 0.0, 0.903])
+                self.home_start_time = (
+                    self.get_clock().now().nanoseconds * 1e-9)
                 self.get_logger().info('Moving to home position')
                 self.triggered = True
-            else:
-                self.state = self.WAIT_RELEASE
-                self.triggered = False
-                self.get_logger().info(
-                    'At home. Send /manual_release to open gripper')
+            elif self.arm.is_done():
+                if self.arm.success:
+                    home = [-0.001, -0.39, 0.009, 2.147,
+                            0.016, 0.0, 0.903]
+                    errors = [abs(self.current_joints[i] - home[i])
+                              for i in range(7)]
+                    if max(errors) < 0.05:
+                        self.get_logger().info(
+                            'Reached home position')
+                        self.state = self.WAIT_RELEASE
+                        self.triggered = False
+                    else:
+                        elapsed = (self.get_clock().now().nanoseconds * 1e-9
+                                   - self.home_start_time)
+                        if elapsed > 15.0:
+                            self.get_logger().warning(
+                                'Home move timeout, '
+                                f'max error={max(errors):.3f} rad')
+                            self.state = self.WAIT_RELEASE
+                            self.triggered = False
+                else:
+                    self.get_logger().error('Home move failed')
+                    self.state = self.IDLE
+                    self.triggered = False
             return
         if self.state == self.WAIT_RELEASE:
             return
 
     def _init_open(self):
-        self.send_gripper(self.gripper_open)
+        self.state = self.OPEN_GRIPPER
+        self.triggered = False
         self._init_timer.cancel()
 
     def _tcp_error(self):
