@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import rclpy
 from geometry_msgs.msg import Pose
 from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import (
@@ -11,8 +12,10 @@ from moveit_msgs.msg import (
     JointConstraint,
     MotionPlanRequest,
     OrientationConstraint,
+    PlanningSceneComponents,
     PositionConstraint,
 )
+from moveit_msgs.srv import GetPlanningScene
 from rclpy.action import ActionClient
 from shape_msgs.msg import SolidPrimitive
 
@@ -30,18 +33,50 @@ class MoveIt2:
         self.position_tolerance = position_tolerance
         self.orientation_tolerance = orientation_tolerance
         self.action = ActionClient(node, MoveGroup, action_name)
+        self._scene_client = node.create_client(
+            GetPlanningScene, '/get_planning_scene')
         self.done = False
         self.success = False
         self.plan_only = False
 
+    def _fetch_allowed_collision_matrix(self):
+        if not self._scene_client.wait_for_service(timeout_sec=1.0):
+            self.node.get_logger().warning(
+                '/get_planning_scene service not available')
+            return None
+        req = GetPlanningScene.Request()
+        req.components.components = (
+            PlanningSceneComponents.ALLOWED_COLLISION_MATRIX)
+        future = self._scene_client.call_async(req)
+        rclpy.spin_until_future_complete(
+            self.node, future, timeout_sec=1.0)
+        if not future.done() or future.result() is None:
+            self.node.get_logger().warning(
+                'Failed to fetch current allowed collision matrix')
+            return None
+        src = future.result().scene.allowed_collision_matrix
+        acm = AllowedCollisionMatrix()
+        acm.entry_names = list(src.entry_names)
+        acm.entry_values = [
+            AllowedCollisionEntry(enabled=list(e.enabled))
+            for e in src.entry_values]
+        acm.default_entry_names = list(src.default_entry_names)
+        acm.default_entry_values = list(src.default_entry_values)
+        return acm
+
     def _apply_scene_diff(self, goal, collision_objects, allowed_links):
+        if isinstance(collision_objects, dict):
+            collision_objects = [collision_objects]
         if not collision_objects:
+            return
+        acm = self._fetch_allowed_collision_matrix()
+        if acm is None:
+            self.node.get_logger().warning(
+                'Skipping target collision protection for this plan')
             return
         scene = goal.planning_options.planning_scene_diff
         scene.is_diff = True
         scene.robot_state.is_diff = True
-        acm = AllowedCollisionMatrix()
-        acm.default_entry_names = list(allowed_links)
         for obj in collision_objects:
             co = CollisionObject()
             co.header.frame_id = self.base_link
@@ -60,9 +95,26 @@ class MoveIt2:
             co.primitive_poses[0].position.z = float(obj['position'][2])
             co.operation = CollisionObject.ADD
             scene.world.collision_objects.append(co)
-            acm.entry_names.append(str(obj['id']))
-            acm.entry_values.append(AllowedCollisionEntry(
-                enabled=[True] * len(allowed_links)))
+
+            for link in allowed_links:
+                if link not in acm.default_entry_names:
+                    acm.default_entry_names.append(link)
+                    acm.default_entry_values.append(False)
+                    for entry in acm.entry_values:
+                        entry.enabled.append(False)
+
+            enabled = [
+                True if link in allowed_links else False
+                for link in acm.default_entry_names]
+            obj_id = str(obj['id'])
+            if obj_id in acm.entry_names:
+                idx = acm.entry_names.index(obj_id)
+                acm.entry_values[idx] = AllowedCollisionEntry(
+                    enabled=enabled)
+            else:
+                acm.entry_names.append(obj_id)
+                acm.entry_values.append(AllowedCollisionEntry(
+                    enabled=enabled))
         scene.allowed_collision_matrix = acm
 
     def move_to_pose(

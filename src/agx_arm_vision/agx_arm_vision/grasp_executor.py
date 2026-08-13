@@ -3,8 +3,9 @@
 import rclpy
 from geometry_msgs.msg import Point, Pose, PoseStamped, Quaternion
 from rclpy.node import Node
-from sensor_msgs.msg import JointState
+from sensor_msgs.msg import JointState, PointCloud2
 from std_msgs.msg import Empty as EmptyMsg
+from std_srvs.srv import Empty as EmptySrv
 from tf2_ros import Buffer, TransformException, TransformListener
 from visualization_msgs.msg import Marker
 
@@ -36,10 +37,14 @@ class GraspExecutor(Node):
         self.declare_parameter('gripper_timeout', 3.0)
         self.declare_parameter('target_z_offset', 0.0)
         self.declare_parameter('require_target_box', True)
+        self.declare_parameter('box_wait_timeout', 1.0)
         self.declare_parameter('force_threshold', 1.5)
         self.declare_parameter('reach_tolerance', 0.03)
         self.declare_parameter('reach_timeout', 45.0)
         self.declare_parameter('velocity_scaling', 0.1)
+        self.declare_parameter('idle_clear_interval', 10.0)
+        self.declare_parameter('insert_settle', 0.3)
+        self.declare_parameter('rebuild_timeout', 2.5)
         self.declare_parameter(
             'constrain_orientation', True)
         self.declare_parameter(
@@ -54,10 +59,16 @@ class GraspExecutor(Node):
         self.target_z_offset = self.get_parameter('target_z_offset').value
         self.require_target_box = self.get_parameter(
             'require_target_box').value
+        self.box_wait_timeout = self.get_parameter(
+            'box_wait_timeout').value
         self.force_threshold = self.get_parameter('force_threshold').value
         self.reach_tolerance = self.get_parameter('reach_tolerance').value
         self.reach_timeout = self.get_parameter('reach_timeout').value
         self.velocity_scaling = self.get_parameter('velocity_scaling').value
+        self.idle_clear_interval = self.get_parameter(
+            'idle_clear_interval').value
+        self.insert_settle = self.get_parameter('insert_settle').value
+        self.rebuild_timeout = self.get_parameter('rebuild_timeout').value
         self.home_joints = self.get_parameter('home_joints').value
         self.arm = MoveIt2(
             node=self,
@@ -99,6 +110,13 @@ class GraspExecutor(Node):
         self.stored_frame = None
         self._latest_box = None
         self._latched_box = None
+        self._pending_pose = None
+        self._pending_time = 0.0
+        self._clear_client = self.create_client(EmptySrv, '/clear_octomap')
+        self._last_cloud_time = 0.0
+        self._last_idle_clear = self.get_clock().now().nanoseconds * 1e-9
+        self._clear_time = None
+        self._rebuild_done = False
         self.move_j_pub = self.create_publisher(
             JointState, '/control/move_j', 10)
 
@@ -106,6 +124,8 @@ class GraspExecutor(Node):
             PoseStamped, '/grasp_pose', self.grasp_callback, 10)
         self.create_subscription(
             Marker, '/yolo/target_box', self.target_box_callback, 10)
+        self.create_subscription(
+            PointCloud2, '/yolo/points_filtered', self.cloud_time_callback, 10)
         self.create_subscription(
             EmptyMsg, '/manual_grasp_start', self.manual_start_cb, 10)
         self.create_subscription(
@@ -141,6 +161,10 @@ class GraspExecutor(Node):
         self._latest_box = (
             self.get_clock().now().nanoseconds * 1e-9, box)
 
+    def cloud_time_callback(self, msg):
+        del msg
+        self._last_cloud_time = self.get_clock().now().nanoseconds * 1e-9
+
     def grasp_callback(self, msg):
         if self.state != self.IDLE:
             return
@@ -150,28 +174,31 @@ class GraspExecutor(Node):
                 and now - self._latest_box[0] <= self.BOX_PAIR_WINDOW):
             box = self._latest_box[1]
         if self.require_target_box and box is None:
-            self.get_logger().warning(
-                'No paired target box; grasp rejected')
+            self._pending_pose = msg
+            self._pending_time = now
             return
         self._latched_box = box
+        self._store_pose(msg.pose, msg.header.frame_id)
+
+    def _store_pose(self, pose, frame_id):
         self.stored_pose = Pose(
             position=Point(
-                x=msg.pose.position.x,
-                y=msg.pose.position.y,
-                z=msg.pose.position.z + self.target_z_offset,
+                x=pose.position.x,
+                y=pose.position.y,
+                z=pose.position.z + self.target_z_offset,
             ),
             orientation=Quaternion(
-                x=msg.pose.orientation.x,
-                y=msg.pose.orientation.y,
-                z=msg.pose.orientation.z,
-                w=msg.pose.orientation.w,
+                x=pose.orientation.x,
+                y=pose.orientation.y,
+                z=pose.orientation.z,
+                w=pose.orientation.w,
             ),
         )
-        self.stored_frame = msg.header.frame_id
+        self.stored_frame = frame_id
         self.get_logger().info(
-            f'Target stored: ({msg.pose.position.x:.3f}, '
-            f'{msg.pose.position.y:.3f}, '
-            f'{msg.pose.position.z:.3f}). '
+            f'Target stored: ({pose.position.x:.3f}, '
+            f'{pose.position.y:.3f}, '
+            f'{pose.position.z:.3f}). '
             f'Waiting for /manual_grasp_start')
 
     def manual_start_cb(self, msg):
@@ -185,6 +212,8 @@ class GraspExecutor(Node):
         self.validating_target = True
         self._validation_sent = False
         self._stable_wait_logged = False
+        self._rebuild_done = False
+        self._clear_time = None
         p = self.target_pose.position
         self.get_logger().info(
             f'Manual grasp triggered, validating: '
@@ -215,6 +244,23 @@ class GraspExecutor(Node):
         self.gripper.update(0.1)
 
         if self.state == self.IDLE and self.validating_target:
+            if not self._rebuild_done:
+                now_clear = self.get_clock().now().nanoseconds * 1e-9
+                if self._clear_time is None:
+                    self._clear_time = now_clear
+                    self._call_clear()
+                    return
+                if now_clear - self._clear_time > self.rebuild_timeout:
+                    self.get_logger().warning(
+                        'Timed out waiting for octomap rebuild; '
+                        'planning anyway')
+                    self._rebuild_done = True
+                elif (self._last_cloud_time > self._clear_time
+                        and now_clear - self._last_cloud_time
+                        >= self.insert_settle):
+                    self._rebuild_done = True
+                else:
+                    return
             if not self._validation_sent:
                 if not self._joints_stable():
                     self._log_stable_wait()
@@ -240,6 +286,26 @@ class GraspExecutor(Node):
             return
 
         if self.state == self.IDLE:
+            if self._pending_pose is not None:
+                now_pending = self.get_clock().now().nanoseconds * 1e-9
+                if (self._latest_box is not None
+                        and now_pending - self._latest_box[0]
+                        <= self.BOX_PAIR_WINDOW):
+                    self._latched_box = self._latest_box[1]
+                    self._store_pose(
+                        self._pending_pose.pose,
+                        self._pending_pose.header.frame_id)
+                    self._pending_pose = None
+                elif (now_pending - self._pending_time
+                        > self.box_wait_timeout):
+                    self.get_logger().warning(
+                        'No paired target box; grasp rejected')
+                    self._pending_pose = None
+            if self.idle_clear_interval > 0:
+                now_idle = self.get_clock().now().nanoseconds * 1e-9
+                if now_idle - self._last_idle_clear >= self.idle_clear_interval:
+                    self._last_idle_clear = now_idle
+                    self._call_clear()
             return
         if self.state == self.OPEN_GRIPPER:
             if not self.triggered:
@@ -351,6 +417,13 @@ class GraspExecutor(Node):
         self.state = self.OPEN_GRIPPER
         self.triggered = False
         self._init_timer.cancel()
+
+    def _call_clear(self):
+        if not self._clear_client.service_is_ready():
+            self.get_logger().warning('/clear_octomap service not ready')
+            return
+        self._clear_client.call_async(EmptySrv.Request())
+        self.get_logger().info('Octomap cleared')
 
     def _joints_stable(self):
         now = self.get_clock().now().nanoseconds * 1e-9

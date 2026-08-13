@@ -126,6 +126,7 @@ class YoloGraspNode(Node):
         results = self.yolo(rgb, verbose=False)
         boxes = results[0].boxes
         if boxes is None or len(boxes) == 0:
+            self._publish_cloud(depth)
             return
 
         det_img = results[0].plot()
@@ -153,6 +154,7 @@ class YoloGraspNode(Node):
                 best_box = (x1, y1, x2, y2)
 
         if best_box is None:
+            self._publish_cloud(depth)
             return
         x1, y1, x2, y2 = best_box
 
@@ -160,6 +162,11 @@ class YoloGraspNode(Node):
         cy = (y1 + y2) // 2
         bw = x2 - x1
         bh = y2 - y1
+        margin_px = max(
+            1, int(0.02 * self.model_cam.fx() / max(best_depth, 0.1)))
+        self._publish_cloud(depth, exclude_box=(
+            max(0, x1 - margin_px), max(0, y1 - margin_px),
+            min(w - 1, x2 + margin_px), min(h - 1, y2 + margin_px)))
         margin = int(max(bw, bh) * 0.2)
         crop_x1 = max(0, x1 - margin)
         crop_y1 = max(0, y1 - margin)
@@ -229,12 +236,6 @@ class YoloGraspNode(Node):
         x_pos = (cx - fcx) * z_center / fx
         y_pos = (cy - fcy) * z_center / fy
 
-        margin_px = max(1, int(0.02 * fx / z_center))
-        ex1 = max(0, x1 - margin_px)
-        ey1 = max(0, y1 - margin_px)
-        ex2 = min(w - 1, x2 + margin_px)
-        ey2 = min(h - 1, y2 + margin_px)
-
         box_d = depth[y1:y2, x1:x2]
         box_valid = box_d[(box_d > 0.05) & np.isfinite(box_d)]
         if len(box_valid) > 0:
@@ -248,7 +249,6 @@ class YoloGraspNode(Node):
         box_sy = bh * box_z / fy
         box_sz = max(d_max - d_min, 0.01) + 0.02
 
-        self._publish_cloud(depth, exclude_box=(ex1, ey1, ex2, ey2))
         self._publish(
             x_pos, y_pos, z_center, angle, grasp_width, best_score,
             box_center=(box_cx, box_cy, box_z),
@@ -279,13 +279,6 @@ class YoloGraspNode(Node):
         pose.pose.orientation.w = q[3]
         base_pose = do_transform_pose_stamped(pose, transform)
         base_pose.pose.position.y = base_pose.pose.position.y
-        self.grasp_pub.publish(base_pose)
-        self.get_logger().info(
-            f'Grasp: ({base_pose.pose.position.x:.3f}, '
-            f'{base_pose.pose.position.y:.3f}, '
-            f'{base_pose.pose.position.z:.3f}) '
-            f'angle={math.degrees(angle):.1f}° '
-            f'width={width:.3f}m score={score:.2f}')
 
         if box_center is not None and box_scale is not None:
             box_pose = PoseStamped()
@@ -308,6 +301,14 @@ class YoloGraspNode(Node):
             marker.scale.z = float(box_scale[2])
             marker.color = ColorRGBA(r=1.0, g=0.8, b=0.0, a=0.5)
             self.target_box_pub.publish(marker)
+
+        self.grasp_pub.publish(base_pose)
+        self.get_logger().info(
+            f'Grasp: ({base_pose.pose.position.x:.3f}, '
+            f'{base_pose.pose.position.y:.3f}, '
+            f'{base_pose.pose.position.z:.3f}) '
+            f'angle={math.degrees(angle):.1f}° '
+            f'width={width:.3f}m score={score:.2f}')
 
     def _publish_cloud(self, depth, exclude_box=None):
         try:
