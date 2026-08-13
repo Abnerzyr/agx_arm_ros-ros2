@@ -44,6 +44,8 @@ def _launch(context):
             "publish_monitored_planning_scene"
         ),
         "monitor_dynamics": False,
+        "octomap_resolution": 0.02,
+        "octomap_frame": "base_link",
     }
 
     move_group_params = [

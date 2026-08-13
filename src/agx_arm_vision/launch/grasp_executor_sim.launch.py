@@ -46,6 +46,9 @@ def generate_launch_description():
         package='agx_arm_vision',
         executable='grasp_executor',
         output='screen',
+        parameters=[{
+            'require_target_box': False,
+        }],
         remappings=[
             ('/feedback/joint_states', '/control/joint_states'),
         ],
@@ -77,14 +80,23 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('random_test')),
     )
 
+    virtual_obstacle = Node(
+        package='agx_arm_vision',
+        executable='virtual_obstacle_cloud',
+        output='screen',
+        condition=IfCondition(LaunchConfiguration('virtual_obstacle')),
+    )
+
     return LaunchDescription([
         DeclareLaunchArgument('simulate_object', default_value='true'),
         DeclareLaunchArgument('use_sim_rviz', default_value='true'),
         DeclareLaunchArgument('random_test', default_value='true'),
+        DeclareLaunchArgument('virtual_obstacle', default_value='true'),
         mock_arm,
         mock_gripper,
         executor,
         target_marker,
         rviz,
         random_flow,
+        virtual_obstacle,
     ])

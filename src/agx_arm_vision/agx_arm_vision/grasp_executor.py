@@ -6,6 +6,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Empty as EmptyMsg
 from tf2_ros import Buffer, TransformException, TransformListener
+from visualization_msgs.msg import Marker
 
 from agx_arm_vision.gripper_client import GripperClient
 from agx_arm_vision.moveit2_local import MoveIt2
@@ -20,6 +21,9 @@ class GraspExecutor(Node):
     MOVE_HOME = 5
     WAIT_RELEASE = 6
 
+    TARGET_ALLOWED_LINKS = ('tcp_link', 'gripper_base')
+    BOX_PAIR_WINDOW = 2.0
+
     def __init__(self):
         super().__init__('grasp_executor')
         self.declare_parameter('base_link', 'base_link')
@@ -31,6 +35,7 @@ class GraspExecutor(Node):
         self.declare_parameter('gripper_width_tolerance', 0.002)
         self.declare_parameter('gripper_timeout', 3.0)
         self.declare_parameter('target_z_offset', 0.0)
+        self.declare_parameter('require_target_box', True)
         self.declare_parameter('force_threshold', 1.5)
         self.declare_parameter('reach_tolerance', 0.03)
         self.declare_parameter('reach_timeout', 45.0)
@@ -47,6 +52,8 @@ class GraspExecutor(Node):
         self.gripper_open = self.get_parameter('gripper_open').value
         self.gripper_closed = self.get_parameter('gripper_closed').value
         self.target_z_offset = self.get_parameter('target_z_offset').value
+        self.require_target_box = self.get_parameter(
+            'require_target_box').value
         self.force_threshold = self.get_parameter('force_threshold').value
         self.reach_tolerance = self.get_parameter('reach_tolerance').value
         self.reach_timeout = self.get_parameter('reach_timeout').value
@@ -90,11 +97,15 @@ class GraspExecutor(Node):
         self.home_start_time = 0.0
         self.stored_pose = None
         self.stored_frame = None
+        self._latest_box = None
+        self._latched_box = None
         self.move_j_pub = self.create_publisher(
             JointState, '/control/move_j', 10)
 
         self.create_subscription(
             PoseStamped, '/grasp_pose', self.grasp_callback, 10)
+        self.create_subscription(
+            Marker, '/yolo/target_box', self.target_box_callback, 10)
         self.create_subscription(
             EmptyMsg, '/manual_grasp_start', self.manual_start_cb, 10)
         self.create_subscription(
@@ -113,9 +124,36 @@ class GraspExecutor(Node):
         self._init_timer = self.create_timer(0.5, self._init_open)
         self.get_logger().info('Nero seven-axis grasp executor ready')
 
+    def target_box_callback(self, msg):
+        box = {
+            'id': 'grasp_target',
+            'position': (
+                msg.pose.position.x,
+                msg.pose.position.y,
+                msg.pose.position.z,
+            ),
+            'size': (
+                msg.scale.x,
+                msg.scale.y,
+                msg.scale.z,
+            ),
+        }
+        self._latest_box = (
+            self.get_clock().now().nanoseconds * 1e-9, box)
+
     def grasp_callback(self, msg):
         if self.state != self.IDLE:
             return
+        now = self.get_clock().now().nanoseconds * 1e-9
+        box = None
+        if (self._latest_box is not None
+                and now - self._latest_box[0] <= self.BOX_PAIR_WINDOW):
+            box = self._latest_box[1]
+        if self.require_target_box and box is None:
+            self.get_logger().warning(
+                'No paired target box; grasp rejected')
+            return
+        self._latched_box = box
         self.stored_pose = Pose(
             position=Point(
                 x=msg.pose.position.x,
@@ -182,7 +220,9 @@ class GraspExecutor(Node):
                     self._log_stable_wait()
                     return
                 self.arm.move_to_pose(
-                    self.target_pose, self.target_frame, plan_only=True)
+                    self.target_pose, self.target_frame, plan_only=True,
+                    collision_objects=self._latched_box,
+                    allowed_links=self.TARGET_ALLOWED_LINKS)
                 self._validation_sent = True
                 return
             if not self.arm.is_done():
@@ -216,7 +256,9 @@ class GraspExecutor(Node):
                     return
                 self.arm.move_to_pose(
                     self.target_pose, self.target_frame,
-                    velocity_scaling=self.velocity_scaling)
+                    velocity_scaling=self.velocity_scaling,
+                    collision_objects=self._latched_box,
+                    allowed_links=self.TARGET_ALLOWED_LINKS)
                 self.triggered = True
             elif self.arm.is_done():
                 if self.arm.success:
@@ -271,7 +313,9 @@ class GraspExecutor(Node):
                     return
                 self.arm.move_to_joints(
                     self.home_joints,
-                    velocity_scaling=self.velocity_scaling)
+                    velocity_scaling=self.velocity_scaling,
+                    collision_objects=self._latched_box,
+                    allowed_links=self.TARGET_ALLOWED_LINKS)
                 self.home_start_time = (
                     self.get_clock().now().nanoseconds * 1e-9)
                 self.get_logger().info('Moving to home position')

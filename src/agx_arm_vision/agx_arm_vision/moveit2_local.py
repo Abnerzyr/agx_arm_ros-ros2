@@ -3,7 +3,10 @@
 from geometry_msgs.msg import Pose
 from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import (
+    AllowedCollisionEntry,
+    AllowedCollisionMatrix,
     BoundingVolume,
+    CollisionObject,
     Constraints,
     JointConstraint,
     MotionPlanRequest,
@@ -31,9 +34,41 @@ class MoveIt2:
         self.success = False
         self.plan_only = False
 
+    def _apply_scene_diff(self, goal, collision_objects, allowed_links):
+        if not collision_objects:
+            return
+        scene = goal.planning_options.planning_scene_diff
+        scene.is_diff = True
+        scene.robot_state.is_diff = True
+        acm = AllowedCollisionMatrix()
+        acm.default_entry_names = list(allowed_links)
+        for obj in collision_objects:
+            co = CollisionObject()
+            co.header.frame_id = self.base_link
+            co.id = str(obj['id'])
+            co.primitives = [SolidPrimitive(
+                type=SolidPrimitive.BOX,
+                dimensions=[
+                    float(obj['size'][0]),
+                    float(obj['size'][1]),
+                    float(obj['size'][2]),
+                ],
+            )]
+            co.primitive_poses = [Pose()]
+            co.primitive_poses[0].position.x = float(obj['position'][0])
+            co.primitive_poses[0].position.y = float(obj['position'][1])
+            co.primitive_poses[0].position.z = float(obj['position'][2])
+            co.operation = CollisionObject.ADD
+            scene.world.collision_objects.append(co)
+            acm.entry_names.append(str(obj['id']))
+            acm.entry_values.append(AllowedCollisionEntry(
+                enabled=[True] * len(allowed_links)))
+        scene.allowed_collision_matrix = acm
+
     def move_to_pose(
             self, pose, frame_id=None, plan_only=False,
-            velocity_scaling=0.2):
+            velocity_scaling=0.2,
+            collision_objects=None, allowed_links=None):
         frame_id = frame_id or self.base_link
         self.done = False
         self.success = False
@@ -51,6 +86,7 @@ class MoveIt2:
         goal.planning_options.plan_only = plan_only
         goal.planning_options.planning_scene_diff.is_diff = True
         goal.planning_options.planning_scene_diff.robot_state.is_diff = True
+        self._apply_scene_diff(goal, collision_objects, allowed_links)
 
         position = PositionConstraint()
         position.header.frame_id = frame_id
@@ -106,7 +142,9 @@ class MoveIt2:
                 self.node.get_logger().error(message)
         self.done = True
 
-    def move_to_joints(self, positions, velocity_scaling=0.2):
+    def move_to_joints(
+            self, positions, velocity_scaling=0.2,
+            collision_objects=None, allowed_links=None):
         self.done = False
         self.success = False
         self.plan_only = False
@@ -120,6 +158,7 @@ class MoveIt2:
         goal.request.max_acceleration_scaling_factor = velocity_scaling
         goal.request.num_planning_attempts = 1
         goal.request.goal_constraints = [Constraints()]
+        self._apply_scene_diff(goal, collision_objects, allowed_links)
 
         joint_names = ['joint1', 'joint2', 'joint3', 'joint4',
                        'joint5', 'joint6', 'joint7']

@@ -8,7 +8,7 @@ Panels:
         - /TF1/Frames1
         - /PointCloud21
       Splitter Ratio: 0.5
-    Tree Height: 176
+    Tree Height: 208
   - Class: rviz_common/Views
     Expanded:
       - /Current View1
@@ -249,7 +249,7 @@ Visualization Manager:
       Enabled: true
       Name: Grasp Target Marker
       Namespaces:
-        {}
+        grasp_target: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -334,6 +334,112 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /yolo/crop_rgb
       Value: true
+    - Class: moveit_rviz_plugin/PlanningScene
+      Enabled: true
+      Move Group Namespace: ""
+      Name: PlanningScene
+      Planning Scene Topic: /monitored_planning_scene
+      Robot Description: robot_description
+      Scene Geometry:
+        Scene Alpha: 0.8999999761581421
+        Scene Color: 50; 230; 50
+        Scene Display Time: 0.009999999776482582
+        Show Scene Geometry: true
+        Voxel Coloring: Z-Axis
+        Voxel Rendering: Occupied Voxels
+      Scene Robot:
+        Attached Body Color: 150; 50; 150
+        Links:
+          All Links Enabled: true
+          Expand Joint Details: false
+          Expand Link Details: false
+          Expand Tree: false
+          Link Tree Style: Links in Alphabetic Order
+          base_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          camera_color_optical_frame:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          camera_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          gripper_base:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          gripper_flange:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          gripper_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          gripper_link1:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          gripper_link2:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          link1:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          link2:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          link3:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          link4:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          link5:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          link6:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          link7:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          tcp_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          world:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+        Robot Alpha: 1
+        Show Robot Collision: false
+        Show Robot Visual: true
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
@@ -352,25 +458,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 1.67830491065979
+      Distance: 1.111015796661377
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: -0.10000000149011612
-        Y: 0.25
-        Z: 0.30000001192092896
+        X: -0.5883316397666931
+        Y: 0.014400696381926537
+        Z: 0.24187618494033813
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.07000018656253815
+      Pitch: 0.270000159740448
       Target Frame: base_link
       Value: Orbit (rviz_default_plugins)
-      Yaw: 3.8801767826080322
+      Yaw: 6.255180358886719
     Saved: ~
 Window Geometry:
   ArUco Debug:
@@ -384,7 +490,7 @@ Window Geometry:
   Hide Right Dock: false
   Image:
     collapsed: false
-  QMainWindow State: 000000ff00000000fd0000000100000000000001cb0000040efc020000000afb000000160041007200550063006f002000440065006200750067000000003d000000560000002800fffffffb000000100044006900730070006c006100790073010000003d000000ed000000c900fffffffb0000000a005600690065007700730100000130000000c0000000a400fffffffb0000000a0049006d00610067006501000001da0000006c0000000000000000fb0000000c00430061006d00650072006100000002ef000000c30000000000000000fb0000000c00430061006d0065007200610000000255000000940000000000000000fb0000000c00430061006d00650072006100000002c5000000ed0000000000000000fb00000018004400650074006500630074005f0049006d00610067006501000001f60000009b0000002800fffffffb0000001a005100750061006c006900740079005f0049006d0061006700650100000297000000c80000002800fffffffb0000000a0049006d0061006700650100000365000000e60000002800ffffff0000037f0000040e00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  QMainWindow State: 000000ff00000000fd0000000100000000000001cb0000040efc020000000afb000000160041007200550063006f002000440065006200750067000000003d000000560000002800fffffffb000000100044006900730070006c006100790073010000003d0000010d000000c900fffffffb0000000a005600690065007700730100000150000000db000000a400fffffffb0000000a0049006d00610067006501000002310000007a0000002800fffffffb0000000c00430061006d00650072006100000002ef000000c30000000000000000fb0000000c00430061006d0065007200610000000255000000940000000000000000fb0000000c00430061006d00650072006100000002c5000000ed0000000000000000fb00000018004400650074006500630074005f0049006d00610067006501000002b1000000b10000002800fffffffb0000001a005100750061006c006900740079005f0049006d0061006700650100000368000000e30000002800fffffffb0000000a0049006d0061006700650100000365000000e600000000000000000000037f0000040e00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Quality_Image:
     collapsed: false
   Views:

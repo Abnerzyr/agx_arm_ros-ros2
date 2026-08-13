@@ -40,6 +40,7 @@ setup(
             'mock_gripper = agx_arm_vision.mock_gripper:main',
             'grasp_target_marker = agx_arm_vision.grasp_target_marker:main',
             'random_grasp_flow = agx_arm_vision.random_grasp_flow_test:main',
+            'virtual_obstacle_cloud = agx_arm_vision.virtual_obstacle_cloud:main',
         ],
     },
 )

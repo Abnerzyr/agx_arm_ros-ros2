@@ -14,10 +14,11 @@ from rclpy.node import Node
 from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import CameraInfo, Image, PointCloud2, PointField
 from skimage.filters import gaussian
-from std_msgs.msg import Header
+from std_msgs.msg import ColorRGBA, Header
 from tf2_geometry_msgs import do_transform_pose_stamped
 from tf2_ros import Buffer, TransformException, TransformListener
 from ultralytics import YOLO
+from visualization_msgs.msg import Marker
 
 
 class YoloGraspNode(Node):
@@ -48,6 +49,7 @@ class YoloGraspNode(Node):
         self.depth_img = None
         self.rgb_img = None
         self.camera_info = None
+        self.depth_stamp = None
 
         pkg_dir = os.path.dirname(os.path.abspath(__file__))
         yolo_path = os.path.join(pkg_dir, 'models', 'yolov8s-worldv2.pt')
@@ -77,6 +79,10 @@ class YoloGraspNode(Node):
             Image, '/yolo/quality_map', 10)
         self.cloud_pub = self.create_publisher(
             PointCloud2, '/yolo/points', 10)
+        self.filtered_cloud_pub = self.create_publisher(
+            PointCloud2, '/yolo/points_filtered', 10)
+        self.target_box_pub = self.create_publisher(
+            Marker, '/yolo/target_box', 10)
 
         self.create_timer(0.5, self.process)
         self.get_logger().info('YOLO+Grasp node ready')
@@ -99,6 +105,7 @@ class YoloGraspNode(Node):
 
     def depth_callback(self, msg):
         self.depth_img = self.bridge.imgmsg_to_cv2(msg, 'passthrough')
+        self.depth_stamp = msg.header.stamp
 
     def rgb_callback(self, msg):
         self.rgb_img = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
@@ -222,10 +229,33 @@ class YoloGraspNode(Node):
         x_pos = (cx - fcx) * z_center / fx
         y_pos = (cy - fcy) * z_center / fy
 
-        self._publish_cloud(depth)
-        self._publish(x_pos, y_pos, z_center, angle, grasp_width, best_score)
+        margin_px = max(1, int(0.02 * fx / z_center))
+        ex1 = max(0, x1 - margin_px)
+        ey1 = max(0, y1 - margin_px)
+        ex2 = min(w - 1, x2 + margin_px)
+        ey2 = min(h - 1, y2 + margin_px)
 
-    def _publish(self, x, y, z, angle, width, score):
+        box_d = depth[y1:y2, x1:x2]
+        box_valid = box_d[(box_d > 0.05) & np.isfinite(box_d)]
+        if len(box_valid) > 0:
+            d_min, d_max = float(np.min(box_valid)), float(np.max(box_valid))
+        else:
+            d_min = d_max = float(z_center)
+        box_z = (d_min + d_max) / 2.0
+        box_cx = (cx - fcx) * box_z / fx
+        box_cy = (cy - fcy) * box_z / fy
+        box_sx = bw * box_z / fx
+        box_sy = bh * box_z / fy
+        box_sz = max(d_max - d_min, 0.01) + 0.02
+
+        self._publish_cloud(depth, exclude_box=(ex1, ey1, ex2, ey2))
+        self._publish(
+            x_pos, y_pos, z_center, angle, grasp_width, best_score,
+            box_center=(box_cx, box_cy, box_z),
+            box_scale=(box_sx, box_sy, box_sz))
+
+    def _publish(self, x, y, z, angle, width, score,
+                 box_center=None, box_scale=None):
         try:
             transform = self.tf_buffer.lookup_transform(
                 self.base_frame,
@@ -257,7 +287,29 @@ class YoloGraspNode(Node):
             f'angle={math.degrees(angle):.1f}° '
             f'width={width:.3f}m score={score:.2f}')
 
-    def _publish_cloud(self, depth):
+        if box_center is not None and box_scale is not None:
+            box_pose = PoseStamped()
+            box_pose.header.frame_id = self.CAMERA_OPTICAL_FRAME
+            box_pose.header.stamp = pose.header.stamp
+            box_pose.pose.position.x = float(box_center[0])
+            box_pose.pose.position.y = float(box_center[1])
+            box_pose.pose.position.z = float(box_center[2])
+            box_pose.pose.orientation.w = 1.0
+            base_box = do_transform_pose_stamped(box_pose, transform)
+            marker = Marker()
+            marker.header = base_box.header
+            marker.ns = 'grasp_target_box'
+            marker.id = 0
+            marker.type = Marker.CUBE
+            marker.action = Marker.ADD
+            marker.pose = base_box.pose
+            marker.scale.x = float(box_scale[0])
+            marker.scale.y = float(box_scale[1])
+            marker.scale.z = float(box_scale[2])
+            marker.color = ColorRGBA(r=1.0, g=0.8, b=0.0, a=0.5)
+            self.target_box_pub.publish(marker)
+
+    def _publish_cloud(self, depth, exclude_box=None):
         try:
             t = self.tf_buffer.lookup_transform(
                 self.base_frame,
@@ -268,19 +320,28 @@ class YoloGraspNode(Node):
         except TransformException:
             return
         h, w = depth.shape
-        fx = self.model_cam.fx()
-        fy = self.model_cam.fy()
-        fcx = self.model_cam.cx()
-        fcy = self.model_cam.cy()
         ds = 4
         u = np.arange(0, w, ds)
         v = np.arange(0, h, ds)
         uu, vv = np.meshgrid(u, v)
         z = depth[vv, uu]
         valid = (z > 0.05) & (z < 2.0) & np.isfinite(z)
-        z = z[valid]
-        uu = uu[valid]
-        vv = vv[valid]
+
+        self._publish_points(
+            self.cloud_pub, uu[valid], vv[valid], z[valid], t)
+
+        if exclude_box is not None:
+            ex1, ey1, ex2, ey2 = exclude_box
+            excluded = (uu >= ex1) & (uu <= ex2) & (vv >= ey1) & (vv <= ey2)
+            keep = valid & ~excluded
+            self._publish_points(
+                self.filtered_cloud_pub, uu[keep], vv[keep], z[keep], t)
+
+    def _publish_points(self, pub, uu, vv, z, t):
+        fx = self.model_cam.fx()
+        fy = self.model_cam.fy()
+        fcx = self.model_cam.cx()
+        fcy = self.model_cam.cy()
         xs = (uu - fcx) * z / fx
         ys = (vv - fcy) * z / fy
         points = np.stack([xs, ys, z], axis=1)
@@ -294,7 +355,10 @@ class YoloGraspNode(Node):
             p = p[idx]
         hdr = Header()
         hdr.frame_id = self.base_frame
-        hdr.stamp = self.get_clock().now().to_msg()
+        hdr.stamp = (
+            self.depth_stamp
+            if self.depth_stamp is not None
+            else self.get_clock().now().to_msg())
         cloud = PointCloud2()
         cloud.header = hdr
         cloud.height = 1
@@ -309,7 +373,7 @@ class YoloGraspNode(Node):
         cloud.is_bigendian = False
         cloud.is_dense = True
         cloud.data = p.astype(np.float32).tobytes()
-        self.cloud_pub.publish(cloud)
+        pub.publish(cloud)
 
     def _publish_quality(self, quality_np):
         q_min, q_max = quality_np.min(), quality_np.max()
