@@ -251,6 +251,12 @@ class GraspExecutor(Node):
                 self.send_gripper(self.gripper_closed)
                 self.triggered = True
             elif self.gripper_done:
+                if not hasattr(self, '_home_wait'):
+                    self._home_wait = 0
+                if self._home_wait < 5:
+                    self._home_wait += 1
+                    return
+                self._home_wait = 0
                 if self.current_force > self.force_threshold:
                     self.get_logger().info(
                         'Grasp sequence completed (object held)')

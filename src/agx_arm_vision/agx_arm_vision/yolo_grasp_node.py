@@ -218,7 +218,7 @@ class YoloGraspNode(Node):
         fcx = self.model_cam.cx()
         fcy = self.model_cam.cy()
         x_pos = (cx - fcx) * z_center / fx
-        y_pos = (fcy - cy) * z_center / fy
+        y_pos = (cy - fcy) * z_center / fy
 
         self._publish_cloud(depth)
         self._publish(x_pos, y_pos, z_center, angle, grasp_width, best_score)
@@ -246,7 +246,7 @@ class YoloGraspNode(Node):
         pose.pose.orientation.z = q[2]
         pose.pose.orientation.w = q[3]
         base_pose = do_transform_pose_stamped(pose, transform)
-        base_pose.pose.position.y = -base_pose.pose.position.y
+        base_pose.pose.position.y = base_pose.pose.position.y
         self.grasp_pub.publish(base_pose)
         self.get_logger().info(
             f'Grasp: ({base_pose.pose.position.x:.3f}, '
@@ -280,13 +280,13 @@ class YoloGraspNode(Node):
         uu = uu[valid]
         vv = vv[valid]
         xs = (uu - fcx) * z / fx
-        ys = (fcy - vv) * z / fy
+        ys = (vv - fcy) * z / fy
         points = np.stack([xs, ys, z], axis=1)
         q = t.transform.rotation
         mat = R.from_quat([q.x, q.y, q.z, q.w]).as_matrix()
         tx, ty, tz = t.transform.translation.x, t.transform.translation.y, t.transform.translation.z
         p = (mat @ points.T).T + np.array([tx, ty, tz])
-        p[:, 1] = -p[:, 1]
+
         if len(p) > 10000:
             idx = np.random.choice(len(p), 10000, replace=False)
             p = p[idx]

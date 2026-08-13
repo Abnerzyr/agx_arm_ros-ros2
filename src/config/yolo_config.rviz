@@ -8,7 +8,7 @@ Panels:
         - /TF1/Frames1
         - /PointCloud21
       Splitter Ratio: 0.5
-    Tree Height: 90
+    Tree Height: 123
   - Class: rviz_common/Views
     Expanded:
       - /Current View1
@@ -256,7 +256,7 @@ Visualization Manager:
       Color: 255; 255; 255
       Color Transformer: Intensity
       Decay Time: 0
-      Enabled: true
+      Enabled: false
       Invert Rainbow: false
       Max Color: 255; 255; 255
       Max Intensity: 4096
@@ -274,102 +274,16 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /pointcloud_grasp/objects
+        Value: /yolo/points
       Use Fixed Frame: true
       Use rainbow: true
-      Value: true
+      Value: false
     - Class: rviz_default_plugins/Image
       Enabled: true
       Max Value: 1
       Median window: 5
       Min Value: 0
-      Name: Image
-      Normalize Range: true
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /yolo/crop_rgb
-      Value: true
-    - Class: rviz_default_plugins/Camera
-      Enabled: false
-      Far Plane Distance: 100
-      Image Rendering: background and overlay
-      Name: Camera
-      Overlay Alpha: 0.5
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /yolo/detections
-      Value: false
-      Visibility:
-        ArUco Debug: true
-        Camera: true
-        Grasp Pose: true
-        Grid: true
-        Image: true
-        PointCloud2: true
-        RobotModel: true
-        TF: true
-        Value: true
-      Zoom Factor: 1
-    - Class: rviz_default_plugins/Camera
-      Enabled: false
-      Far Plane Distance: 100
-      Image Rendering: background and overlay
-      Name: Camera
-      Overlay Alpha: 0.5
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /yolo/quality_map
-      Value: false
-      Visibility:
-        ArUco Debug: true
-        Camera: true
-        Grasp Pose: true
-        Grid: true
-        Image: true
-        PointCloud2: true
-        RobotModel: true
-        TF: true
-        Value: true
-      Zoom Factor: 1
-    - Class: rviz_default_plugins/Camera
-      Enabled: false
-      Far Plane Distance: 100
-      Image Rendering: background and overlay
-      Name: Camera
-      Overlay Alpha: 0.5
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /yolo/detections
-      Value: false
-      Visibility:
-        ArUco Debug: true
-        Camera: true
-        Grasp Pose: true
-        Grid: true
-        Image: true
-        PointCloud2: true
-        RobotModel: true
-        TF: true
-        Value: true
-      Zoom Factor: 1
-    - Class: rviz_default_plugins/Image
-      Enabled: true
-      Max Value: 1
-      Median window: 5
-      Min Value: 0
-      Name: Image
+      Name: Detect_Image
       Normalize Range: true
       Topic:
         Depth: 5
@@ -383,7 +297,7 @@ Visualization Manager:
       Max Value: 1
       Median window: 5
       Min Value: 0
-      Name: Image
+      Name: Quality_Image
       Normalize Range: true
       Topic:
         Depth: 5
@@ -410,7 +324,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 1.542593240737915
+      Distance: 1.67830491065979
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -425,24 +339,24 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.4100000560283661
+      Pitch: 0.3600000739097595
       Target Frame: base_link
       Value: Orbit (rviz_default_plugins)
-      Yaw: 3.980177640914917
+      Yaw: 4.0401811599731445
     Saved: ~
 Window Geometry:
   ArUco Debug:
     collapsed: false
-  Camera:
+  Detect_Image:
     collapsed: false
   Displays:
     collapsed: false
   Height: 975
   Hide Left Dock: false
   Hide Right Dock: false
-  Image:
+  QMainWindow State: 000000ff00000000fd0000000100000000000001cb00000375fc0200000009fb000000160041007200550063006f002000440065006200750067000000003d000000560000002800fffffffb000000100044006900730070006c006100790073010000003d000000fe000000c900fffffffb0000000a005600690065007700730100000141000000d0000000a400fffffffb0000000a0049006d00610067006501000001da0000006c0000000000000000fb0000000c00430061006d00650072006100000002ef000000c30000000000000000fb0000000c00430061006d0065007200610000000255000000940000000000000000fb0000000c00430061006d00650072006100000002c5000000ed0000000000000000fb00000018004400650074006500630074005f0049006d0061006700650100000217000000af0000002800fffffffb0000001a005100750061006c006900740079005f0049006d00610067006501000002cc000000e60000002800ffffff000002df0000037500000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  Quality_Image:
     collapsed: false
-  QMainWindow State: 000000ff00000000fd0000000100000000000001cb00000375fc0200000009fb000000160041007200550063006f002000440065006200750067000000003d000000560000002800fffffffb000000100044006900730070006c006100790073010000003d000000dd000000c900fffffffb0000000a005600690065007700730100000120000000b4000000a400fffffffb0000000a0049006d00610067006501000001da0000006c0000002800fffffffb0000000c00430061006d00650072006100000002ef000000c30000002800fffffffb0000000c00430061006d0065007200610000000255000000940000002800fffffffb0000000c00430061006d00650072006100000002c5000000ed0000002800fffffffb0000000a0049006d006100670065010000024c000000980000002800fffffffb0000000a0049006d00610067006501000002ea000000c80000002800ffffff000002df0000037500000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Views:
     collapsed: false
   Width: 1200

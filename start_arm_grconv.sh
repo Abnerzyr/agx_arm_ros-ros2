@@ -1,5 +1,6 @@
 #!/bin/bash
 cd /home/s1/tiaozhanbei/agx_arm_ros-ros2
+rm -f /dev/shm/fastrtps_port* 2>/dev/null
 source install/setup.bash
 
 echo "=== Activating CAN ==="
@@ -52,6 +53,12 @@ if [ -z "$CAN_PORT" ]; then
     exit 1
 fi
 
+echo "=== Resetting CAN port state ==="
+sudo ip link set $CAN_PORT down 2>/dev/null || true
+sleep 1
+sudo ip link set $CAN_PORT up type can bitrate 1000000 2>/dev/null || true
+sleep 2
+
 echo "=== Killing old processes ==="
 pkill -f start_single_agx_arm_moveit 2>/dev/null || true
 pkill -9 -f move_group 2>/dev/null || true
@@ -90,8 +97,6 @@ for i in $(seq 1 10); do
     echo "  waiting for controllers... ($i)"
     sleep 2
 done
-
-echo "=== Starting camera ==="
 ros2 run realsense2_camera realsense2_camera_node \
   --ros-args -r __node:=camera -r __ns:=/camera \
   -p align_depth.enable:=true -p publish_tf:=false &

@@ -29,6 +29,7 @@ class GGCNNGraspNode(Node):
             'info_topic', '/camera/camera/color/camera_info')
         self.declare_parameter('model_path', '')
         self.declare_parameter('quality_threshold', 0.3)
+        self.quality_threshold = self.get_parameter('quality_threshold').value
 
         self.base_frame = self.get_parameter('base_frame').value
 
@@ -128,7 +129,7 @@ class GGCNNGraspNode(Node):
         cx = self.model_cam.cx()
         cy = self.model_cam.cy()
         x = (orig_u - cx) * z / fx
-        y = (cy - orig_v) * z / fy
+        y = (orig_v - cy) * z / fy
         self._publish(x, y, z, angle, grasp_width, best_score)
 
     def _publish(self, x, y, z, angle, width, score):
@@ -155,7 +156,7 @@ class GGCNNGraspNode(Node):
         pose.pose.orientation.z = q[2]
         pose.pose.orientation.w = q[3]
         base_pose = do_transform_pose_stamped(pose, transform)
-        base_pose.pose.position.y = -base_pose.pose.position.y
+        base_pose.pose.position.y = base_pose.pose.position.y
         self.grasp_pub.publish(base_pose)
         self.get_logger().info(
             f'Grasp: ({base_pose.pose.position.x:.3f}, '
@@ -189,7 +190,7 @@ class GGCNNGraspNode(Node):
         uu = uu[valid]
         vv = vv[valid]
         x = (uu - cx) * z / fx
-        y = (cy - vv) * z / fy
+        y = (vv - cy) * z / fy
         points = np.stack([x, y, z], axis=1)
         q = t.transform.rotation
         mat = R.from_quat([q.x, q.y, q.z, q.w]).as_matrix()
@@ -197,7 +198,7 @@ class GGCNNGraspNode(Node):
         ty = t.transform.translation.y
         tz = t.transform.translation.z
         p = (mat @ points.T).T + np.array([tx, ty, tz])
-        p[:, 1] = -p[:, 1]
+
         if len(p) > 10000:
             idx = np.random.choice(len(p), 10000, replace=False)
             p = p[idx]
