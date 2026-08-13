@@ -15,6 +15,7 @@ setup(
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
+        (os.path.join('share', package_name, 'rviz'), glob('rviz/*.rviz')),
     ],
     install_requires=['setuptools'],
     package_data={'agx_arm_vision': ['models/*.pt', 'models/*.py', 'models/grconvnet/*', 'models/inference/**/*.py']},
@@ -36,6 +37,8 @@ setup(
             'ggcnn_grasp = agx_arm_vision.ggcnn_grasp_node:main',
             'grconvnet_grasp = agx_arm_vision.grconvnet_grasp_node:main',
             'yolo_grasp = agx_arm_vision.yolo_grasp_node:main',
+            'mock_gripper = agx_arm_vision.mock_gripper:main',
+            'grasp_target_marker = agx_arm_vision.grasp_target_marker:main',
         ],
     },
 )

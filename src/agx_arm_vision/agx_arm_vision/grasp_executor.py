@@ -7,6 +7,7 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Empty as EmptyMsg
 from tf2_ros import Buffer, TransformException, TransformListener
 
+from agx_arm_vision.gripper_client import GripperClient
 from agx_arm_vision.moveit2_local import MoveIt2
 
 
@@ -24,13 +25,12 @@ class GraspExecutor(Node):
         self.declare_parameter('base_link', 'base_link')
         self.declare_parameter('end_effector_link', 'tcp_link')
         self.declare_parameter('arm_group', 'arm')
-        self.declare_parameter(
-            'gripper_action', '/gripper_controller/follow_joint_trajectory')
         self.declare_parameter('gripper_joint', 'gripper')
         self.declare_parameter('gripper_open', 0.1)
         self.declare_parameter('gripper_closed', 0.0)
+        self.declare_parameter('gripper_width_tolerance', 0.002)
+        self.declare_parameter('gripper_timeout', 3.0)
         self.declare_parameter('target_z_offset', 0.0)
-        self.declare_parameter('rejected_target_distance', 0.1)
         self.declare_parameter('force_threshold', 1.5)
         self.declare_parameter('reach_tolerance', 0.03)
         self.declare_parameter('reach_timeout', 10.0)
@@ -46,8 +46,6 @@ class GraspExecutor(Node):
         self.gripper_open = self.get_parameter('gripper_open').value
         self.gripper_closed = self.get_parameter('gripper_closed').value
         self.target_z_offset = self.get_parameter('target_z_offset').value
-        self.rejected_target_distance = self.get_parameter(
-            'rejected_target_distance').value
         self.force_threshold = self.get_parameter('force_threshold').value
         self.reach_tolerance = self.get_parameter('reach_tolerance').value
         self.reach_timeout = self.get_parameter('reach_timeout').value
@@ -60,19 +58,24 @@ class GraspExecutor(Node):
             constrain_orientation=self.get_parameter(
                 'constrain_orientation').value,
         )
-        self.gripper_pub = self.create_publisher(
-            JointState, '/control/gripper_target', 1)
+        self.gripper = GripperClient(
+            self,
+            joint_name=self.get_parameter('gripper_joint').value,
+            open_width=self.gripper_open,
+            closed_width=self.gripper_closed,
+            force_threshold=self.force_threshold,
+            width_tolerance=self.get_parameter(
+                'gripper_width_tolerance').value,
+            timeout=self.get_parameter('gripper_timeout').value,
+        )
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.state = self.IDLE
         self.triggered = False
         self.validating_target = False
-        self.gripper_done = True
         self.target_pose = None
         self.target_frame = None
-        self.rejected_target = None
-        self.current_force = 0.0
         self.reach_wait_start = 0.0
         self.reach_ok_count = 0
         self.current_joints = [0.0] * 7
@@ -149,27 +152,8 @@ class GraspExecutor(Node):
         self.state = self.OPEN_GRIPPER
         self.triggered = False
 
-    def send_gripper(self, position):
-        self.gripper_done = False
-        msg = JointState()
-        msg.name = [self.gripper_joint]
-        msg.position = [float(position)]
-        self.gripper_pub.publish(msg)
-        self._gripper_timer = self.create_timer(1.5, self._on_gripper_done)
-
-    def _on_gripper_done(self):
-        self.gripper_done = True
-        self._gripper_timer.cancel()
-
     def gripper_feedback_cb(self, msg):
-        self.current_force = msg.force
-        if (self.state == self.CLOSE_GRIPPER
-                and self.triggered
-                and msg.force > self.force_threshold):
-            self.get_logger().info(
-                f'Object grasped! force={msg.force:.2f} N, '
-                f'width={msg.width:.3f} m')
-            self.gripper_done = True
+        self.gripper.feedback(msg.width, msg.force)
 
     def joint_feedback_cb(self, msg):
         names = ['joint1', 'joint2', 'joint3', 'joint4',
@@ -181,6 +165,8 @@ class GraspExecutor(Node):
                     self.current_joints[n] = msg.position[idx]
 
     def tick(self):
+        self.gripper.update(0.1)
+
         if self.state == self.IDLE and self.validating_target:
             if not self.arm.is_done():
                 return
@@ -190,9 +176,6 @@ class GraspExecutor(Node):
                 self.get_logger().info(
                     'Target is reachable; starting grasp sequence')
             else:
-                p = self.target_pose.position
-                self.rejected_target = (
-                    self.target_frame, p.x, p.y, p.z)
                 self.target_pose = None
                 self.target_frame = None
                 self.get_logger().warning(
@@ -203,9 +186,9 @@ class GraspExecutor(Node):
             return
         if self.state == self.OPEN_GRIPPER:
             if not self.triggered:
-                self.send_gripper(self.gripper_open)
+                self.gripper.open()
                 self.triggered = True
-            elif self.gripper_done:
+            elif self.gripper.done:
                 self.state = self.IDLE
                 self.triggered = False
             return
@@ -247,17 +230,10 @@ class GraspExecutor(Node):
             return
         if self.state == self.CLOSE_GRIPPER:
             if not self.triggered:
-                self.current_force = 0.0
-                self.send_gripper(self.gripper_closed)
+                self.gripper.close()
                 self.triggered = True
-            elif self.gripper_done:
-                if not hasattr(self, '_home_wait'):
-                    self._home_wait = 0
-                if self._home_wait < 5:
-                    self._home_wait += 1
-                    return
-                self._home_wait = 0
-                if self.current_force > self.force_threshold:
+            elif self.gripper.done:
+                if self.gripper.holding():
                     self.get_logger().info(
                         'Grasp sequence completed (object held)')
                 else:
