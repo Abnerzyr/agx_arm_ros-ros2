@@ -416,7 +416,7 @@ class AgxArmRosNode(Node):
             return False
         return True
 
-    def _check_can_control(self) -> bool:
+    def _check_can_control(self, check_gate: bool = True) -> bool:
         if not self.control_ready:
             # Startup warm-up: ignore incoming control commands until a valid
             # joint state stream is available.
@@ -427,7 +427,7 @@ class AgxArmRosNode(Node):
         if not self.enable_flag:
             self.get_logger().warn("Agx_arm is not enabled, cannot control")
             return False
-        if not self.control_enabled:
+        if check_gate and not self.control_enabled:
             if not self._control_gate_block_logged:
                 self.get_logger().info(
                     "External control gate is closed, ignore control commands"
@@ -776,7 +776,7 @@ class AgxArmRosNode(Node):
         self._control_hand_joints(joint_pos)
 
     def _gripper_target_callback(self, msg: JointState):
-        if not self._check_can_control():
+        if not self._check_can_control(check_gate=False):
             return
 
         joint_pos = {

@@ -14,7 +14,7 @@ echo "=== Auto-detecting arm CAN port ==="
 CAN_PORT=""
 for iface in can0 can1; do
     HAS_ERR=$(ip -details link show $iface 2>/dev/null | grep -c 'BUS-OFF\|NO-CARRIER' || true)
-    if [ "$HAS_ERR" -gt 0 ]; thenAuto-homing to [-1.751, -0.342, 1.656, 1.036, 0.36, 0.074, 1.57]
+    if [ "$HAS_ERR" -gt 0 ]; then
         echo "  $iface: BUS-OFF/NO-CARRIER, skip"
         continue
     fi
@@ -68,6 +68,7 @@ pkill -9 -f agx_arm_ctrl_single 2>/dev/null || true
 pkill -9 -f realsense2_camera 2>/dev/null || true
 pkill -9 -f aruco_tracker 2>/dev/null || true
 pkill -9 -f yolo_grasp 2>/dev/null || true
+pkill -9 -f grasp_target_marker 2>/dev/null || true
 sleep 1
 pkill -9 -f grasp_executor 2>/dev/null || true
 pkill -9 -f vision_grasp_node 2>/dev/null || true
@@ -80,7 +81,7 @@ ros2 launch agx_arm_ctrl start_single_agx_arm_moveit.launch.py \
   effector_type:=agx_gripper \
   auto_enable:=true \
   auto_control_gate:=true \
-  speed_percent:=5 \
+  speed_percent:=10 \
   fw_version:=v111 \
   auto_home:=true \
   use_rviz:=false \
@@ -117,6 +118,11 @@ ros2 run agx_arm_vision yolo_grasp &>/tmp/yolo.log &
 YOLO_PID=$!
 echo "  yolo_grasp PID=$YOLO_PID"
 
+echo "=== Starting grasp target marker ==="
+ros2 run agx_arm_vision grasp_target_marker &>/tmp/marker.log &
+MARKER_PID=$!
+echo "  marker PID=$MARKER_PID"
+
 sleep 2
 
 echo "=== Starting grasp executor ==="
@@ -125,7 +131,7 @@ GRASP_PID=$!
 echo "  grasp_executor PID=$GRASP_PID"
 
 echo "=== All started (YOLO) ==="
-echo "CAN=$CAN_PORT  MoveIt=$MOVEIT_PID  Cam=$CAM_PID  YOLO=$YOLO_PID  Grasp=$GRASP_PID"
+echo "CAN=$CAN_PORT  MoveIt=$MOVEIT_PID  Cam=$CAM_PID  YOLO=$YOLO_PID  Marker=$MARKER_PID  Grasp=$GRASP_PID"
 echo ""
 echo "Manual commands:"
 echo "  ros2 topic pub --once /manual_grasp_start std_msgs/msg/Empty"

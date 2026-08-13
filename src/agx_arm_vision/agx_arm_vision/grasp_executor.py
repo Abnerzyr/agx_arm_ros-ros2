@@ -33,7 +33,8 @@ class GraspExecutor(Node):
         self.declare_parameter('target_z_offset', 0.0)
         self.declare_parameter('force_threshold', 1.5)
         self.declare_parameter('reach_tolerance', 0.03)
-        self.declare_parameter('reach_timeout', 10.0)
+        self.declare_parameter('reach_timeout', 45.0)
+        self.declare_parameter('velocity_scaling', 0.1)
         self.declare_parameter(
             'constrain_orientation', True)
         self.declare_parameter(
@@ -49,6 +50,7 @@ class GraspExecutor(Node):
         self.force_threshold = self.get_parameter('force_threshold').value
         self.reach_tolerance = self.get_parameter('reach_tolerance').value
         self.reach_timeout = self.get_parameter('reach_timeout').value
+        self.velocity_scaling = self.get_parameter('velocity_scaling').value
         self.home_joints = self.get_parameter('home_joints').value
         self.arm = MoveIt2(
             node=self,
@@ -79,6 +81,12 @@ class GraspExecutor(Node):
         self.reach_wait_start = 0.0
         self.reach_ok_count = 0
         self.current_joints = [0.0] * 7
+        self._prev_tick_joints = None
+        self._joint_stable_ticks = 0
+        self._last_joint_feedback = 0.0
+        self._last_joint_delta = 0.0
+        self._validation_sent = False
+        self._stable_wait_logged = False
         self.home_start_time = 0.0
         self.stored_pose = None
         self.stored_frame = None
@@ -137,8 +145,8 @@ class GraspExecutor(Node):
         self.target_pose = self.stored_pose
         self.target_frame = self.stored_frame
         self.validating_target = True
-        self.arm.move_to_pose(
-            self.target_pose, self.target_frame, plan_only=True)
+        self._validation_sent = False
+        self._stable_wait_logged = False
         p = self.target_pose.position
         self.get_logger().info(
             f'Manual grasp triggered, validating: '
@@ -163,11 +171,20 @@ class GraspExecutor(Node):
                 idx = msg.name.index(name)
                 if idx < len(msg.position):
                     self.current_joints[n] = msg.position[idx]
+        self._last_joint_feedback = self.get_clock().now().nanoseconds * 1e-9
 
     def tick(self):
         self.gripper.update(0.1)
 
         if self.state == self.IDLE and self.validating_target:
+            if not self._validation_sent:
+                if not self._joints_stable():
+                    self._log_stable_wait()
+                    return
+                self.arm.move_to_pose(
+                    self.target_pose, self.target_frame, plan_only=True)
+                self._validation_sent = True
+                return
             if not self.arm.is_done():
                 return
             self.validating_target = False
@@ -194,7 +211,12 @@ class GraspExecutor(Node):
             return
         if self.state == self.MOVE_TO_TARGET:
             if not self.triggered:
-                self.arm.move_to_pose(self.target_pose, self.target_frame)
+                if not self._joints_stable():
+                    self._log_stable_wait()
+                    return
+                self.arm.move_to_pose(
+                    self.target_pose, self.target_frame,
+                    velocity_scaling=self.velocity_scaling)
                 self.triggered = True
             elif self.arm.is_done():
                 if self.arm.success:
@@ -244,7 +266,12 @@ class GraspExecutor(Node):
             return
         if self.state == self.MOVE_HOME:
             if not self.triggered:
-                self.arm.move_to_joints(self.home_joints)
+                if not self._joints_stable():
+                    self._log_stable_wait()
+                    return
+                self.arm.move_to_joints(
+                    self.home_joints,
+                    velocity_scaling=self.velocity_scaling)
                 self.home_start_time = (
                     self.get_clock().now().nanoseconds * 1e-9)
                 self.get_logger().info('Moving to home position')
@@ -262,7 +289,7 @@ class GraspExecutor(Node):
                     else:
                         elapsed = (self.get_clock().now().nanoseconds * 1e-9
                                    - self.home_start_time)
-                        if elapsed > 15.0:
+                        if elapsed > 90.0:
                             self.get_logger().warning(
                                 'Home move timeout, '
                                 f'max error={max(errors):.3f} rad')
@@ -280,6 +307,33 @@ class GraspExecutor(Node):
         self.state = self.OPEN_GRIPPER
         self.triggered = False
         self._init_timer.cancel()
+
+    def _joints_stable(self):
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if now - self._last_joint_feedback > 0.5:
+            self._joint_stable_ticks = 0
+            self._last_joint_delta = -1.0
+            return False
+        if self._prev_tick_joints is None:
+            self._prev_tick_joints = list(self.current_joints)
+            return False
+        delta = max(abs(a - b) for a, b in zip(
+            self.current_joints, self._prev_tick_joints))
+        self._prev_tick_joints = list(self.current_joints)
+        self._last_joint_delta = delta
+        if delta < 0.01:
+            self._joint_stable_ticks += 1
+        else:
+            self._joint_stable_ticks = 0
+        return self._joint_stable_ticks >= 3
+
+    def _log_stable_wait(self):
+        if self._stable_wait_logged:
+            return
+        self._stable_wait_logged = True
+        self.get_logger().warning(
+            'Arm joints not stable; waiting for settle before planning '
+            f'(max_delta={self._last_joint_delta:.4f} rad)')
 
     def _tcp_error(self):
         try:
