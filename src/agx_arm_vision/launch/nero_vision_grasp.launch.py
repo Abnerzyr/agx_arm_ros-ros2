@@ -143,7 +143,7 @@ def generate_launch_description():
         DeclareLaunchArgument('use_depth', default_value='true'),
         DeclareLaunchArgument('target_z_offset', default_value='0.0'),
         DeclareLaunchArgument(
-            'constrain_orientation', default_value='false'),
+            'constrain_orientation', default_value='true'),
         mock_arm,
         real_arm,
         realsense,

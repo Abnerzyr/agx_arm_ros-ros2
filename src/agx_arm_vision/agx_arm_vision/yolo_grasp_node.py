@@ -21,6 +21,8 @@ from ultralytics import YOLO
 
 
 class YoloGraspNode(Node):
+    CAMERA_OPTICAL_FRAME = 'camera_color_optical_frame'
+
     def __init__(self):
         super().__init__('yolo_grasp_node')
         self.declare_parameter('base_frame', 'base_link')
@@ -227,7 +229,7 @@ class YoloGraspNode(Node):
         try:
             transform = self.tf_buffer.lookup_transform(
                 self.base_frame,
-                self.camera_info.header.frame_id,
+                self.CAMERA_OPTICAL_FRAME,
                 rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=1.0),
             )
@@ -235,7 +237,7 @@ class YoloGraspNode(Node):
             return
         grasp_rot = R.from_euler('z', angle)
         pose = PoseStamped()
-        pose.header.frame_id = self.camera_info.header.frame_id
+        pose.header.frame_id = self.CAMERA_OPTICAL_FRAME
         pose.header.stamp = self.get_clock().now().to_msg()
         pose.pose.position.x = float(x)
         pose.pose.position.y = float(y)
@@ -259,7 +261,7 @@ class YoloGraspNode(Node):
         try:
             t = self.tf_buffer.lookup_transform(
                 self.base_frame,
-                self.camera_info.header.frame_id,
+                self.CAMERA_OPTICAL_FRAME,
                 rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=1.0),
             )

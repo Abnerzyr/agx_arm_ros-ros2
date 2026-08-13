@@ -64,12 +64,27 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('use_sim_rviz')),
     )
 
+    random_flow = Node(
+        package='agx_arm_vision',
+        executable='random_grasp_flow',
+        output='screen',
+        parameters=[{
+            'max_step': 0.35,
+            'min_z': 0.30,
+            'max_z': 0.60,
+            'max_radius': 0.50,
+        }],
+        condition=IfCondition(LaunchConfiguration('random_test')),
+    )
+
     return LaunchDescription([
         DeclareLaunchArgument('simulate_object', default_value='true'),
         DeclareLaunchArgument('use_sim_rviz', default_value='true'),
+        DeclareLaunchArgument('random_test', default_value='true'),
         mock_arm,
         mock_gripper,
         executor,
         target_marker,
         rviz,
+        random_flow,
     ])

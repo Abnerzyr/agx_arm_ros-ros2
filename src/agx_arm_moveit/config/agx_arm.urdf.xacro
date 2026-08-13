@@ -6,7 +6,7 @@
   <xacro:arg name="initial_positions_file" default="initial_positions.yaml" />
   <xacro:arg name="tcp_offset_xyz" default="0 0 0" />
   <xacro:arg name="tcp_offset_rpy" default="0 0 0" />
-  <xacro:arg name="camera_mount_xyz" default="0.0585 0.0 -0.0225" />
+  <xacro:arg name="camera_mount_xyz" default="0.0585 0.0 0.0775" />
   <xacro:arg name="camera_mount_rpy" default="0 0 -1.5708" />
 
   <xacro:property name="arm_type" value="$(arg arm_type)" />
@@ -43,7 +43,7 @@
     </visual>
   </link>
   <joint name="camera_mount_joint" type="fixed">
-    <parent link="gripper_link" />
+    <parent link="gripper_base" />
     <child link="camera_link" />
     <origin xyz="$(arg camera_mount_xyz)" rpy="$(arg camera_mount_rpy)" />
   </joint>

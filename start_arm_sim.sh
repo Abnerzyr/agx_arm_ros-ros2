@@ -14,6 +14,7 @@ pkill -9 -f rviz2 2>/dev/null || true
 pkill -9 -f mock_gripper 2>/dev/null || true
 pkill -9 -f grasp_executor 2>/dev/null || true
 pkill -9 -f grasp_target_marker 2>/dev/null || true
+pkill -9 -f random_grasp_flow 2>/dev/null || true
 pkill -9 -f 'ros2 launch' 2>/dev/null || true
 sleep 1
 
