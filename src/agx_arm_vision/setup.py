@@ -39,6 +39,7 @@ setup(
             'yolo_grasp = agx_arm_vision.yolo_grasp_node:main',
             'mock_gripper = agx_arm_vision.mock_gripper:main',
             'grasp_target_marker = agx_arm_vision.grasp_target_marker:main',
+            'tilt_measure = agx_arm_vision.camera_tilt_measure:main',
             'random_grasp_flow = agx_arm_vision.random_grasp_flow_test:main',
             'virtual_obstacle_cloud = agx_arm_vision.virtual_obstacle_cloud:main',
         ],

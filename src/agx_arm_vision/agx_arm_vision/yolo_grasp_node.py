@@ -55,6 +55,9 @@ class YoloGraspNode(Node):
         self._map_enabled = True
         self._last_map_msg_time = 0.0
         self._cloud_ok = True
+        self._table_plane = None
+        self._plane_logged = False
+        self._fallback_logged = False
 
         pkg_dir = os.path.dirname(os.path.abspath(__file__))
         yolo_path = os.path.join(pkg_dir, 'models', 'yolov8s-worldv2.pt')
@@ -241,34 +244,38 @@ class YoloGraspNode(Node):
         angle = ang_np[v, u]
         grasp_width = max(0.0, min(0.1, width_np[v, u] * 0.001))
 
-        z_center = depth[cy, cx] if (0 <= cy < h and 0 <= cx < w) else best_depth
-        if z_center <= 0.05 or z_center > 2.0:
-            z_center = best_depth
-        if z_center <= 0.05 or z_center > 2.0:
-            return
-
         fx = self.model_cam.fx()
         fy = self.model_cam.fy()
         fcx = self.model_cam.cx()
         fcy = self.model_cam.cy()
-        x_pos = (cx - fcx) * z_center / fx
-        y_pos = (cy - fcy) * z_center / fy
 
         box_d = depth[y1:y2, x1:x2]
         box_valid = box_d[(box_d > 0.05) & np.isfinite(box_d)]
         if len(box_valid) > 0:
             d_min, d_max = float(np.min(box_valid)), float(np.max(box_valid))
         else:
-            d_min = d_max = float(z_center)
+            d_min = d_max = float(best_depth)
         box_z = (d_min + d_max) / 2.0
+        if box_z <= 0.05 or box_z > 2.0:
+            return
         box_cx = (cx - fcx) * box_z / fx
         box_cy = (cy - fcy) * box_z / fy
         box_sx = bw * box_z / fx
         box_sy = bh * box_z / fy
         box_sz = max(d_max - d_min, 0.01) + 0.02
 
+        scale = crop_side / self.input_size
+        u_orig = crop_x1 + u * scale
+        v_orig = crop_y1 + v * scale
+        if not (0 <= u_orig < w and 0 <= v_orig < h):
+            x_g = box_cx
+            y_g = box_cy
+        else:
+            x_g = (u_orig - fcx) * box_z / fx
+            y_g = (v_orig - fcy) * box_z / fy
+
         self._publish(
-            x_pos, y_pos, z_center, angle, grasp_width, best_score,
+            x_g, y_g, box_z, angle, grasp_width, best_score,
             box_center=(box_cx, box_cy, box_z),
             box_scale=(box_sx, box_sy, box_sz))
 
@@ -353,10 +360,81 @@ class YoloGraspNode(Node):
 
         if exclude_box is not None:
             ex1, ey1, ex2, ey2 = exclude_box
-            excluded = (uu >= ex1) & (uu <= ex2) & (vv >= ey1) & (vv <= ey2)
-            keep = valid & ~excluded
+            inside = (uu >= ex1) & (uu <= ex2) & (vv >= ey1) & (vv <= ey2)
+            keep = valid & ~inside
+
+            fx = self.model_cam.fx()
+            fy = self.model_cam.fy()
+            fcx = self.model_cam.cx()
+            fcy = self.model_cam.cy()
+            xs = (uu - fcx) * z / fx
+            ys = (vv - fcy) * z / fy
+
+            rot = R.from_quat([
+                t.transform.rotation.x,
+                t.transform.rotation.y,
+                t.transform.rotation.z,
+                t.transform.rotation.w,
+            ]).as_matrix()
+            n_cam = rot[2, :]
+
+            plane = self._get_table_plane(
+                n_cam,
+                xs[inside & valid], ys[inside & valid], z[inside & valid])
+
+            if plane is None:
+                if not self._fallback_logged:
+                    self.get_logger().warning(
+                        'Table plane rejected; using full exclusion')
+                    self._fallback_logged = True
+                self._publish_points(
+                    self.filtered_cloud_pub,
+                    uu[keep], vv[keep], z[keep], t)
+                return
+
+            n, d = plane
+            if not self._plane_logged:
+                n_base = rot @ n
+                self.get_logger().info(
+                    'Table plane locked: '
+                    f'n_base=({n_base[0]:.3f},{n_base[1]:.3f},'
+                    f'{n_base[2]:.3f}) d={d:.3f}')
+                self._plane_logged = True
+            u_in = uu[inside]
+            v_in = vv[inside]
+            denom = (u_in - fcx) / fx * n[0] + (v_in - fcy) / fy * n[1] + n[2]
+            z_plane = -d / denom
+            ok = np.isfinite(z_plane) & (z_plane > 0.05) & (z_plane < 2.0)
+
             self._publish_points(
-                self.filtered_cloud_pub, uu[keep], vv[keep], z[keep], t)
+                self.filtered_cloud_pub,
+                np.concatenate([uu[keep], u_in[ok]]),
+                np.concatenate([vv[keep], v_in[ok]]),
+                np.concatenate([z[keep], z_plane[ok]]),
+                t)
+
+    def _get_table_plane(self, n, hx, hy, hz):
+        if self._table_plane is not None:
+            n0, d = self._table_plane
+            if len(hx) >= 20:
+                heights = hx * n0[0] + hy * n0[1] + hz * n0[2]
+                low = float(np.percentile(heights, 5))
+                if abs(low + d) <= 0.02:
+                    return n0, d
+            self._table_plane = None
+        plane = self._fit_table_height(n, hx, hy, hz)
+        if plane is not None:
+            self._table_plane = plane
+        return plane
+
+    def _fit_table_height(self, n, hx, hy, hz):
+        if len(hx) < 20:
+            return None
+        heights = hx * n[0] + hy * n[1] + hz * n[2]
+        low = float(np.percentile(heights, 5))
+        if not np.isfinite(low) or low < 0.05 or low > 2.0:
+            return None
+        return n, -low
 
     def _publish_points(self, pub, uu, vv, z, t):
         fx = self.model_cam.fx()
