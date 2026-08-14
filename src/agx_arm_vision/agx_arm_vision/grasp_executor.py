@@ -4,6 +4,7 @@ import rclpy
 from geometry_msgs.msg import Point, Pose, PoseStamped, Quaternion
 from rclpy.node import Node
 from sensor_msgs.msg import JointState, PointCloud2
+from std_msgs.msg import Bool
 from std_msgs.msg import Empty as EmptyMsg
 from std_srvs.srv import Empty as EmptySrv
 from tf2_ros import Buffer, TransformException, TransformListener
@@ -45,6 +46,8 @@ class GraspExecutor(Node):
         self.declare_parameter('idle_clear_interval', 10.0)
         self.declare_parameter('insert_settle', 0.3)
         self.declare_parameter('rebuild_timeout', 2.5)
+        self.declare_parameter(
+            'filtered_cloud_topic', '/move_group/filtered_cloud')
         self.declare_parameter(
             'constrain_orientation', True)
         self.declare_parameter(
@@ -114,11 +117,18 @@ class GraspExecutor(Node):
         self._pending_time = 0.0
         self._clear_client = self.create_client(EmptySrv, '/clear_octomap')
         self._last_cloud_time = 0.0
+        self._last_filtered_time = 0.0
         self._last_idle_clear = self.get_clock().now().nanoseconds * 1e-9
         self._clear_time = None
+        self._clear_pending = False
+        self._clear_success = False
+        self._clear_done_time = 0.0
+        self._clear_seq = 0
         self._rebuild_done = False
         self.move_j_pub = self.create_publisher(
             JointState, '/control/move_j', 10)
+        self.map_update_pub = self.create_publisher(
+            Bool, '/map_update_enable', 10)
 
         self.create_subscription(
             PoseStamped, '/grasp_pose', self.grasp_callback, 10)
@@ -126,6 +136,10 @@ class GraspExecutor(Node):
             Marker, '/yolo/target_box', self.target_box_callback, 10)
         self.create_subscription(
             PointCloud2, '/yolo/points_filtered', self.cloud_time_callback, 10)
+        self.create_subscription(
+            PointCloud2,
+            self.get_parameter('filtered_cloud_topic').value,
+            self.filtered_cloud_callback, 10)
         self.create_subscription(
             EmptyMsg, '/manual_grasp_start', self.manual_start_cb, 10)
         self.create_subscription(
@@ -164,6 +178,10 @@ class GraspExecutor(Node):
     def cloud_time_callback(self, msg):
         del msg
         self._last_cloud_time = self.get_clock().now().nanoseconds * 1e-9
+
+    def filtered_cloud_callback(self, msg):
+        del msg
+        self._last_filtered_time = self.get_clock().now().nanoseconds * 1e-9
 
     def grasp_callback(self, msg):
         if self.state != self.IDLE:
@@ -242,6 +260,9 @@ class GraspExecutor(Node):
 
     def tick(self):
         self.gripper.update(0.1)
+        map_update = Bool()
+        map_update.data = (self.state == self.IDLE)
+        self.map_update_pub.publish(map_update)
 
         if self.state == self.IDLE and self.validating_target:
             if not self._rebuild_done:
@@ -250,17 +271,40 @@ class GraspExecutor(Node):
                     self._clear_time = now_clear
                     self._call_clear()
                     return
-                if now_clear - self._clear_time > self.rebuild_timeout:
-                    self.get_logger().warning(
-                        'Timed out waiting for octomap rebuild; '
-                        'planning anyway')
-                    self._rebuild_done = True
-                elif (self._last_cloud_time > self._clear_time
-                        and now_clear - self._last_cloud_time
-                        >= self.insert_settle):
-                    self._rebuild_done = True
+                if self._clear_pending:
+                    if now_clear - self._clear_time > self.rebuild_timeout:
+                        self.get_logger().warning(
+                            'Clear confirmation timed out; '
+                            'using fallback rebuild detection')
+                        self._clear_pending = False
+                        self._clear_success = False
+                    else:
+                        return
+                if self._clear_success and self._last_filtered_time > 0.0:
+                    if (self._last_filtered_time > self._clear_done_time
+                            and now_clear - self._last_filtered_time
+                            >= self.insert_settle):
+                        self._rebuild_done = True
+                    elif (now_clear - self._clear_done_time
+                            > self.rebuild_timeout):
+                        self.get_logger().warning(
+                            'Timed out waiting for octomap rebuild; '
+                            'planning anyway')
+                        self._rebuild_done = True
+                    else:
+                        return
                 else:
-                    return
+                    if now_clear - self._clear_time > self.rebuild_timeout:
+                        self.get_logger().warning(
+                            'Timed out waiting for octomap rebuild; '
+                            'planning anyway')
+                        self._rebuild_done = True
+                    elif (self._last_cloud_time > self._clear_time
+                            and now_clear - self._last_cloud_time
+                            >= self.insert_settle):
+                        self._rebuild_done = True
+                    else:
+                        return
             if not self._validation_sent:
                 if not self._joints_stable():
                     self._log_stable_wait()
@@ -330,10 +374,10 @@ class GraspExecutor(Node):
                 if self.arm.success:
                     self.state = self.WAIT_REACH
                     self.reach_wait_start = self.get_clock().now().nanoseconds * 1e-9
+                    self.triggered = False
                 else:
                     self.get_logger().error('Arm motion failed')
-                    self.state = self.MOVE_HOME
-                self.triggered = False
+                    self._enter_home()
             return
         if self.state == self.WAIT_REACH:
             elapsed = (
@@ -356,7 +400,7 @@ class GraspExecutor(Node):
                 self.get_logger().warning(
                     f'TCP reach timeout ({self.reach_timeout:.1f}s), '
                     f'error={error}')
-                self.state = self.MOVE_HOME
+                self._enter_home()
             return
         if self.state == self.CLOSE_GRIPPER:
             if not self.triggered:
@@ -366,11 +410,11 @@ class GraspExecutor(Node):
                 if self.gripper.holding():
                     self.get_logger().info(
                         'Grasp sequence completed (object held)')
+                    self._latched_box = None
                 else:
                     self.get_logger().info(
                         'Grasp sequence completed (nothing grasped)')
-                self.state = self.MOVE_HOME
-                self.triggered = False
+                self._enter_home()
             return
         if self.state == self.MOVE_HOME:
             if not self.triggered:
@@ -413,6 +457,10 @@ class GraspExecutor(Node):
         if self.state == self.WAIT_RELEASE:
             return
 
+    def _enter_home(self):
+        self.state = self.MOVE_HOME
+        self.triggered = False
+
     def _init_open(self):
         self.state = self.OPEN_GRIPPER
         self.triggered = False
@@ -421,9 +469,29 @@ class GraspExecutor(Node):
     def _call_clear(self):
         if not self._clear_client.service_is_ready():
             self.get_logger().warning('/clear_octomap service not ready')
+            return False
+        self._clear_pending = True
+        self._clear_success = False
+        self._clear_seq += 1
+        seq = self._clear_seq
+        future = self._clear_client.call_async(EmptySrv.Request())
+        future.add_done_callback(
+            lambda fut, s=seq: self._clear_done_cb(fut, s))
+        return True
+
+    def _clear_done_cb(self, future, seq):
+        if seq != self._clear_seq:
             return
-        self._clear_client.call_async(EmptySrv.Request())
-        self.get_logger().info('Octomap cleared')
+        self._clear_pending = False
+        self._clear_done_time = self.get_clock().now().nanoseconds * 1e-9
+        try:
+            future.result()
+        except Exception:
+            self._clear_success = False
+            self.get_logger().error('Octomap clear failed')
+            return
+        self._clear_success = True
+        self.get_logger().info('Octomap cleared (confirmed)')
 
     def _joints_stable(self):
         now = self.get_clock().now().nanoseconds * 1e-9

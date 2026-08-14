@@ -12,9 +12,10 @@ from geometry_msgs.msg import PoseStamped
 from image_geometry import PinholeCameraModel
 from rclpy.node import Node
 from scipy.spatial.transform import Rotation as R
-from sensor_msgs.msg import CameraInfo, Image, PointCloud2, PointField
+from sensor_msgs.msg import (
+    CameraInfo, Image, PointCloud2, PointField)
 from skimage.filters import gaussian
-from std_msgs.msg import ColorRGBA, Header
+from std_msgs.msg import Bool, ColorRGBA, Header
 from tf2_geometry_msgs import do_transform_pose_stamped
 from tf2_ros import Buffer, TransformException, TransformListener
 from ultralytics import YOLO
@@ -23,6 +24,7 @@ from visualization_msgs.msg import Marker
 
 class YoloGraspNode(Node):
     CAMERA_OPTICAL_FRAME = 'camera_color_optical_frame'
+    MAP_ENABLE_TIMEOUT = 1.0
 
     def __init__(self):
         super().__init__('yolo_grasp_node')
@@ -50,6 +52,9 @@ class YoloGraspNode(Node):
         self.rgb_img = None
         self.camera_info = None
         self.depth_stamp = None
+        self._map_enabled = True
+        self._last_map_msg_time = 0.0
+        self._cloud_ok = True
 
         pkg_dir = os.path.dirname(os.path.abspath(__file__))
         yolo_path = os.path.join(pkg_dir, 'models', 'yolov8s-worldv2.pt')
@@ -68,6 +73,8 @@ class YoloGraspNode(Node):
         self.create_subscription(
             CameraInfo, self.get_parameter('info_topic').value,
             self.info_callback, 10)
+        self.create_subscription(
+            Bool, '/map_update_enable', self.map_update_cb, 10)
 
         self.grasp_pub = self.create_publisher(
             PoseStamped, '/grasp_pose', 10)
@@ -110,6 +117,16 @@ class YoloGraspNode(Node):
     def rgb_callback(self, msg):
         self.rgb_img = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
 
+    def map_update_cb(self, msg):
+        self._map_enabled = msg.data
+        self._last_map_msg_time = self.get_clock().now().nanoseconds * 1e-9
+
+    def _cloud_gate(self):
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if now - self._last_map_msg_time > self.MAP_ENABLE_TIMEOUT:
+            return True
+        return self._map_enabled
+
     def _depth_meters(self, img):
         if img.dtype == np.uint16:
             return img.astype(np.float32) * 0.001
@@ -119,6 +136,7 @@ class YoloGraspNode(Node):
         if (self.depth_img is None or self.rgb_img is None
                 or self.camera_info is None):
             return
+        self._cloud_ok = self._cloud_gate()
         depth = self._depth_meters(self.depth_img)
         rgb = self.rgb_img
         h, w = depth.shape
@@ -311,6 +329,8 @@ class YoloGraspNode(Node):
             f'width={width:.3f}m score={score:.2f}')
 
     def _publish_cloud(self, depth, exclude_box=None):
+        if not self._cloud_ok:
+            return
         try:
             t = self.tf_buffer.lookup_transform(
                 self.base_frame,
