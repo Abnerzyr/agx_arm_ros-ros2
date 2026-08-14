@@ -7,7 +7,7 @@
   <xacro:arg name="tcp_offset_xyz" default="0 0 0" />
   <xacro:arg name="tcp_offset_rpy" default="0 0 0" />
   <xacro:arg name="camera_mount_xyz" default="0.0585 0.0 0.0775" />
-  <xacro:arg name="camera_mount_rpy" default="-0.02898 0.08681 -1.52818" />
+  <xacro:arg name="camera_mount_rpy" default="0 0 -1.5708" />
 
   <xacro:property name="arm_type" value="$(arg arm_type)" />
   <xacro:property name="flange_link" value="${'link7' if arm_type == 'nero' else 'link6'}" />
