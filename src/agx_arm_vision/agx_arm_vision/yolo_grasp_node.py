@@ -252,10 +252,12 @@ class YoloGraspNode(Node):
         box_d = depth[y1:y2, x1:x2]
         box_valid = box_d[(box_d > 0.05) & np.isfinite(box_d)]
         if len(box_valid) > 0:
-            d_min, d_max = float(np.min(box_valid)), float(np.max(box_valid))
+            d_min = float(np.min(box_valid))
+            d_max = float(np.max(box_valid))
+            d_p40 = float(np.percentile(box_valid, 40))
         else:
-            d_min = d_max = float(best_depth)
-        box_z = (d_min + d_max) / 2.0
+            d_min = d_max = d_p40 = float(best_depth)
+        box_z = (d_min + d_p40) / 2.0
         if box_z <= 0.05 or box_z > 2.0:
             return
         box_cx = (cx - fcx) * box_z / fx
@@ -263,6 +265,9 @@ class YoloGraspNode(Node):
         box_sx = bw * box_z / fx
         box_sy = bh * box_z / fy
         box_sz = max(d_max - d_min, 0.01) + 0.02
+        self.get_logger().info(
+            f'Box depth: d_min={d_min:.3f} d_p40={d_p40:.3f} '
+            f'd_max={d_max:.3f} box_z={box_z:.3f}')
 
         scale = crop_side / self.input_size
         u_orig = crop_x1 + u * scale
