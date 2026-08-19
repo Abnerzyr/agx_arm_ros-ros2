@@ -6,7 +6,7 @@
   <xacro:arg name="initial_positions_file" default="initial_positions.yaml" />
   <xacro:arg name="tcp_offset_xyz" default="0 0 0" />
   <xacro:arg name="tcp_offset_rpy" default="0 0 0" />
-  <xacro:arg name="camera_mount_xyz" default="0.0585 0.0 0.0775" />
+  <xacro:arg name="camera_mount_xyz" default="0.0585 0.0 0.0575" />
   <xacro:arg name="camera_mount_rpy" default="0 0 -1.5708" />
 
   <xacro:property name="arm_type" value="$(arg arm_type)" />
@@ -51,7 +51,7 @@
   <joint name="camera_to_color_optical" type="fixed">
     <parent link="camera_link" />
     <child link="camera_color_optical_frame" />
-    <origin xyz="0 0 0" rpy="0 0 3.1416" />
+    <origin xyz="0.03 0 0" rpy="0 0 3.1416" />
   </joint>
 
   <xacro:include filename="agx_arm.ros2_control.xacro" />

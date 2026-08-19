@@ -62,6 +62,11 @@ def _launch(context):
             output="screen",
             parameters=move_group_params,
             remappings=remappings,
+            arguments=[
+                "--ros-args", "--log-level",
+                "moveit_move_group_default_capabilities"
+                ".clear_octomap_service_capability:=warn",
+            ],
             additional_env={"DISPLAY": os.environ.get("DISPLAY", "")},
             condition=UnlessCondition(LaunchConfiguration("debug")),
         ),
@@ -71,6 +76,11 @@ def _launch(context):
             output="screen",
             parameters=move_group_params,
             remappings=remappings,
+            arguments=[
+                "--ros-args", "--log-level",
+                "moveit_move_group_default_capabilities"
+                ".clear_octomap_service_capability:=warn",
+            ],
             prefix=["gdb -x {} --ex run --args".format(
                 moveit_config.package_path / "launch" / "gdb_settings.gdb"
             )],

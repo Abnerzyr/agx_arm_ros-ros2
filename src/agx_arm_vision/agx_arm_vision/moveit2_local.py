@@ -1,21 +1,17 @@
 #!/usr/bin/env python3
 
-import rclpy
 from geometry_msgs.msg import Pose
 from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import (
-    AllowedCollisionEntry,
-    AllowedCollisionMatrix,
     BoundingVolume,
     CollisionObject,
     Constraints,
     JointConstraint,
     MotionPlanRequest,
     OrientationConstraint,
-    PlanningSceneComponents,
     PositionConstraint,
 )
-from moveit_msgs.srv import GetPlanningScene
+from moveit_msgs.srv import ApplyPlanningScene
 from rclpy.action import ActionClient
 from shape_msgs.msg import SolidPrimitive
 
@@ -33,95 +29,69 @@ class MoveIt2:
         self.position_tolerance = position_tolerance
         self.orientation_tolerance = orientation_tolerance
         self.action = ActionClient(node, MoveGroup, action_name)
-        self._scene_client = node.create_client(
-            GetPlanningScene, '/get_planning_scene')
+        self._apply_scene_client = node.create_client(
+            ApplyPlanningScene, '/apply_planning_scene')
         self.done = False
         self.success = False
         self.plan_only = False
 
-    def _fetch_allowed_collision_matrix(self):
-        if not self._scene_client.wait_for_service(timeout_sec=1.0):
-            self.node.get_logger().warning(
-                '/get_planning_scene service not available')
-            return None
-        req = GetPlanningScene.Request()
-        req.components.components = (
-            PlanningSceneComponents.ALLOWED_COLLISION_MATRIX)
-        future = self._scene_client.call_async(req)
-        rclpy.spin_until_future_complete(
-            self.node, future, timeout_sec=1.0)
-        if not future.done() or future.result() is None:
-            self.node.get_logger().warning(
-                'Failed to fetch current allowed collision matrix')
-            return None
-        src = future.result().scene.allowed_collision_matrix
-        acm = AllowedCollisionMatrix()
-        acm.entry_names = list(src.entry_names)
-        acm.entry_values = [
-            AllowedCollisionEntry(enabled=list(e.enabled))
-            for e in src.entry_values]
-        acm.default_entry_names = list(src.default_entry_names)
-        acm.default_entry_values = list(src.default_entry_values)
-        return acm
-
-    def _apply_scene_diff(self, goal, collision_objects, allowed_links):
-        if isinstance(collision_objects, dict):
-            collision_objects = [collision_objects]
-        if not collision_objects:
-            return
-        acm = self._fetch_allowed_collision_matrix()
-        if acm is None:
-            self.node.get_logger().warning(
-                'Skipping target collision protection for this plan')
-            return
-        scene = goal.planning_options.planning_scene_diff
-        scene.is_diff = True
-        scene.robot_state.is_diff = True
-        for obj in collision_objects:
-            co = CollisionObject()
-            co.header.frame_id = self.base_link
-            co.id = str(obj['id'])
+    # ------------------------------------------------------------------
+    # Collision object add / remove via /apply_planning_scene.
+    # The target box is added to the planning scene as a plain world
+    # collision object (no AllowedCollisionMatrix manipulation).
+    # ------------------------------------------------------------------
+    def apply_collision_object(
+            self, collision_object, add=True, callback=None):
+        if not self._apply_scene_client.service_is_ready():
+            self.node.get_logger().error(
+                '/apply_planning_scene service not available')
+            return False
+        req = ApplyPlanningScene.Request()
+        req.scene.is_diff = True
+        co = CollisionObject()
+        co.header.frame_id = self.base_link
+        co.id = str(collision_object['id'])
+        if add:
             co.primitives = [SolidPrimitive(
                 type=SolidPrimitive.BOX,
                 dimensions=[
-                    float(obj['size'][0]),
-                    float(obj['size'][1]),
-                    float(obj['size'][2]),
+                    float(collision_object['size'][0]),
+                    float(collision_object['size'][1]),
+                    float(collision_object['size'][2]),
                 ],
             )]
             co.primitive_poses = [Pose()]
-            co.primitive_poses[0].position.x = float(obj['position'][0])
-            co.primitive_poses[0].position.y = float(obj['position'][1])
-            co.primitive_poses[0].position.z = float(obj['position'][2])
-            co.operation = CollisionObject.ADD
-            scene.world.collision_objects.append(co)
+            co.primitive_poses[0].position.x = float(
+                collision_object['position'][0])
+            co.primitive_poses[0].position.y = float(
+                collision_object['position'][1])
+            co.primitive_poses[0].position.z = float(
+                collision_object['position'][2])
+            quat = collision_object.get(
+                'orientation', (0.0, 0.0, 0.0, 1.0))
+            co.primitive_poses[0].orientation.x = float(quat[0])
+            co.primitive_poses[0].orientation.y = float(quat[1])
+            co.primitive_poses[0].orientation.z = float(quat[2])
+            co.primitive_poses[0].orientation.w = float(quat[3])
+        co.operation = CollisionObject.ADD if add else CollisionObject.REMOVE
+        req.scene.world.collision_objects.append(co)
+        future = self._apply_scene_client.call_async(req)
+        if callback is not None:
+            future.add_done_callback(callback)
+        return True
 
-            for link in allowed_links:
-                if link not in acm.default_entry_names:
-                    acm.default_entry_names.append(link)
-                    acm.default_entry_values.append(False)
-                    for entry in acm.entry_values:
-                        entry.enabled.append(False)
-
-            enabled = [
-                True if link in allowed_links else False
-                for link in acm.default_entry_names]
-            obj_id = str(obj['id'])
-            if obj_id in acm.entry_names:
-                idx = acm.entry_names.index(obj_id)
-                acm.entry_values[idx] = AllowedCollisionEntry(
-                    enabled=enabled)
-            else:
-                acm.entry_names.append(obj_id)
-                acm.entry_values.append(AllowedCollisionEntry(
-                    enabled=enabled))
-        scene.allowed_collision_matrix = acm
-
+    # ------------------------------------------------------------------
+    # MoveGroup actions
+    # ------------------------------------------------------------------
     def move_to_pose(
             self, pose, frame_id=None, plan_only=False,
-            velocity_scaling=0.2,
-            collision_objects=None, allowed_links=None):
+            velocity_scaling=0.2, constrain_orientation=None,
+            orientation_tolerance=None):
         frame_id = frame_id or self.base_link
+        if constrain_orientation is None:
+            constrain_orientation = self.constrain_orientation
+        if orientation_tolerance is None:
+            orientation_tolerance = self.orientation_tolerance
         self.done = False
         self.success = False
         self.plan_only = plan_only
@@ -136,9 +106,6 @@ class MoveIt2:
         goal.request.num_planning_attempts = 20
         goal.request.goal_constraints = [Constraints()]
         goal.planning_options.plan_only = plan_only
-        goal.planning_options.planning_scene_diff.is_diff = True
-        goal.planning_options.planning_scene_diff.robot_state.is_diff = True
-        self._apply_scene_diff(goal, collision_objects, allowed_links)
 
         position = PositionConstraint()
         position.header.frame_id = frame_id
@@ -154,14 +121,14 @@ class MoveIt2:
         goal.request.goal_constraints[0].position_constraints = [
             position]
 
-        if self.constrain_orientation:
+        if constrain_orientation:
             orientation = OrientationConstraint()
             orientation.header.frame_id = frame_id
             orientation.link_name = self.end_effector
             orientation.orientation = pose.orientation
-            orientation.absolute_x_axis_tolerance = self.orientation_tolerance
-            orientation.absolute_y_axis_tolerance = self.orientation_tolerance
-            orientation.absolute_z_axis_tolerance = self.orientation_tolerance
+            orientation.absolute_x_axis_tolerance = orientation_tolerance
+            orientation.absolute_y_axis_tolerance = orientation_tolerance
+            orientation.absolute_z_axis_tolerance = orientation_tolerance
             orientation.weight = 1.0
             goal.request.goal_constraints[0].orientation_constraints = [
                 orientation]
@@ -195,8 +162,7 @@ class MoveIt2:
         self.done = True
 
     def move_to_joints(
-            self, positions, velocity_scaling=0.2,
-            collision_objects=None, allowed_links=None):
+            self, positions, velocity_scaling=0.2):
         self.done = False
         self.success = False
         self.plan_only = False
@@ -210,7 +176,6 @@ class MoveIt2:
         goal.request.max_acceleration_scaling_factor = velocity_scaling
         goal.request.num_planning_attempts = 1
         goal.request.goal_constraints = [Constraints()]
-        self._apply_scene_diff(goal, collision_objects, allowed_links)
 
         joint_names = ['joint1', 'joint2', 'joint3', 'joint4',
                        'joint5', 'joint6', 'joint7']

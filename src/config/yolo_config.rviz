@@ -4,9 +4,7 @@ Panels:
     Name: Displays
     Property Tree Widget:
       Expanded:
-        - /TF1
         - /TF1/Frames1
-        - /PointCloud21
       Splitter Ratio: 0.5
     Tree Height: 208
   - Class: rviz_common/Views
@@ -440,6 +438,19 @@ Visualization Manager:
         Show Robot Collision: false
         Show Robot Visual: true
       Value: true
+    - Class: rviz_default_plugins/Marker
+      Enabled: true
+      Name: Marker
+      Namespaces:
+        grasp_target_box: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /yolo/target_box
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
@@ -458,25 +469,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 1.111015796661377
+      Distance: 0.7144486904144287
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: -0.5883316397666931
-        Y: 0.014400696381926537
-        Z: 0.24187618494033813
+        X: -0.5331224203109741
+        Y: -0.044676780700683594
+        Z: 0.32363730669021606
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.270000159740448
+      Pitch: 0.0850001722574234
       Target Frame: base_link
       Value: Orbit (rviz_default_plugins)
-      Yaw: 6.255180358886719
+      Yaw: 5.1533660888671875
     Saved: ~
 Window Geometry:
   ArUco Debug:

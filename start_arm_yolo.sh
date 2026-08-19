@@ -68,6 +68,7 @@ pkill -9 -f agx_arm_ctrl_single 2>/dev/null || true
 pkill -9 -f realsense2_camera 2>/dev/null || true
 pkill -9 -f aruco_tracker 2>/dev/null || true
 pkill -9 -f yolo_grasp 2>/dev/null || true
+pkill -9 -f place_planner 2>/dev/null || true
 pkill -9 -f grasp_target_marker 2>/dev/null || true
 pkill -9 -f robot_state_publisher 2>/dev/null || true
 sleep 1
@@ -119,6 +120,11 @@ ros2 run agx_arm_vision yolo_grasp &>/tmp/yolo.log &
 YOLO_PID=$!
 echo "  yolo_grasp PID=$YOLO_PID"
 
+echo "=== Starting place planner ==="
+ros2 run agx_arm_vision place_planner &>/tmp/place.log &
+PLACE_PID=$!
+echo "  place_planner PID=$PLACE_PID"
+
 echo "=== Starting grasp target marker ==="
 ros2 run agx_arm_vision grasp_target_marker &>/tmp/marker.log &
 MARKER_PID=$!
@@ -132,7 +138,7 @@ GRASP_PID=$!
 echo "  grasp_executor PID=$GRASP_PID"
 
 echo "=== All started (YOLO) ==="
-echo "CAN=$CAN_PORT  MoveIt=$MOVEIT_PID  Cam=$CAM_PID  YOLO=$YOLO_PID  Marker=$MARKER_PID  Grasp=$GRASP_PID"
+echo "CAN=$CAN_PORT  MoveIt=$MOVEIT_PID  Cam=$CAM_PID  YOLO=$YOLO_PID  Place=$PLACE_PID  Marker=$MARKER_PID  Grasp=$GRASP_PID"
 echo ""
 echo "Manual commands:"
 echo "  ros2 topic pub --once -w 1 /manual_grasp_start std_msgs/msg/Empty '{}'"

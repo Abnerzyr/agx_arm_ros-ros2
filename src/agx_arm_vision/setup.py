@@ -37,6 +37,7 @@ setup(
             'ggcnn_grasp = agx_arm_vision.ggcnn_grasp_node:main',
             'grconvnet_grasp = agx_arm_vision.grconvnet_grasp_node:main',
             'yolo_grasp = agx_arm_vision.yolo_grasp_node:main',
+            'place_planner = agx_arm_vision.place_planner:main',
             'mock_gripper = agx_arm_vision.mock_gripper:main',
             'grasp_target_marker = agx_arm_vision.grasp_target_marker:main',
             'tilt_measure = agx_arm_vision.camera_tilt_measure:main',

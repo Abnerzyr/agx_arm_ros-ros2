@@ -38,11 +38,20 @@ class YoloGraspNode(Node):
         self.declare_parameter('confidence_threshold', 0.25)
         self.declare_parameter('grasp_quality_threshold', 0.3)
         self.declare_parameter('input_size', 224)
+        self.declare_parameter('box_padding', 0.005)
+        self.declare_parameter('min_range', 0.15)
+        self.declare_parameter('box_exclude_window', 2.0)
+        self.declare_parameter('target_classes', ["rubik's cube"])
 
         self.base_frame = self.get_parameter('base_frame').value
         self.conf_threshold = self.get_parameter('confidence_threshold').value
         self.grasp_quality = self.get_parameter('grasp_quality_threshold').value
         self.input_size = self.get_parameter('input_size').value
+        self.box_padding = self.get_parameter('box_padding').value
+        self.min_range = self.get_parameter('min_range').value
+        self.box_exclude_window = self.get_parameter(
+            'box_exclude_window').value
+        self.target_classes = self.get_parameter('target_classes').value
 
         self.bridge = CvBridge()
         self.model_cam = PinholeCameraModel()
@@ -58,11 +67,27 @@ class YoloGraspNode(Node):
         self._table_plane = None
         self._plane_logged = False
         self._fallback_logged = False
+        self._last_grasp_level = None
+        self._last_target_exclude = None
+        self._last_target_exclude_time = 0.0
 
         pkg_dir = os.path.dirname(os.path.abspath(__file__))
         yolo_path = os.path.join(pkg_dir, 'models', 'yolov8s-worldv2.pt')
         self.yolo = YOLO(yolo_path)
-        self.get_logger().info('YOLOv8n loaded')
+        coco_names = list(self.yolo.names.values())
+        if self.target_classes:
+            try:
+                import clip  # noqa: F401
+            except ImportError:
+                self.get_logger().error(
+                    'Custom classes need the CLIP package; '
+                    'falling back to default COCO classes. Install with: '
+                    'pip3 install git+https://github.com/ultralytics/CLIP.git')
+            else:
+                self.yolo.set_classes(self.target_classes + coco_names)
+                self.get_logger().info(
+                    f'YOLO classes: {len(self.target_classes)} custom '
+                    f'({self.target_classes}) + {len(coco_names)} coco')
 
         self.grconv = self._load_grconv()
         self.get_logger().info('GR-ConvNet loaded')
@@ -125,9 +150,6 @@ class YoloGraspNode(Node):
         self._last_map_msg_time = self.get_clock().now().nanoseconds * 1e-9
 
     def _cloud_gate(self):
-        now = self.get_clock().now().nanoseconds * 1e-9
-        if now - self._last_map_msg_time > self.MAP_ENABLE_TIMEOUT:
-            return True
         return self._map_enabled
 
     def _depth_meters(self, img):
@@ -175,7 +197,13 @@ class YoloGraspNode(Node):
                 best_box = (x1, y1, x2, y2)
 
         if best_box is None:
-            self._publish_cloud(depth)
+            now = self.get_clock().now().nanoseconds * 1e-9
+            if (self._last_target_exclude is not None
+                    and now - self._last_target_exclude_time
+                    <= self.box_exclude_window):
+                self._publish_cloud(depth, exclude_box=self._last_target_exclude)
+            else:
+                self._publish_cloud(depth)
             return
         x1, y1, x2, y2 = best_box
 
@@ -184,10 +212,14 @@ class YoloGraspNode(Node):
         bw = x2 - x1
         bh = y2 - y1
         margin_px = max(
-            1, int(0.02 * self.model_cam.fx() / max(best_depth, 0.1)))
-        self._publish_cloud(depth, exclude_box=(
+            1, int(0.03 * self.model_cam.fx() / max(best_depth, 0.1)))
+        exclude_box = (
             max(0, x1 - margin_px), max(0, y1 - margin_px),
-            min(w - 1, x2 + margin_px), min(h - 1, y2 + margin_px)))
+            min(w - 1, x2 + margin_px), min(h - 1, y2 + margin_px))
+        self._last_target_exclude = exclude_box
+        self._last_target_exclude_time = (
+            self.get_clock().now().nanoseconds * 1e-9)
+        self._publish_cloud(depth, exclude_box=exclude_box)
         margin = int(max(bw, bh) * 0.2)
         crop_x1 = max(0, x1 - margin)
         crop_y1 = max(0, y1 - margin)
@@ -210,6 +242,31 @@ class YoloGraspNode(Node):
         d_valid = (crop_d > 0.05) & np.isfinite(crop_d)
         if d_valid.sum() < 100:
             return
+        sel_valid = np.zeros((crop_side, crop_side), bool)
+        by1, by2 = y1 - crop_y1, y2 - crop_y1
+        bx1, bx2 = x1 - crop_x1, x2 - crop_x1
+        sel_valid[by1:by2, bx1:bx2] = d_valid[by1:by2, bx1:bx2]
+        fx = self.model_cam.fx()
+        fy = self.model_cam.fy()
+        fcx = self.model_cam.cx()
+        fcy = self.model_cam.cy()
+        plane = self._table_plane_from_frame(depth)
+        if plane is not None:
+            n, d = plane
+            uu_c, vv_c = np.meshgrid(
+                np.arange(crop_x1, crop_x2), np.arange(crop_y1, crop_y2))
+            z_c = depth[crop_y1:crop_y2, crop_x1:crop_x2]
+            ok_c = (z_c > 0.05) & (z_c < 2.0) & np.isfinite(z_c)
+            xs_c = (uu_c - fcx) * z_c / fx
+            ys_c = (vv_c - fcy) * z_c / fy
+            dist_c = np.abs(xs_c * n[0] + ys_c * n[1] + z_c * n[2] + d)
+            near = np.zeros((crop_side, crop_side), bool)
+            near[:ch, :cw_real] = ok_c & (dist_c < 0.02)
+            sel_valid &= ~near
+        dist_px = cv2.distanceTransform(
+            sel_valid.astype(np.uint8), cv2.DIST_L2, 3)
+        thr_px = np.where(crop_d > 0.05, 0.01 * fx / crop_d, 0.0)
+        sel_valid &= dist_px >= thr_px
         mask = ~d_valid
         if mask.any():
             crop_d = cv2.inpaint(crop_d, mask.astype(np.uint8), 3, cv2.INPAINT_TELEA)
@@ -235,19 +292,52 @@ class YoloGraspNode(Node):
         ang_np = gaussian(ang_np, 2.0, preserve_range=True)
         width_np = width.squeeze().cpu().numpy() * 150.0
 
-        best_px = np.unravel_index(np.argmax(quality_np), quality_np.shape)
-        best_score = quality_np[best_px]
-        if best_score < self.grasp_quality:
-            return
+        sel_small = cv2.resize(
+            sel_valid.astype(np.uint8), (self.input_size, self.input_size),
+            interpolation=cv2.INTER_NEAREST).astype(bool)
+        quality_masked = np.where(sel_small, quality_np, -np.inf)
+        best_px = np.unravel_index(
+            np.argmax(quality_masked), quality_masked.shape)
+        best_score = quality_masked[best_px]
+        grasp_level = 0
+        if not np.isfinite(best_score) or best_score < self.grasp_quality:
+            relaxed = np.zeros((crop_side, crop_side), bool)
+            relaxed[by1:by2, bx1:bx2] = d_valid[by1:by2, bx1:bx2]
+            relaxed_small = cv2.resize(
+                relaxed.astype(np.uint8),
+                (self.input_size, self.input_size),
+                interpolation=cv2.INTER_NEAREST).astype(bool)
+            q1 = np.where(relaxed_small, quality_np, -np.inf)
+            p1 = np.unravel_index(np.argmax(q1), q1.shape)
+            s1 = q1[p1]
+            if np.isfinite(s1):
+                best_px, best_score, grasp_level = p1, s1, 1
+        if not np.isfinite(best_score):
+            p2 = np.unravel_index(np.argmax(quality_np), quality_np.shape)
+            s2 = quality_np[p2]
+            if np.isfinite(s2):
+                best_px, best_score, grasp_level = p2, s2, 2
+        if not np.isfinite(best_score):
+            grasp_level = 3
+            best_score = 0.0
+        if grasp_level != self._last_grasp_level:
+            self._last_grasp_level = grasp_level
+            self.get_logger().info(
+                f'Grasp point level {grasp_level} '
+                f'(score={best_score:.2f})')
 
-        v, u = best_px
-        angle = ang_np[v, u]
-        grasp_width = max(0.0, min(0.1, width_np[v, u] * 0.001))
-
-        fx = self.model_cam.fx()
-        fy = self.model_cam.fy()
-        fcx = self.model_cam.cx()
-        fcy = self.model_cam.cy()
+        if grasp_level == 3:
+            u_orig = float(cx)
+            v_orig = float(cy)
+            angle = 0.0
+            grasp_width = 0.0
+        else:
+            v, u = best_px
+            angle = ang_np[v, u]
+            grasp_width = max(0.0, min(0.1, width_np[v, u] * 0.001))
+            scale = crop_side / self.input_size
+            u_orig = crop_x1 + u * scale
+            v_orig = crop_y1 + v * scale
 
         box_d = depth[y1:y2, x1:x2]
         box_valid = box_d[(box_d > 0.05) & np.isfinite(box_d)]
@@ -259,33 +349,53 @@ class YoloGraspNode(Node):
             d_min = d_max = d_p40 = float(best_depth)
         box_z = (d_min + d_p40) / 2.0
         if box_z <= 0.05 or box_z > 2.0:
+            box_z = float(best_depth)
+        if box_z <= 0.05 or box_z > 2.0:
             return
-        box_cx = (cx - fcx) * box_z / fx
-        box_cy = (cy - fcy) * box_z / fy
-        box_sx = bw * box_z / fx
-        box_sy = bh * box_z / fy
-        box_sz = max(d_max - d_min, 0.01) + 0.02
-        self.get_logger().info(
-            f'Box depth: d_min={d_min:.3f} d_p40={d_p40:.3f} '
-            f'd_max={d_max:.3f} box_z={box_z:.3f}')
-
-        scale = crop_side / self.input_size
-        u_orig = crop_x1 + u * scale
-        v_orig = crop_y1 + v * scale
-        if not (0 <= u_orig < w and 0 <= v_orig < h):
-            x_g = box_cx
-            y_g = box_cy
+        box_fit = self._object_box_from_points(depth, x1, y1, x2, y2, plane)
+        if box_fit is None:
+            box_zc = (d_min + d_max) / 2.0
+            box_cx = (cx - fcx) * box_zc / fx
+            box_cy = (cy - fcy) * box_zc / fy
+            box_cz = box_zc
+            box_sx = min(bw * box_zc / fx, 0.3) + self.box_padding
+            box_sy = min(bh * box_zc / fy, 0.3) + self.box_padding
+            box_sz = min(max(d_max - d_min, 0.02), 0.2) + self.box_padding
+            box_quat = self._table_box_quat(plane)
+            self.get_logger().info(
+                f'Box (fallback): d_min={d_min:.3f} d_p40={d_p40:.3f} '
+                f'd_max={d_max:.3f} box_z={box_z:.3f} '
+                f'box=({box_sx:.3f}x{box_sy:.3f}x{box_sz:.3f})')
         else:
-            x_g = (u_orig - fcx) * box_z / fx
-            y_g = (v_orig - fcy) * box_z / fy
+            (box_cx, box_cy, box_cz), (box_sx, box_sy, box_sz), box_quat = box_fit
+            self.get_logger().info(
+                f'Box (world): center=({box_cx:.3f},{box_cy:.3f},'
+                f'{box_cz:.3f}) size=({box_sx:.3f}x{box_sy:.3f}x{box_sz:.3f})')
+
+        u_orig = min(max(u_orig, 0.0), float(w - 1))
+        v_orig = min(max(v_orig, 0.0), float(h - 1))
+        ui = int(round(u_orig))
+        vi = int(round(v_orig))
+        win = depth[max(0, vi - 7):min(h, vi + 8),
+                    max(0, ui - 7):min(w, ui + 8)]
+        win_valid = win[(win > 0.05) & np.isfinite(win)]
+        if len(win_valid) >= 10:
+            z_g = float(np.percentile(win_valid, 40))
+        else:
+            z_g = box_z
+        x_g = (u_orig - fcx) * z_g / fx
+        y_g = (v_orig - fcy) * z_g / fy
 
         self._publish(
-            x_g, y_g, box_z, angle, grasp_width, best_score,
-            box_center=(box_cx, box_cy, box_z),
-            box_scale=(box_sx, box_sy, box_sz))
+            x_g, y_g, z_g, angle, grasp_width, best_score,
+            box_center=(box_cx, box_cy, box_cz),
+            box_scale=(box_sx, box_sy, box_sz),
+            box_orientation=box_quat)
 
     def _publish(self, x, y, z, angle, width, score,
-                 box_center=None, box_scale=None):
+                 box_center=None, box_scale=None, box_orientation=None):
+        if not self._cloud_ok:
+            return
         try:
             transform = self.tf_buffer.lookup_transform(
                 self.base_frame,
@@ -294,6 +404,9 @@ class YoloGraspNode(Node):
                 timeout=rclpy.duration.Duration(seconds=1.0),
             )
         except TransformException:
+            self.get_logger().error(
+                'TF lookup failed; grasp pose not published',
+                throttle_duration_sec=5.0)
             return
         grasp_rot = R.from_euler('z', angle)
         pose = PoseStamped()
@@ -317,7 +430,13 @@ class YoloGraspNode(Node):
             box_pose.pose.position.x = float(box_center[0])
             box_pose.pose.position.y = float(box_center[1])
             box_pose.pose.position.z = float(box_center[2])
-            box_pose.pose.orientation.w = 1.0
+            if box_orientation is not None:
+                box_pose.pose.orientation.x = float(box_orientation[0])
+                box_pose.pose.orientation.y = float(box_orientation[1])
+                box_pose.pose.orientation.z = float(box_orientation[2])
+                box_pose.pose.orientation.w = float(box_orientation[3])
+            else:
+                box_pose.pose.orientation.w = 1.0
             base_box = do_transform_pose_stamped(box_pose, transform)
             marker = Marker()
             marker.header = base_box.header
@@ -358,7 +477,7 @@ class YoloGraspNode(Node):
         v = np.arange(0, h, ds)
         uu, vv = np.meshgrid(u, v)
         z = depth[vv, uu]
-        valid = (z > 0.05) & (z < 2.0) & np.isfinite(z)
+        valid = (z > self.min_range) & (z < 2.0) & np.isfinite(z)
 
         self._publish_points(
             self.cloud_pub, uu[valid], vv[valid], z[valid], t)
@@ -418,6 +537,186 @@ class YoloGraspNode(Node):
                 np.concatenate([z[keep], z_plane[ok]]),
                 t)
 
+    def _ransac_plane(self, pts):
+        if len(pts) < 300:
+            return None
+        sub = pts[::5] if len(pts) > 2000 else pts
+        rng = np.random.default_rng()
+        best_inl = 0
+        best_n = None
+        for _ in range(60):
+            i3 = rng.choice(len(sub), 3, replace=False)
+            p0, p1, p2 = sub[i3]
+            n = np.cross(p1 - p0, p2 - p0)
+            norm = np.linalg.norm(n)
+            if norm < 1e-9:
+                continue
+            n = n / norm
+            d = -float(n @ p0)
+            inl = int(np.count_nonzero(np.abs(sub @ n + d) < 0.012))
+            if inl > best_inl:
+                best_inl = inl
+                best_n = n
+                best_d = d
+        if best_n is None or best_inl < 0.3 * len(sub):
+            return None
+        return best_n, best_d
+
+    def _table_box_axes(self, plane=None):
+        """Orthonormal table-aligned axes derived from the RANSAC plane.
+
+        The height axis follows the table normal (gravity), so the fitted
+        box lines up with the real object instead of the camera axes.
+        Returns None if the base->camera TF is unavailable.
+        """
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.base_frame,
+                self.CAMERA_OPTICAL_FRAME,
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=1.0),
+            )
+        except TransformException:
+            return None
+        q = transform.transform.rotation
+        rot_cb = R.from_quat([q.x, q.y, q.z, q.w]).as_matrix()
+        rot_bc = rot_cb.T
+        trans = np.array([
+            transform.transform.translation.x,
+            transform.transform.translation.y,
+            transform.transform.translation.z])
+        if plane is not None:
+            n_cam = np.asarray(plane[0], dtype=float)
+            if np.linalg.norm(n_cam) < 1e-9:
+                n_base = np.array([0.0, 0.0, 1.0])
+                d_base = None
+            else:
+                n_cam = n_cam / np.linalg.norm(n_cam)
+                n_base = rot_cb @ n_cam
+                d_base = float(plane[1]) - float(n_base @ trans)
+        else:
+            n_base = np.array([0.0, 0.0, 1.0])
+            d_base = None
+        tmp = (np.array([0.0, 1.0, 0.0])
+               if abs(n_base[0]) > 0.9 else np.array([1.0, 0.0, 0.0]))
+        e1_base = np.cross(n_base, tmp)
+        e1_base = e1_base / np.linalg.norm(e1_base)
+        e2_base = np.cross(n_base, e1_base)
+        return {
+            'rot_cb': rot_cb,
+            'rot_bc': rot_bc,
+            'trans': trans,
+            'n_base': n_base,
+            'd_base': d_base,
+            'e1_base': e1_base,
+            'e2_base': e2_base,
+        }
+
+    def _table_box_quat(self, plane=None):
+        """Camera-frame quaternion of a table-aligned box (identity fallback)."""
+        axes = self._table_box_axes(plane)
+        if axes is None:
+            return (0.0, 0.0, 0.0, 1.0)
+        rot_base = np.column_stack(
+            [axes['e1_base'], axes['e2_base'], axes['n_base']])
+        rot_cam = axes['rot_bc'] @ rot_base
+        quat = R.from_matrix(rot_cam).as_quat()
+        return (float(quat[0]), float(quat[1]),
+                float(quat[2]), float(quat[3]))
+
+    def _object_box_from_points(self, depth, x1, y1, x2, y2, plane=None):
+        if plane is None:
+            plane = self._table_plane_from_frame(depth)
+        axes = self._table_box_axes(plane)
+        if axes is None:
+            return None
+        fx = self.model_cam.fx()
+        fy = self.model_cam.fy()
+        fcx = self.model_cam.cx()
+        fcy = self.model_cam.cy()
+        ds = 2
+        uu, vv = np.meshgrid(
+            np.arange(x1, x2, ds), np.arange(y1, y2, ds))
+        z = depth[vv, uu]
+        valid = (z > 0.05) & (z < 2.0) & np.isfinite(z)
+        if valid.sum() < 50:
+            return None
+        xs = (uu - fcx) * z / fx
+        ys = (vv - fcy) * z / fy
+        pts_cam = np.stack([xs[valid], ys[valid], z[valid]], axis=1)
+        pts_all = (axes['rot_cb'] @ pts_cam.T).T + axes['trans']
+        pts = pts_all
+        d_base = axes['d_base']
+        if d_base is not None:
+            n_base = axes['n_base']
+            keep = np.abs(pts @ n_base + d_base) > 0.015
+            pts = pts[keep]
+            if len(pts) < 20:
+                return None
+        n_base = axes['n_base']
+        e1_base = axes['e1_base']
+        e2_base = axes['e2_base']
+        px = pts @ e1_base
+        py = pts @ e2_base
+        h = pts @ n_base
+        px_lo, px_hi = np.percentile(px, 2), np.percentile(px, 98)
+        py_lo, py_hi = np.percentile(py, 2), np.percentile(py, 98)
+        h_hi = float(np.percentile(h, 98))
+        p_horiz = ((px_lo + px_hi) / 2.0) * e1_base + \
+            ((py_lo + py_hi) / 2.0) * e2_base
+        h_lo = float(np.percentile(h, 2))
+        if d_base is not None:
+            denom = float(n_base @ n_base)
+            if abs(denom) > 1e-6:
+                h_lo = float(-(n_base @ p_horiz + d_base) / denom)
+        # Height floor from the box's nearest-depth points. When the object's
+        # upper-surface depth is sparse, h_hi collapses toward the table and
+        # the box becomes a flat slab; the nearest (front/top) band of the box
+        # points still recovers the true object height.
+        h_floor = 0.0
+        if pts_cam.shape[0] > 0:
+            d_min = float(np.min(pts_cam[:, 2]))
+            near = pts_cam[:, 2] <= (d_min + 0.02)
+            if near.sum() > 0:
+                h_near = pts_all[near] @ n_base
+                z_top = float(np.max(h_near))
+                h_floor = min(max(0.0, z_top - h_lo), 0.2)
+        box_dims = (
+            float(px_hi - px_lo) + self.box_padding,
+            float(py_hi - py_lo) + self.box_padding,
+            max(float(h_hi - h_lo), h_floor, 0.01) + self.box_padding,
+        )
+        box_center_base = p_horiz + (float(h_lo + h_hi) / 2.0) * n_base
+        box_center = axes['rot_bc'] @ (box_center_base - axes['trans'])
+        if (not np.all(np.isfinite(box_dims))
+                or max(box_dims) > 0.5
+                or not np.all(np.isfinite(box_center))):
+            return None
+        rot_base = np.column_stack([e1_base, e2_base, n_base])
+        rot_cam = axes['rot_bc'] @ rot_base
+        quat = R.from_matrix(rot_cam).as_quat()
+        return (tuple(float(c) for c in box_center),
+                box_dims,
+                tuple(float(qq) for qq in quat))
+
+    def _table_plane_from_frame(self, depth):
+        h, w = depth.shape
+        fx = self.model_cam.fx()
+        fy = self.model_cam.fy()
+        fcx = self.model_cam.cx()
+        fcy = self.model_cam.cy()
+        ds = 8
+        uu, vv = np.meshgrid(
+            np.arange(0, w, ds), np.arange(0, h, ds))
+        z = depth[vv, uu]
+        valid = (z > self.min_range) & (z < 2.0) & np.isfinite(z)
+        if valid.sum() < 300:
+            return None
+        xs = (uu - fcx) * z / fx
+        ys = (vv - fcy) * z / fy
+        pts = np.stack([xs[valid], ys[valid], z[valid]], axis=1)
+        return self._ransac_plane(pts)
+
     def _get_table_plane(self, n, hx, hy, hz):
         if self._table_plane is not None:
             n0, d = self._table_plane
@@ -437,7 +736,7 @@ class YoloGraspNode(Node):
             return None
         heights = hx * n[0] + hy * n[1] + hz * n[2]
         low = float(np.percentile(heights, 5))
-        if not np.isfinite(low) or low < 0.05 or low > 2.0:
+        if not np.isfinite(low) or not (0.05 < abs(low) < 2.0):
             return None
         return n, -low
 
