@@ -4,6 +4,7 @@ import rclpy
 from geometry_msgs.msg import Point, Pose, PoseStamped, Quaternion
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
+from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import JointState, PointCloud2
 from std_msgs.msg import Bool
 from std_msgs.msg import Empty as EmptyMsg
@@ -46,6 +47,7 @@ class GraspExecutor(Node):
         self.declare_parameter('force_threshold', 1.5)
         self.declare_parameter('reach_tolerance', 0.03)
         self.declare_parameter('reach_timeout', 45.0)
+        self.declare_parameter('pre_approach_distance', 0.10)
         self.declare_parameter('velocity_scaling', 0.1)
         self.declare_parameter('idle_clear_interval', 10.0)
         self.declare_parameter('insert_settle', 0.3)
@@ -80,6 +82,8 @@ class GraspExecutor(Node):
         self.force_threshold = self.get_parameter('force_threshold').value
         self.reach_tolerance = self.get_parameter('reach_tolerance').value
         self.reach_timeout = self.get_parameter('reach_timeout').value
+        self.pre_approach_distance = self.get_parameter(
+            'pre_approach_distance').value
         self.velocity_scaling = self.get_parameter('velocity_scaling').value
         self.idle_clear_interval = self.get_parameter(
             'idle_clear_interval').value
@@ -127,6 +131,8 @@ class GraspExecutor(Node):
         self.triggered = False
         self.validating_target = False
         self.target_pose = None
+        self.target_hover_pose = None
+        self._approach_phase = 0
         self.target_frame = None
         self.reach_wait_start = 0.0
         self.reach_ok_count = 0
@@ -318,6 +324,19 @@ class GraspExecutor(Node):
             f'grasp_offset={self.grasp_offset:.3f}. '
             f'Waiting for /manual_grasp_start')
 
+    def _hover_from_target(self, pose):
+        q = pose.orientation
+        rot = R.from_quat([q.x, q.y, q.z, q.w]).as_matrix()
+        z_axis = rot[:, 2]
+        return Pose(
+            position=Point(
+                x=pose.position.x - z_axis[0] * self.pre_approach_distance,
+                y=pose.position.y - z_axis[1] * self.pre_approach_distance,
+                z=pose.position.z - z_axis[2] * self.pre_approach_distance,
+            ),
+            orientation=Quaternion(x=q.x, y=q.y, z=q.z, w=q.w),
+        )
+
     def manual_start_cb(self, msg):
         del msg
         if self.state != self.IDLE or self.stored_pose is None:
@@ -326,6 +345,8 @@ class GraspExecutor(Node):
             return
         self.target_pose = self.stored_pose
         self.target_frame = self.stored_frame
+        self.target_hover_pose = self._hover_from_target(self.target_pose)
+        self._approach_phase = 0
         self.validating_target = True
         self._validation_sent = False
         self._stable_wait_logged = False
@@ -560,21 +581,35 @@ class GraspExecutor(Node):
                 if not self._joints_stable():
                     self._log_stable_wait()
                     return
+                self._approach_phase = 0
                 self._mark('plan_sent')
                 self.arm.move_to_pose(
-                    self.target_pose, self.target_frame,
+                    self.target_hover_pose, self.target_frame,
                     velocity_scaling=self.velocity_scaling)
                 self.triggered = True
             elif self.arm.is_done():
-                if self.arm.success:
-                    self._mark('plan_done')
-                    self.state = self.WAIT_REACH
-                    self.reach_wait_start = self.get_clock().now().nanoseconds * 1e-9
-                    self.triggered = False
-                else:
+                if not self.arm.success:
                     self._mark('plan_failed')
-                    self.get_logger().error('Arm motion failed')
+                    self.get_logger().error('Arm motion to hover failed')
                     self._enter_home()
+                    return
+                if self._approach_phase == 0:
+                    self._approach_phase = 1
+                    self._mark('cartesian_sent')
+                    self.arm.move_cartesian_to(
+                        [self.target_pose], self.target_frame)
+                elif self._approach_phase == 1:
+                    if self.arm.success:
+                        self._mark('plan_done')
+                        self.state = self.WAIT_REACH
+                        self.reach_wait_start = (
+                            self.get_clock().now().nanoseconds * 1e-9)
+                        self.triggered = False
+                    else:
+                        self._mark('plan_failed')
+                        self.get_logger().error(
+                            'Cartesian descent failed; going home')
+                        self._enter_home()
             return
         if self.state == self.WAIT_REACH:
             elapsed = (

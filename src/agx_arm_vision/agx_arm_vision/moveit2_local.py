@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+from control_msgs.action import FollowJointTrajectory
 from geometry_msgs.msg import Pose
 from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import (
@@ -11,7 +12,7 @@ from moveit_msgs.msg import (
     OrientationConstraint,
     PositionConstraint,
 )
-from moveit_msgs.srv import ApplyPlanningScene
+from moveit_msgs.srv import ApplyPlanningScene, GetCartesianPath
 from rclpy.action import ActionClient
 from shape_msgs.msg import SolidPrimitive
 
@@ -31,6 +32,11 @@ class MoveIt2:
         self.action = ActionClient(node, MoveGroup, action_name)
         self._apply_scene_client = node.create_client(
             ApplyPlanningScene, '/apply_planning_scene')
+        self._cartesian_client = node.create_client(
+            GetCartesianPath, '/compute_cartesian_path')
+        self._traj_client = ActionClient(
+            node, FollowJointTrajectory,
+            '/arm_controller/follow_joint_trajectory')
         self.done = False
         self.success = False
         self.plan_only = False
@@ -79,6 +85,84 @@ class MoveIt2:
         if callback is not None:
             future.add_done_callback(callback)
         return True
+
+    # ------------------------------------------------------------------
+    # Cartesian straight-line path (compute_cartesian_path + execute).
+    # ------------------------------------------------------------------
+    def move_cartesian_to(
+            self, waypoints, frame_id=None, max_step=0.01,
+            jump_threshold=0.0, avoid_collisions=True):
+        """Plan a straight-line Cartesian path through `waypoints` and execute
+        it asynchronously (sets done/success like move_to_pose)."""
+        frame_id = frame_id or self.base_link
+        self.done = False
+        self.success = False
+        self.plan_only = False
+        if not self._cartesian_client.service_is_ready():
+            self.node.get_logger().error(
+                '/compute_cartesian_path service not available')
+            self.done = True
+            return
+        req = GetCartesianPath.Request()
+        req.header.frame_id = frame_id
+        req.group_name = self.group_name
+        req.link_name = self.end_effector
+        req.start_state.is_diff = True
+        req.max_step = max_step
+        req.jump_threshold = jump_threshold
+        req.avoid_collisions = avoid_collisions
+        for wp in waypoints:
+            req.waypoints.append(wp)
+        future = self._cartesian_client.call_async(req)
+
+        def on_path(f):
+            try:
+                res = f.result()
+            except Exception:
+                res = None
+            if (res is None or res.solution is None
+                    or res.fraction < 1.0 - 1e-6):
+                frac = getattr(res, 'fraction', None)
+                self.node.get_logger().error(
+                    f'Cartesian path failed (fraction={frac})')
+                self.done = True
+                self.success = False
+                return
+            self._execute_trajectory(res.solution)
+
+        future.add_done_callback(on_path)
+
+    def _execute_trajectory(self, robot_trajectory):
+        if not self._traj_client.wait_for_server(timeout_sec=5.0):
+            self.node.get_logger().error(
+                '/arm_controller/follow_joint_trajectory unavailable')
+            self.done = True
+            self.success = False
+            return
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory = robot_trajectory.joint_trajectory
+        future = self._traj_client.send_goal_async(goal)
+        future.add_done_callback(self._traj_goal_response)
+
+    def _traj_goal_response(self, future):
+        goal_handle = future.result()
+        if goal_handle is None or not goal_handle.accepted:
+            self.node.get_logger().error(
+                'FollowJointTrajectory goal rejected')
+            self.done = True
+            self.success = False
+            return
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self._traj_result_response)
+
+    def _traj_result_response(self, future):
+        result = future.result().result
+        self.success = (result.error_code == 0)
+        if not self.success:
+            self.node.get_logger().error(
+                'FollowJointTrajectory failed with code '
+                f'{result.error_code}')
+        self.done = True
 
     # ------------------------------------------------------------------
     # MoveGroup actions

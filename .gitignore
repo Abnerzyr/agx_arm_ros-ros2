@@ -17,3 +17,5 @@ oculus_reader
 oculus_reader/oculus_reader
 **/__pycache__/
 .thumbsweights/clip/
+
+weights/clip/
