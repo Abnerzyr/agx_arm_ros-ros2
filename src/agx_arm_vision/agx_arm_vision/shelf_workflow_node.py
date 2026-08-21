@@ -51,10 +51,25 @@ class ShelfWorkflowNode(Node):
         7: 'WAIT_RELEASE_CMD', 8: 'PLACING',
     }
 
+    EXECUTOR_STATE_NAMES = {
+        0: 'IDLE', 1: 'OPEN_GRIPPER', 2: 'MOVE_TO_TARGET',
+        3: 'WAIT_REACH', 4: 'CLOSE_GRIPPER', 5: 'MOVE_HOME',
+        6: 'WAIT_RELEASE', 7: 'MOVE_TO_PLACE_ABOVE',
+        8: 'LOWER_TO_PLACE', 9: 'PLACE_OPEN', 10: 'PLACE_LIFT',
+    }
+
     EXECUTOR_IDLE = 0
     EXECUTOR_WAIT_RELEASE = 6
 
-    ALIGN_DIST_EPS = 0.02
+    ALIGN_DIST_EPS = 0.42#for test remember to change it back to 0.02!!!!在rviz测试时临时使用！！！
+
+    # TCP-referenced viewing pose offsets: the TCP lands TCP_BACK_OFFSET
+    # toward the arm and TCP_HEIGHT_OFFSET above the marker.
+    TCP_BACK_OFFSET = 0.05
+    TCP_HEIGHT_OFFSET = 0.1
+    # Fixed home tcp_link orientation fallback (xyzw), used when the TF
+    # lookup at startup is unavailable.
+    HOME_TCP_QUAT = (0.683, 0.692, -0.171, -0.161)
 
     def __init__(self):
         super().__init__('shelf_workflow_node')
@@ -65,12 +80,14 @@ class ShelfWorkflowNode(Node):
         self.declare_parameter('arm_group', 'arm')
         self.declare_parameter('velocity_scaling', 0.1)
         self.declare_parameter('aruco_timeout', 5.0)
+        self.declare_parameter('align_give_up_timeout', 15.0)
+        self.declare_parameter('grasp_fail_timeout', 20.0)
+        self.declare_parameter('grasp_give_up_timeout', 90.0)
+        self.declare_parameter('place_give_up_timeout', 90.0)
         self.declare_parameter('detect_timeout', 5.0)
         self.declare_parameter('align_max_iter', 2)
         self.declare_parameter('settle_after_home', 1.0)
         self.declare_parameter('marker_fresh_timeout', 1.0)
-        self.declare_parameter('camera_back_offset', 0.1)
-        self.declare_parameter('camera_height_offset', 0.1)
         self.declare_parameter(
             'home_joints',
             [-1.751, -0.342, 1.656, 1.036, 0.360, 0.074, 1.570])
@@ -90,16 +107,20 @@ class ShelfWorkflowNode(Node):
         self.camera_frame = self.get_parameter('camera_frame').value
         self.velocity_scaling = self.get_parameter('velocity_scaling').value
         self.aruco_timeout = self.get_parameter('aruco_timeout').value
+        self.align_give_up_timeout = self.get_parameter(
+            'align_give_up_timeout').value
+        self.grasp_fail_timeout = self.get_parameter(
+            'grasp_fail_timeout').value
+        self.grasp_give_up_timeout = self.get_parameter(
+            'grasp_give_up_timeout').value
+        self.place_give_up_timeout = self.get_parameter(
+            'place_give_up_timeout').value
         self.detect_timeout = self.get_parameter('detect_timeout').value
         self.align_max_iter = self.get_parameter('align_max_iter').value
         self.settle_after_home = self.get_parameter(
             'settle_after_home').value
         self.marker_fresh_timeout = self.get_parameter(
             'marker_fresh_timeout').value
-        self.camera_back_offset = self.get_parameter(
-            'camera_back_offset').value
-        self.camera_height_offset = self.get_parameter(
-            'camera_height_offset').value
         self.home_joints = list(self.get_parameter('home_joints').value)
 
         self.tf_buffer = Buffer()
@@ -155,8 +176,11 @@ class ShelfWorkflowNode(Node):
         self._detect_start = 0.0
         self._detect_warn_logged = False
         self._grasp_trigger_time = 0.0
+        self._grasp_fail_start = None
         self._place_start = 0.0
+        self._state_log_time = 0.0
         self._busy_executor_logged = False
+        self._home_quat = None
 
         self.create_timer(0.1, self.tick)
         self.get_logger().info(
@@ -233,6 +257,8 @@ class ShelfWorkflowNode(Node):
         self._align_sent = False
         self._align_no_marker_logged = False
         self._detect_warn_logged = False
+        self._grasp_fail_start = None
+        self._state_log_time = 0.0
         self._busy_executor_logged = False
 
     def _layer_cfg(self, layer):
@@ -304,22 +330,41 @@ class ShelfWorkflowNode(Node):
         return pose
 
     def _view_pose_from_marker(self, marker_pt):
-        """Home-like viewing pose: camera 0.1m back toward the arm and
-        0.1m above the marker, looking down at it."""
+        """Fixed home orientation viewing pose: the TCP lands
+        TCP_BACK_OFFSET toward the arm and TCP_HEIGHT_OFFSET above the
+        marker, keeping the home TCP orientation."""
         v = marker_pt.copy()
         v[2] = 0.0
         nv = np.linalg.norm(v)
-        view_dir_h = v / nv if nv > 1e-6 else np.array([1.0, 0.0, 0.0])
-        cam_pos = (marker_pt
-                   - self.camera_back_offset * view_dir_h
-                   + np.array([0.0, 0.0, self.camera_height_offset]))
-        view_dir = marker_pt - cam_pos
-        n_view = np.linalg.norm(view_dir)
-        if n_view < 1e-6:
-            view_dir = np.array([0.0, 0.0, -1.0])
-        else:
-            view_dir = view_dir / n_view
-        return self._tcp_pose_from_camera(cam_pos, view_dir)
+        dirh = v / nv if nv > 1e-6 else np.array([1.0, 0.0, 0.0])
+        tcp_pos = (marker_pt
+                   - self.TCP_BACK_OFFSET * dirh
+                   + np.array([0.0, 0.0, self.TCP_HEIGHT_OFFSET]))
+        pose = Pose()
+        pose.position.x = float(tcp_pos[0])
+        pose.position.y = float(tcp_pos[1])
+        pose.position.z = float(tcp_pos[2])
+        qx, qy, qz, qw = self._fixed_tcp_quat()
+        pose.orientation.x = float(qx)
+        pose.orientation.y = float(qy)
+        pose.orientation.z = float(qz)
+        pose.orientation.w = float(qw)
+        return pose
+
+    def _fixed_tcp_quat(self):
+        if self._home_quat is None:
+            t_base_tcp = self._lookup_matrix(
+                self.base_frame, self.end_effector)
+            if t_base_tcp is not None:
+                quat = R.from_matrix(t_base_tcp[:3, :3]).as_quat()
+                self._home_quat = tuple(float(q) for q in quat)
+                self.get_logger().info(
+                    'Fixed viewing orientation set from current tcp pose')
+            else:
+                self._home_quat = self.HOME_TCP_QUAT
+                self.get_logger().warn(
+                    'TF unavailable; using hardcoded home quaternion')
+        return self._home_quat
 
     def _nominal_tcp_pose(self):
         sx = self._cfg_num('shelf_x', 0.45)
@@ -488,8 +533,16 @@ class ShelfWorkflowNode(Node):
                         f'{self.aruco_timeout:.1f}s; staying at nominal '
                         f'pose (check shelf_x/standoff or intervene)')
                     self._align_no_marker_logged = True
+                if now - self._align_start > self.align_give_up_timeout:
+                    self.get_logger().error(
+                        f'No aruco marker for '
+                        f'{self.align_give_up_timeout:.0f}s; aborting task '
+                        f'(back to IDLE, send /task_command to retry)')
+                    self._reset_cycle_vars()
+                    self._set_state(self.IDLE)
                 return
             self._align_no_marker_logged = False
+            self._align_start = now
             marker, frame_id = found
             pose = self._align_tcp_pose(marker, frame_id)
             if pose is None:
@@ -552,6 +605,8 @@ class ShelfWorkflowNode(Node):
         if self.state == self.TRIGGER_GRASP:
             self.grasp_start_pub.publish(Empty())
             self._grasp_trigger_time = now
+            self._grasp_fail_start = None
+            self._state_log_time = 0.0
             self.get_logger().info('Published /manual_grasp_start')
             self._set_state(self.GRASPING)
             return
@@ -563,12 +618,26 @@ class ShelfWorkflowNode(Node):
                     'waiting for /release_command')
                 self._set_state(self.WAIT_RELEASE_CMD)
                 return
-            if (self._executor_state == self.EXECUTOR_IDLE
-                    and now - self._grasp_trigger_time > 5.0):
-                self.get_logger().warn(
-                    'grasp_executor back to IDLE without WAIT_RELEASE; '
-                    'grasp may have failed (check /tmp/grasp.log)',
-                    throttle_duration_sec=5.0)
+            self._log_executor_state(now)
+            if self._executor_state == self.EXECUTOR_IDLE:
+                if self._grasp_fail_start is None:
+                    self._grasp_fail_start = now
+                elif now - self._grasp_fail_start > self.grasp_fail_timeout:
+                    self.get_logger().error(
+                        'Grasp failed (executor back to IDLE); aborting '
+                        'task (send /task_command to retry)')
+                    self._reset_cycle_vars()
+                    self._set_state(self.IDLE)
+                    return
+            else:
+                self._grasp_fail_start = None
+            if now - self._grasp_trigger_time > self.grasp_give_up_timeout:
+                self.get_logger().error(
+                    f'Grasp not finished within '
+                    f'{self.grasp_give_up_timeout:.0f}s; aborting task '
+                    f'(send /task_command to retry)')
+                self._reset_cycle_vars()
+                self._set_state(self.IDLE)
             return
 
         if self.state == self.WAIT_RELEASE_CMD:
@@ -582,18 +651,33 @@ class ShelfWorkflowNode(Node):
                     'Place sequence finished; task complete, back to IDLE')
                 self._layer = None
                 self._set_state(self.IDLE)
-            elif now - self._place_start > 90.0:
-                self.get_logger().warn(
-                    'Place sequence still running after 90s; check '
-                    '/tmp/grasp.log', throttle_duration_sec=10.0)
+                return
+            self._log_executor_state(now)
+            if now - self._place_start > self.place_give_up_timeout:
+                self.get_logger().error(
+                    f'Place not finished within '
+                    f'{self.place_give_up_timeout:.0f}s; aborting task '
+                    f'(send /task_command to retry)')
+                self._reset_cycle_vars()
+                self._set_state(self.IDLE)
             return
 
     def _fire_release(self):
         self._release_pending = False
         self.release_pub.publish(Empty())
         self._place_start = self.get_clock().now().nanoseconds * 1e-9
+        self._state_log_time = 0.0
         self.get_logger().info('Published /manual_release (place sequence)')
         self._set_state(self.PLACING)
+
+    def _log_executor_state(self, now):
+        if now - self._state_log_time < 1.0:
+            return
+        self._state_log_time = now
+        name = self.EXECUTOR_STATE_NAMES.get(
+            self._executor_state, str(self._executor_state))
+        self.get_logger().info(
+            f'executor state: {self._executor_state} ({name})')
 
 
 def main():

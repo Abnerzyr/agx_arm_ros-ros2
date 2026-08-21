@@ -142,7 +142,13 @@ def _build_moveit(context):
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
                 str(package_path / "launch/rsp.launch.py")
-            )
+            ),
+            launch_arguments={
+                "namespace": namespace,
+                "follow": LaunchConfiguration("follow"),
+                "feedback_topic": LaunchConfiguration("feedback_topic"),
+                "control_topic": LaunchConfiguration("control_topic"),
+            }.items(),
         )
     )
 

@@ -51,7 +51,7 @@ for i in $(seq 1 15); do
 done
 
 echo "=== Starting RViz ==="
-rviz2 -d /home/s1/tiaozhanbei/agx_arm_ros-ros2/src/agx_arm_vision/rviz/shelf_sim.rviz &
+rviz2 -d /home/s1/tiaozhanbei/agx_arm_ros-ros2/src/agx_arm_vision/rviz/shelf_realcam.rviz &
 RVIZ_PID=$!
 echo "  rviz PID=$RVIZ_PID"
 
@@ -107,7 +107,6 @@ echo "=== Starting shelf workflow (sim config) ==="
 ros2 run agx_arm_vision shelf_workflow \
   --ros-args \
   -p config_file:=/home/s1/tiaozhanbei/agx_arm_ros-ros2/src/agx_arm_vision/config/shelf_layers_sim.yaml \
-  -p camera_height_offset:=0.20 \
   &>/tmp/shelf.log &
 SHELF_PID=$!
 echo "  shelf_workflow PID=$SHELF_PID"

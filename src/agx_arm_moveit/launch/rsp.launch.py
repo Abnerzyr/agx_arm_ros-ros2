@@ -17,6 +17,10 @@ def _launch(context):
     control_topic = LaunchConfiguration("control_topic").perform(context)
     joint_states_topic = str(feedback_topic) if follow == "true" else str(control_topic)
 
+    # 命名空间 -> frame_prefix：让 TF 帧也带前缀（arm/base_link），避免与底盘 base_link 冲突
+    namespace = LaunchConfiguration("namespace").perform(context).strip("/")
+    frame_prefix = namespace + "/" if namespace else ""
+
     moveit_config = build_moveit_config(context)
 
     return [
@@ -25,7 +29,7 @@ def _launch(context):
             executable="robot_state_publisher",
             respawn=True,
             output="screen",
-            parameters=[moveit_config.robot_description],
+            parameters=[moveit_config.robot_description, {"frame_prefix": frame_prefix}],
             remappings=[("joint_states", joint_states_topic)],
         )
     ]
