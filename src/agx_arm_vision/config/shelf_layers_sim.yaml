@@ -1,0 +1,21 @@
+# 货架分层抓取-放置工作流【纯仿真】配置
+# 数值已调整到 mock 机械臂可达工作空间；真机请用 shelf_layers.yaml
+
+base_frame: base_link
+camera_frame: camera_color_optical_frame
+
+base_height: 0.3          # 仿真底座高度 (m)，把层位抬高以便 mock 臂可达
+standoff: 0.30            # 保留字段，对准已改用 俯视式(后0.1/高0.1)
+shelf_x: -0.40            # nominal 瞄准点 x (m)；home 时手臂前向为 -x
+shelf_y: -0.16            # nominal 瞄准点 y (m)，左右居中
+
+layers:
+  - layer: 1
+    aruco_id: 1
+    layer_height: 0.6     # base_link 相对 z = 0.3
+  - layer: 2
+    aruco_id: 2
+    layer_height: 0.9     # → 0.6
+  - layer: 3
+    aruco_id: 3
+    layer_height: 1.2     # → 0.9

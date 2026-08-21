@@ -4,9 +4,11 @@ import rclpy
 from aruco_opencv_msgs.msg import ArucoDetection, MarkerPose
 from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
+from std_msgs.msg import ColorRGBA
 from std_srvs.srv import Empty
 from tf2_geometry_msgs import do_transform_pose_stamped
 from tf2_ros import Buffer, TransformException, TransformListener
+from visualization_msgs.msg import Marker
 
 
 class VirtualArucoPublisher(Node):
@@ -33,6 +35,8 @@ class VirtualArucoPublisher(Node):
             ArucoDetection, '/aruco_detections', 10)
         self.world_pub = self.create_publisher(
             PoseStamped, '/virtual_marker_world', 10)
+        self.marker_pub = self.create_publisher(
+            Marker, '/virtual_aruco_marker', 10)
         self.create_service(Empty, '/reset_virtual_marker', self.reset_marker)
         self.create_timer(
             1.0 / self.get_parameter('rate').value, self.publish_marker)
@@ -54,6 +58,19 @@ class VirtualArucoPublisher(Node):
         world_pose.pose.position.z = float(self.z)
         world_pose.pose.orientation.w = 1.0
         self.world_pub.publish(world_pose)
+
+        square = Marker()
+        square.header = world_pose.header
+        square.ns = 'virtual_aruco'
+        square.id = 0
+        square.type = Marker.CUBE
+        square.action = Marker.ADD
+        square.pose = world_pose.pose
+        square.scale.x = 0.05
+        square.scale.y = 0.05
+        square.scale.z = 0.002
+        square.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=0.9)
+        self.marker_pub.publish(square)
 
         try:
             transform = self.tf_buffer.lookup_transform(

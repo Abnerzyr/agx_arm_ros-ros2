@@ -1,6 +1,6 @@
 #!/bin/bash
 cd /home/s1/tiaozhanbei/agx_arm_ros-ros2
-rm -f /dev/shm/fastrtps_port* 2>/dev/null
+rm -f /dev/shm/fastrtps* 2>/dev/null
 source install/setup.bash
 
 echo "=== Activating CAN ==="
@@ -67,7 +67,10 @@ pkill -9 -f rviz2 2>/dev/null || true
 pkill -9 -f agx_arm_ctrl_single 2>/dev/null || true
 pkill -9 -f realsense2_camera 2>/dev/null || true
 pkill -9 -f aruco_tracker 2>/dev/null || true
-pkill -9 -f grconvnet_grasp 2>/dev/null || true
+pkill -9 -f yolo_grasp 2>/dev/null || true
+pkill -9 -f place_planner 2>/dev/null || true
+pkill -9 -f grasp_target_marker 2>/dev/null || true
+pkill -9 -f robot_state_publisher 2>/dev/null || true
 sleep 1
 pkill -9 -f grasp_executor 2>/dev/null || true
 pkill -9 -f vision_grasp_node 2>/dev/null || true
@@ -80,9 +83,10 @@ ros2 launch agx_arm_ctrl start_single_agx_arm_moveit.launch.py \
   effector_type:=agx_gripper \
   auto_enable:=true \
   auto_control_gate:=true \
-  speed_percent:=5 \
+  speed_percent:=10 \
   fw_version:=v111 \
   auto_home:=true \
+  use_rviz:=false \
   follow:=true &
 MOVEIT_PID=$!
 
@@ -97,6 +101,13 @@ for i in $(seq 1 10); do
     echo "  waiting for controllers... ($i)"
     sleep 2
 done
+
+echo "=== Starting RViz ==="
+rviz2 -d /home/s1/tiaozhanbei/agx_arm_ros-ros2/src/config/yolo_config.rviz &
+RVIZ_PID=$!
+echo "  rviz PID=$RVIZ_PID"
+
+echo "=== Starting camera ==="
 ros2 run realsense2_camera realsense2_camera_node \
   --ros-args -r __node:=camera -r __ns:=/camera \
   -p align_depth.enable:=true -p publish_tf:=false &
@@ -104,22 +115,33 @@ CAM_PID=$!
 
 sleep 3
 
-echo "=== Starting GR-ConvNet ==="
-ros2 run agx_arm_vision grconvnet_grasp &>/tmp/grconv.log &
-GRCONV_PID=$!
-echo "  grconvnet_grasp PID=$GRCONV_PID"
+echo "=== Starting YOLO+Grasp ==="
+ros2 run agx_arm_vision yolo_grasp &>/tmp/yolo.log &
+YOLO_PID=$!
+echo "  yolo_grasp PID=$YOLO_PID"
+
+echo "=== Starting place planner ==="
+ros2 run agx_arm_vision place_planner &>/tmp/place.log &
+PLACE_PID=$!
+echo "  place_planner PID=$PLACE_PID"
+
+echo "=== Starting grasp target marker ==="
+ros2 run agx_arm_vision grasp_target_marker &>/tmp/marker.log &
+MARKER_PID=$!
+echo "  marker PID=$MARKER_PID"
 
 sleep 2
-
-echo "=== All started (GR-ConvNet) ==="
-echo "CAN=$CAN_PORT  MoveIt=$MOVEIT_PID  Cam=$CAM_PID  GRConv=$GRCONV_PID  Grasp=$GRASP_PID"
-echo ""
 
 echo "=== Starting grasp executor ==="
 ros2 run agx_arm_vision grasp_executor &>/tmp/grasp.log &
 GRASP_PID=$!
 echo "  grasp_executor PID=$GRASP_PID"
 
+echo "=== All started (YOLO) ==="
+echo "CAN=$CAN_PORT  MoveIt=$MOVEIT_PID  Cam=$CAM_PID  YOLO=$YOLO_PID  Place=$PLACE_PID  Marker=$MARKER_PID  Grasp=$GRASP_PID"
+echo ""
 echo "Manual commands:"
+echo "  ros2 topic pub --once -w 1 /manual_grasp_start std_msgs/msg/Empty '{}'"
+echo "  ros2 topic pub --once -w 1 /manual_release std_msgs/msg/Empty '{}'"
 echo "  ros2 service call /move_home std_srvs/srv/Empty"
 wait

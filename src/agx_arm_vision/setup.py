@@ -16,6 +16,7 @@ setup(
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
         (os.path.join('share', package_name, 'rviz'), glob('rviz/*.rviz')),
+        (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
     ],
     install_requires=['setuptools'],
     package_data={'agx_arm_vision': ['models/*.pt', 'models/*.py', 'models/grconvnet/*', 'models/inference/**/*.py']},
@@ -43,6 +44,8 @@ setup(
             'tilt_measure = agx_arm_vision.camera_tilt_measure:main',
             'random_grasp_flow = agx_arm_vision.random_grasp_flow_test:main',
             'virtual_obstacle_cloud = agx_arm_vision.virtual_obstacle_cloud:main',
+            'shelf_workflow = agx_arm_vision.shelf_workflow_node:main',
+            'virtual_yolo_target = agx_arm_vision.virtual_yolo_target:main',
         ],
     },
 )

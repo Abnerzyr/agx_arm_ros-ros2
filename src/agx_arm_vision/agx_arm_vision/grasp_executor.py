@@ -6,7 +6,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import JointState, PointCloud2
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Int32
 from std_msgs.msg import Empty as EmptyMsg
 from std_srvs.srv import Empty as EmptySrv
 from tf2_ros import Buffer, TransformException, TransformListener
@@ -187,6 +187,8 @@ class GraspExecutor(Node):
         self._place_abort_open = False
         self.move_j_pub = self.create_publisher(
             JointState, '/control/move_j', 10)
+        self.state_pub = self.create_publisher(
+            Int32, '/grasp_executor_state', 10)
         self.map_update_pub = self.create_publisher(
             Bool, '/map_update_enable', 10)
         self.place_update_pub = self.create_publisher(
@@ -427,6 +429,7 @@ class GraspExecutor(Node):
         self._last_joint_feedback = self.get_clock().now().nanoseconds * 1e-9
 
     def tick(self):
+        self.state_pub.publish(Int32(data=self.state))
         self.gripper.update(0.1)
         map_update = Bool()
         map_update.data = (self.state == self.IDLE)

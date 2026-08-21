@@ -1,6 +1,8 @@
 #!/bin/bash
+# start_arm_yolo_tilt.sh : inherits start_arm_yolo.sh and adds a camera
+# tilt measurement (table-plane vs base-xy) after the camera is up.
 cd /home/s1/tiaozhanbei/agx_arm_ros-ros2
-rm -f /dev/shm/fastrtps_port* 2>/dev/null
+rm -f /dev/shm/fastrtps* 2>/dev/null
 source install/setup.bash
 
 echo "=== Activating CAN ==="
@@ -68,8 +70,8 @@ pkill -9 -f agx_arm_ctrl_single 2>/dev/null || true
 pkill -9 -f realsense2_camera 2>/dev/null || true
 pkill -9 -f aruco_tracker 2>/dev/null || true
 pkill -9 -f yolo_grasp 2>/dev/null || true
-pkill -9 -f place_planner 2>/dev/null || true
 pkill -9 -f grasp_target_marker 2>/dev/null || true
+pkill -9 -f tilt_measure 2>/dev/null || true
 pkill -9 -f robot_state_publisher 2>/dev/null || true
 sleep 1
 pkill -9 -f grasp_executor 2>/dev/null || true
@@ -115,15 +117,26 @@ CAM_PID=$!
 
 sleep 3
 
+echo "=== Measuring camera tilt (table plane vs base-xy) ==="
+echo "  collecting 30 frames (~15s), make sure the table is visible"
+ros2 run agx_arm_vision tilt_measure --ros-args -p frames:=30 \
+  &>/tmp/tilt.log &
+TILT_PID=$!
+for i in $(seq 1 40); do
+    if ! kill -0 $TILT_PID 2>/dev/null; then
+        break
+    fi
+    sleep 1
+done
+kill $TILT_PID 2>/dev/null || true
+echo "--- tilt measurement result ---"
+grep -E "TILT ANGLE|n_meas|n_pred|New camera_mount|negligible|Correction" \
+    /tmp/tilt.log || tail -10 /tmp/tilt.log
+
 echo "=== Starting YOLO+Grasp ==="
 ros2 run agx_arm_vision yolo_grasp &>/tmp/yolo.log &
 YOLO_PID=$!
 echo "  yolo_grasp PID=$YOLO_PID"
-
-echo "=== Starting place planner ==="
-ros2 run agx_arm_vision place_planner &>/tmp/place.log &
-PLACE_PID=$!
-echo "  place_planner PID=$PLACE_PID"
 
 echo "=== Starting grasp target marker ==="
 ros2 run agx_arm_vision grasp_target_marker &>/tmp/marker.log &
@@ -137,8 +150,8 @@ ros2 run agx_arm_vision grasp_executor &>/tmp/grasp.log &
 GRASP_PID=$!
 echo "  grasp_executor PID=$GRASP_PID"
 
-echo "=== All started (YOLO) ==="
-echo "CAN=$CAN_PORT  MoveIt=$MOVEIT_PID  Cam=$CAM_PID  YOLO=$YOLO_PID  Place=$PLACE_PID  Marker=$MARKER_PID  Grasp=$GRASP_PID"
+echo "=== All started (YOLO + tilt check) ==="
+echo "CAN=$CAN_PORT  MoveIt=$MOVEIT_PID  Cam=$CAM_PID  Tilt=$TILT_PID  YOLO=$YOLO_PID  Marker=$MARKER_PID  Grasp=$GRASP_PID"
 echo ""
 echo "Manual commands:"
 echo "  ros2 topic pub --once -w 1 /manual_grasp_start std_msgs/msg/Empty '{}'"

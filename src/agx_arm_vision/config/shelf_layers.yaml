@@ -1,0 +1,21 @@
+# 货架分层抓取-放置工作流配置
+# 所有高度/距离单位: m, 角度单位: deg
+
+base_frame: base_link
+camera_frame: camera_color_optical_frame
+
+base_height: 0.5          # 底座平台离地高度 (m)
+standoff: 0.40            # 相机到 marker/物体的工作距离 (m)
+shelf_x: 0.45             # 货架相对底座的水平距离 (m)，默认值，后续实测调整
+shelf_y: 0.0              # 货架相对底座的横向偏移 (m)
+
+layers:
+  - layer: 1
+    aruco_id: 1
+    layer_height: 0.6     # 层平面离地高度 → base_link 相对 z = 0.1
+  - layer: 2
+    aruco_id: 2
+    layer_height: 0.9     # → 0.4
+  - layer: 3
+    aruco_id: 3
+    layer_height: 1.2     # → 0.7
