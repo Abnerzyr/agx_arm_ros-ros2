@@ -43,7 +43,7 @@ Visualization Manager:
         Durability Policy: Transient Local
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /robot_description
+        Value: robot_description
       Enabled: true
       Links:
         All Links Enabled: true
@@ -241,7 +241,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /grasp_pose
+        Value: grasp_pose
       Value: true
     - Class: rviz_default_plugins/Marker
       Enabled: true
@@ -254,7 +254,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /grasp_target_marker
+        Value: grasp_target_marker
       Value: true
     - Alpha: 1
       Autocompute Intensity Bounds: true
@@ -286,7 +286,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /yolo/points
+        Value: yolo/points
       Use Fixed Frame: true
       Use rainbow: true
       Value: false
@@ -302,7 +302,7 @@ Visualization Manager:
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /yolo/detections
+        Value: yolo/detections
       Value: true
     - Class: rviz_default_plugins/Image
       Enabled: true
@@ -316,7 +316,7 @@ Visualization Manager:
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /yolo/quality_map
+        Value: yolo/quality_map
       Value: true
     - Class: rviz_default_plugins/Image
       Enabled: true
@@ -330,13 +330,13 @@ Visualization Manager:
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /yolo/crop_rgb
+        Value: yolo/crop_rgb
       Value: true
     - Class: moveit_rviz_plugin/PlanningScene
       Enabled: true
       Move Group Namespace: ""
       Name: PlanningScene
-      Planning Scene Topic: /monitored_planning_scene
+      Planning Scene Topic: monitored_planning_scene
       Robot Description: robot_description
       Scene Geometry:
         Scene Alpha: 0.8999999761581421
@@ -449,7 +449,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /yolo/target_box
+        Value: yolo/target_box
       Value: true
   Enabled: true
   Global Options:

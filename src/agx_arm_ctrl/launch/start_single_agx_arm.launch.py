@@ -107,7 +107,7 @@ def generate_launch_description():
 
     home_joints_arg = DeclareLaunchArgument(
         'home_joints',
-        default_value='[-1.751, -0.342, 1.656, 1.036, 0.360, 0.074, 1.570]',
+        default_value='[-0.0259, -0.4025, -0.0575, 2.1947, 0.0604, 0.0722, 0.9141]',
         description='Home joint angles (radians) for auto-homing.',
     )
 

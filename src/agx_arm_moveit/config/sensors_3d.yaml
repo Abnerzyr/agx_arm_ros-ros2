@@ -4,7 +4,7 @@ sensors:
 
 point_cloud_sensor:
   sensor_plugin: occupancy_map_monitor/PointCloudOctomapUpdater
-  point_cloud_topic: /yolo/points_filtered
+  point_cloud_topic: yolo/points_filtered
   max_range: 5.0
   point_subsample: 1
   padding_offset: 0.02
@@ -14,7 +14,7 @@ point_cloud_sensor:
 
 place_cloud_sensor:
   sensor_plugin: occupancy_map_monitor/PointCloudOctomapUpdater
-  point_cloud_topic: /place/points_filtered
+  point_cloud_topic: place/points_filtered
   max_range: 5.0
   point_subsample: 1
   padding_offset: 0.02

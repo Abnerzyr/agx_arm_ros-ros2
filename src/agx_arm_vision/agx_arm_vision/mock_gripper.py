@@ -18,7 +18,7 @@ class MockGripper(Node):
         self.declare_parameter('object_width', 0.03)
         self.declare_parameter('grasp_force', 2.0)
         self.declare_parameter(
-            'gripper_action', '/gripper_controller/follow_joint_trajectory')
+            'gripper_action', 'gripper_controller/follow_joint_trajectory')
         self.declare_parameter('gripper_joint', 'gripper')
         self.declare_parameter('trajectory_duration', 1.0)
         self.declare_parameter('press_tolerance', 0.002)
@@ -46,13 +46,13 @@ class MockGripper(Node):
         )
 
         self.create_subscription(
-            JointState, '/control/gripper_target',
+            JointState, 'control/gripper_target',
             self.target_callback, 10)
         self.create_subscription(
-            JointState, '/control/joint_states',
+            JointState, 'control/joint_states',
             self.joint_states_callback, 10)
         self.status_pub = self.create_publisher(
-            GripperStatus, '/feedback/gripper_status', 10)
+            GripperStatus, 'feedback/gripper_status', 10)
         self.create_timer(0.02, self.step)
         self.get_logger().info(
             f'Mock gripper ready (simulate_object={self.simulate_object}, '

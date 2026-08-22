@@ -29,6 +29,7 @@ class YoloGraspNode(Node):
     def __init__(self):
         super().__init__('yolo_grasp_node')
         self.declare_parameter('base_frame', 'base_link')
+        self.declare_parameter('camera_optical_frame', 'camera_color_optical_frame')
         self.declare_parameter(
             'depth_topic', '/camera/camera/aligned_depth_to_color/image_raw')
         self.declare_parameter(
@@ -44,6 +45,8 @@ class YoloGraspNode(Node):
         self.declare_parameter('target_classes', ["rubik's cube"])
 
         self.base_frame = self.get_parameter('base_frame').value
+        self.camera_optical_frame = self.get_parameter(
+            'camera_optical_frame').value
         self.conf_threshold = self.get_parameter('confidence_threshold').value
         self.grasp_quality = self.get_parameter('grasp_quality_threshold').value
         self.input_size = self.get_parameter('input_size').value
@@ -102,22 +105,22 @@ class YoloGraspNode(Node):
             CameraInfo, self.get_parameter('info_topic').value,
             self.info_callback, 10)
         self.create_subscription(
-            Bool, '/map_update_enable', self.map_update_cb, 10)
+            Bool, 'map_update_enable', self.map_update_cb, 10)
 
         self.grasp_pub = self.create_publisher(
-            PoseStamped, '/grasp_pose', 10)
+            PoseStamped, 'grasp_pose', 10)
         self.det_img_pub = self.create_publisher(
-            Image, '/yolo/detections', 10)
+            Image, 'yolo/detections', 10)
         self.crop_img_pub = self.create_publisher(
-            Image, '/yolo/crop_rgb', 10)
+            Image, 'yolo/crop_rgb', 10)
         self.quality_pub = self.create_publisher(
-            Image, '/yolo/quality_map', 10)
+            Image, 'yolo/quality_map', 10)
         self.cloud_pub = self.create_publisher(
-            PointCloud2, '/yolo/points', 10)
+            PointCloud2, 'yolo/points', 10)
         self.filtered_cloud_pub = self.create_publisher(
-            PointCloud2, '/yolo/points_filtered', 10)
+            PointCloud2, 'yolo/points_filtered', 10)
         self.target_box_pub = self.create_publisher(
-            Marker, '/yolo/target_box', 10)
+            Marker, 'yolo/target_box', 10)
 
         self.create_timer(0.5, self.process)
         self.get_logger().info('YOLO+Grasp node ready')
@@ -399,7 +402,7 @@ class YoloGraspNode(Node):
         try:
             transform = self.tf_buffer.lookup_transform(
                 self.base_frame,
-                self.CAMERA_OPTICAL_FRAME,
+                self.camera_optical_frame,
                 rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=1.0),
             )
@@ -410,7 +413,7 @@ class YoloGraspNode(Node):
             return
         grasp_rot = R.from_euler('z', angle)
         pose = PoseStamped()
-        pose.header.frame_id = self.CAMERA_OPTICAL_FRAME
+        pose.header.frame_id = self.camera_optical_frame
         pose.header.stamp = self.get_clock().now().to_msg()
         pose.pose.position.x = float(x)
         pose.pose.position.y = float(y)
@@ -425,7 +428,7 @@ class YoloGraspNode(Node):
 
         if box_center is not None and box_scale is not None:
             box_pose = PoseStamped()
-            box_pose.header.frame_id = self.CAMERA_OPTICAL_FRAME
+            box_pose.header.frame_id = self.camera_optical_frame
             box_pose.header.stamp = pose.header.stamp
             box_pose.pose.position.x = float(box_center[0])
             box_pose.pose.position.y = float(box_center[1])
@@ -465,7 +468,7 @@ class YoloGraspNode(Node):
         try:
             t = self.tf_buffer.lookup_transform(
                 self.base_frame,
-                self.CAMERA_OPTICAL_FRAME,
+                self.camera_optical_frame,
                 rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=1.0),
             )
@@ -572,7 +575,7 @@ class YoloGraspNode(Node):
         try:
             transform = self.tf_buffer.lookup_transform(
                 self.base_frame,
-                self.CAMERA_OPTICAL_FRAME,
+                self.camera_optical_frame,
                 rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=1.0),
             )

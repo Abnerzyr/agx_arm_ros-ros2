@@ -22,6 +22,10 @@ def _launch(context):
     control_topic = LaunchConfiguration("control_topic").perform(context)
     joint_states_topic = str(feedback_topic) if follow else str(control_topic)
 
+    # 命名空间 -> octomap_frame：MoveIt 的 octomap 附着帧带前缀
+    namespace = LaunchConfiguration("namespace").perform(context).strip("/")
+    frame_prefix = namespace + "/" if namespace else ""
+
     move_group_configuration = {
         "publish_robot_description_semantic": True,
         "allow_trajectory_execution": LaunchConfiguration("allow_trajectory_execution"),
@@ -45,7 +49,7 @@ def _launch(context):
         ),
         "monitor_dynamics": False,
         "octomap_resolution": 0.02,
-        "octomap_frame": "base_link",
+        "octomap_frame": frame_prefix + "base_link",
     }
 
     move_group_params = [

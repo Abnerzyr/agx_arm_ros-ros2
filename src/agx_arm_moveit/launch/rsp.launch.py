@@ -17,9 +17,13 @@ def _launch(context):
     control_topic = LaunchConfiguration("control_topic").perform(context)
     joint_states_topic = str(feedback_topic) if follow == "true" else str(control_topic)
 
-    # 命名空间 -> frame_prefix：让 TF 帧也带前缀（arm/base_link），避免与底盘 base_link 冲突
+    # 命名空间下，link 名前缀已烤进 URDF（见 _moveit_config_builder），
+    # 因此这里不再用 frame_prefix（避免双前缀）。
+    # robot_state_publisher 会把 TF 发到全局 /tf；实测所有 TF 消费者
+    # （RViz / move_group / 视觉节点的 transform_listener）都订阅根 /tf，
+    # 所以这里不能把 TF remap 进命名空间，保持发根 /tf 即可。
     namespace = LaunchConfiguration("namespace").perform(context).strip("/")
-    frame_prefix = namespace + "/" if namespace else ""
+    remappings = [("joint_states", joint_states_topic)]
 
     moveit_config = build_moveit_config(context)
 
@@ -29,8 +33,8 @@ def _launch(context):
             executable="robot_state_publisher",
             respawn=True,
             output="screen",
-            parameters=[moveit_config.robot_description, {"frame_prefix": frame_prefix}],
-            remappings=[("joint_states", joint_states_topic)],
+            parameters=[moveit_config.robot_description],
+            remappings=remappings,
         )
     ]
 

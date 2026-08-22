@@ -124,7 +124,7 @@ class AgxArmRosNode(Node):
         self.declare_parameter("auto_home", True)
         self.declare_parameter(
             "home_joints",
-            [-1.751, -0.342, 1.656, 1.036, 0.360, 0.074, 1.570])
+            [-0.0259, -0.4025, -0.0575, 2.1947, 0.0604, 0.0722, 0.9141])
 
     def _load_parameters(self):
         self.can_port = self.get_parameter("can_port").value

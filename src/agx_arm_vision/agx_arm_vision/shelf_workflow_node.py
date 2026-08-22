@@ -61,7 +61,7 @@ class ShelfWorkflowNode(Node):
     EXECUTOR_IDLE = 0
     EXECUTOR_WAIT_RELEASE = 6
 
-    ALIGN_DIST_EPS = 0.42#for test remember to change it back to 0.02!!!!在rviz测试时临时使用！！！
+    ALIGN_DIST_EPS = 0.02
 
     # TCP-referenced viewing pose offsets: the TCP lands TCP_BACK_OFFSET
     # toward the arm and TCP_HEIGHT_OFFSET above the marker.
@@ -90,7 +90,7 @@ class ShelfWorkflowNode(Node):
         self.declare_parameter('marker_fresh_timeout', 1.0)
         self.declare_parameter(
             'home_joints',
-            [-1.751, -0.342, 1.656, 1.036, 0.360, 0.074, 1.570])
+            [-0.0259, -0.4025, -0.0575, 2.1947, 0.0604, 0.0722, 0.9141])
 
         config_file = self.get_parameter('config_file').value
         if not os.path.exists(config_file):
@@ -137,24 +137,24 @@ class ShelfWorkflowNode(Node):
         )
 
         self.grasp_start_pub = self.create_publisher(
-            Empty, '/manual_grasp_start', 10)
+            Empty, 'manual_grasp_start', 10)
         self.release_pub = self.create_publisher(
-            Empty, '/manual_release', 10)
+            Empty, 'manual_release', 10)
         self.align_target_pub = self.create_publisher(
-            Marker, '/shelf/align_target', 10)
+            Marker, 'shelf/align_target', 10)
 
         self.create_subscription(
-            Int32, '/task_command', self.task_cmd_cb, 10)
+            Int32, 'task_command', self.task_cmd_cb, 10)
         self.create_subscription(
-            Empty, '/release_command', self.release_cmd_cb, 10)
+            Empty, 'release_command', self.release_cmd_cb, 10)
         self.create_subscription(
             ArucoDetection, '/aruco_detections', self.aruco_cb, 10)
         self.create_subscription(
-            Marker, '/yolo/target_box', self.target_box_cb, 10)
+            Marker, 'yolo/target_box', self.target_box_cb, 10)
         self.create_subscription(
-            PoseStamped, '/grasp_pose', self.grasp_pose_cb, 10)
+            PoseStamped, 'grasp_pose', self.grasp_pose_cb, 10)
         self.create_subscription(
-            Int32, '/grasp_executor_state', self.executor_state_cb, 10)
+            Int32, 'grasp_executor_state', self.executor_state_cb, 10)
 
         self.state = self.IDLE
         self._layer = None
@@ -387,7 +387,11 @@ class ShelfWorkflowNode(Node):
         return None
 
     def _align_tcp_pose(self, marker, detection_frame):
-        t_base_cam = self._lookup_matrix(self.base_frame, detection_frame)
+        # Aruco detections are always expressed in the camera optical frame;
+        # use the configurable camera_frame so the lookup works under a
+        # namespace (detection header frame is unprefixed, TF frames are not).
+        del detection_frame
+        t_base_cam = self._lookup_matrix(self.base_frame, self.camera_frame)
         if t_base_cam is None:
             return None
         p_cam = np.array([

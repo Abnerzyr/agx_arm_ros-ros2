@@ -21,6 +21,7 @@ class PlacePlanner(Node):
     def __init__(self):
         super().__init__('place_planner')
         self.declare_parameter('base_frame', 'base_link')
+        self.declare_parameter('camera_optical_frame', 'camera_color_optical_frame')
         self.declare_parameter(
             'depth_topic', '/camera/camera/aligned_depth_to_color/image_raw')
         self.declare_parameter(
@@ -34,6 +35,8 @@ class PlacePlanner(Node):
         self.declare_parameter('process_period', 0.5)
 
         self.base_frame = self.get_parameter('base_frame').value
+        self.camera_optical_frame = self.get_parameter(
+            'camera_optical_frame').value
         self.table_dist = self.get_parameter('table_distance_threshold').value
         self.occupied_thresh = self.get_parameter(
             'occupied_height_threshold').value
@@ -60,14 +63,14 @@ class PlacePlanner(Node):
             CameraInfo, self.get_parameter('info_topic').value,
             self.info_callback, 10)
         self.create_subscription(
-            Bool, '/place_update_enable', self.place_update_cb, 10)
+            Bool, 'place_update_enable', self.place_update_cb, 10)
 
         self.place_pub = self.create_publisher(
-            PoseStamped, '/place_pose', 10)
+            PoseStamped, 'place_pose', 10)
         self.cloud_pub = self.create_publisher(
-            PointCloud2, '/place/points_filtered', 10)
+            PointCloud2, 'place/points_filtered', 10)
         self.marker_pub = self.create_publisher(
-            Marker, '/place_target_marker', 10)
+            Marker, 'place_target_marker', 10)
 
         self.create_timer(self.process_period, self.process)
         self.get_logger().info('Place planner ready')
@@ -96,7 +99,7 @@ class PlacePlanner(Node):
         try:
             return self.tf_buffer.lookup_transform(
                 self.base_frame,
-                self.CAMERA_OPTICAL_FRAME,
+                self.camera_optical_frame,
                 rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=1.0),
             )

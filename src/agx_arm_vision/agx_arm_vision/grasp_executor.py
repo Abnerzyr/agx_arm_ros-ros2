@@ -54,20 +54,20 @@ class GraspExecutor(Node):
         self.declare_parameter('rebuild_timeout', 2.5)
         self.declare_parameter('box_apply_timeout', 5.0)
         self.declare_parameter('box_remove_timeout', 3.0)
-        self.declare_parameter('place_pose_topic', '/place_pose')
-        self.declare_parameter('place_cloud_topic', '/place/points_filtered')
+        self.declare_parameter('place_pose_topic', 'place_pose')
+        self.declare_parameter('place_cloud_topic', 'place/points_filtered')
         self.declare_parameter(
-            'place_filtered_cloud_topic', '/place_filtered_cloud')
+            'place_filtered_cloud_topic', 'place_filtered_cloud')
         self.declare_parameter('place_z_clearance', 0.05)
         self.declare_parameter('place_pose_timeout', 2.0)
         self.declare_parameter('place_lower_timeout', 20.0)
         self.declare_parameter(
-            'filtered_cloud_topic', '/filtered_cloud')
+            'filtered_cloud_topic', 'filtered_cloud')
         self.declare_parameter(
             'constrain_orientation', True)
         self.declare_parameter(
             'home_joints',
-            [-1.751, -0.342, 1.656, 1.036, 0.360, 0.074, 1.570])
+            [-0.0259, -0.4025, -0.0575, 2.1947, 0.0604, 0.0722, 0.9141])
 
         self.base_link = self.get_parameter('base_link').value
         self.end_effector = self.get_parameter('end_effector_link').value
@@ -150,7 +150,7 @@ class GraspExecutor(Node):
         self._latched_box = None
         self._pending_pose = None
         self._pending_time = 0.0
-        self._clear_client = self.create_client(EmptySrv, '/clear_octomap')
+        self._clear_client = self.create_client(EmptySrv, 'clear_octomap')
         self._last_cloud_time = 0.0
         self._last_filtered_time = 0.0
         self._last_idle_clear = self.get_clock().now().nanoseconds * 1e-9
@@ -186,29 +186,29 @@ class GraspExecutor(Node):
         self._place_cycle_home = False
         self._place_abort_open = False
         self.move_j_pub = self.create_publisher(
-            JointState, '/control/move_j', 10)
+            JointState, 'control/move_j', 10)
         self.state_pub = self.create_publisher(
-            Int32, '/grasp_executor_state', 10)
+            Int32, 'grasp_executor_state', 10)
         self.map_update_pub = self.create_publisher(
-            Bool, '/map_update_enable', 10)
+            Bool, 'map_update_enable', 10)
         self.place_update_pub = self.create_publisher(
-            Bool, '/place_update_enable', 10)
+            Bool, 'place_update_enable', 10)
 
         self.create_subscription(
-            PoseStamped, '/grasp_pose', self.grasp_callback, 10)
+            PoseStamped, 'grasp_pose', self.grasp_callback, 10)
         self.create_subscription(
-            Marker, '/yolo/target_box', self.target_box_callback, 10)
+            Marker, 'yolo/target_box', self.target_box_callback, 10)
         self.create_subscription(
-            PointCloud2, '/yolo/points_filtered', self.cloud_time_callback, 10)
+            PointCloud2, 'yolo/points_filtered', self.cloud_time_callback, 10)
         self.create_subscription(
             PointCloud2,
             self.get_parameter('filtered_cloud_topic').value,
             self.filtered_cloud_callback,
             QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT))
         self.create_subscription(
-            EmptyMsg, '/manual_grasp_start', self.manual_start_cb, 10)
+            EmptyMsg, 'manual_grasp_start', self.manual_start_cb, 10)
         self.create_subscription(
-            EmptyMsg, '/manual_release', self.manual_release_cb, 10)
+            EmptyMsg, 'manual_release', self.manual_release_cb, 10)
         self.create_subscription(
             PoseStamped, self.place_pose_topic,
             self.place_pose_callback, 10)
@@ -222,12 +222,12 @@ class GraspExecutor(Node):
         try:
             from agx_arm_msgs.msg import GripperStatus
             self.create_subscription(
-                GripperStatus, '/feedback/gripper_status',
+                GripperStatus, 'feedback/gripper_status',
                 self.gripper_feedback_cb, 10)
         except ImportError:
             self.get_logger().warning('GripperStatus import failed')
         self.create_subscription(
-            JointState, '/feedback/joint_states',
+            JointState, 'feedback/joint_states',
             self.joint_feedback_cb, 10)
         self.create_timer(0.1, self.tick)
         self._init_timer = self.create_timer(0.5, self._init_open)

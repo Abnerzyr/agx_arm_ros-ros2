@@ -20,7 +20,7 @@ from shape_msgs.msg import SolidPrimitive
 class MoveIt2:
     def __init__(
             self, node, base_link, end_effector, group_name,
-            action_name='/move_action', constrain_orientation=False,
+            action_name='move_action', constrain_orientation=False,
             position_tolerance=0.01, orientation_tolerance=0.10):
         self.node = node
         self.base_link = base_link
@@ -31,12 +31,12 @@ class MoveIt2:
         self.orientation_tolerance = orientation_tolerance
         self.action = ActionClient(node, MoveGroup, action_name)
         self._apply_scene_client = node.create_client(
-            ApplyPlanningScene, '/apply_planning_scene')
+            ApplyPlanningScene, 'apply_planning_scene')
         self._cartesian_client = node.create_client(
-            GetCartesianPath, '/compute_cartesian_path')
+            GetCartesianPath, 'compute_cartesian_path')
         self._traj_client = ActionClient(
             node, FollowJointTrajectory,
-            '/arm_controller/follow_joint_trajectory')
+            'arm_controller/follow_joint_trajectory')
         self.done = False
         self.success = False
         self.plan_only = False
