@@ -70,6 +70,8 @@ def _launch(context):
                 "--ros-args", "--log-level",
                 "moveit_move_group_default_capabilities"
                 ".clear_octomap_service_capability:=warn",
+                "--log-level",
+                "moveit_ros.planning_scene_monitor.planning_scene_monitor:=error",
             ],
             additional_env={"DISPLAY": os.environ.get("DISPLAY", "")},
             condition=UnlessCondition(LaunchConfiguration("debug")),
@@ -84,6 +86,8 @@ def _launch(context):
                 "--ros-args", "--log-level",
                 "moveit_move_group_default_capabilities"
                 ".clear_octomap_service_capability:=warn",
+                "--log-level",
+                "moveit_ros.planning_scene_monitor.planning_scene_monitor:=error",
             ],
             prefix=["gdb -x {} --ex run --args".format(
                 moveit_config.package_path / "launch" / "gdb_settings.gdb"

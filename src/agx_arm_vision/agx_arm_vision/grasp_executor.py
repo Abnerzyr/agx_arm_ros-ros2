@@ -67,7 +67,7 @@ class GraspExecutor(Node):
             'constrain_orientation', True)
         self.declare_parameter(
             'home_joints',
-            [-0.0259, -0.4025, -0.0575, 2.1947, 0.0604, 0.0722, 0.9141])
+            [-0.0259, -0.4025, -0.0575, 2.0, 0.0604, 0.0722, 0.9141])
 
         self.base_link = self.get_parameter('base_link').value
         self.end_effector = self.get_parameter('end_effector_link').value

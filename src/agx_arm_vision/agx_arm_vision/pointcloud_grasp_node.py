@@ -28,7 +28,7 @@ class PointCloudGraspNode(Node):
         self.declare_parameter('publish_static_joints', False)
         self.declare_parameter(
             'initial_joints',
-            [-0.0259, -0.4025, -0.0575, 2.1947, 0.0604, 0.0722, 0.9141])
+            [-0.0259, -0.4025, -0.0575, 2.0, 0.0604, 0.0722, 0.9141])
 
         self.base_frame = self.get_parameter('base_frame').value
         self.plane_dist = self.get_parameter('plane_distance').value

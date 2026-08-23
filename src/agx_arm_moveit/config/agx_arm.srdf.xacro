@@ -358,7 +358,7 @@
       <joint name="joint1" value="-0.0259" />
       <joint name="joint2" value="-0.4025" />
       <joint name="joint3" value="-0.0575" />
-      <joint name="joint4" value="2.1947" />
+      <joint name="joint4" value="2.0" />
       <joint name="joint5" value="0.0604" />
       <joint name="joint6" value="0.0722" />
       <joint name="joint7" value="0.9141" />

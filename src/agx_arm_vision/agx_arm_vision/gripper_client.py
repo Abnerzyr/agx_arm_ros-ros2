@@ -6,7 +6,7 @@ from sensor_msgs.msg import JointState
 class GripperClient:
     HOLD_WIDTH_MIN = 0.005
     SETTLE_TICKS = 3
-    TARGET_TOPIC = '/control/gripper_target'
+    TARGET_TOPIC = 'control/gripper_target'
 
     def __init__(self, node, joint_name, open_width=0.1, closed_width=0.0,
                  force_threshold=1.5, width_tolerance=0.002, timeout=3.0):

@@ -90,7 +90,7 @@ class ShelfWorkflowNode(Node):
         self.declare_parameter('marker_fresh_timeout', 1.0)
         self.declare_parameter(
             'home_joints',
-            [-0.0259, -0.4025, -0.0575, 2.1947, 0.0604, 0.0722, 0.9141])
+            [-0.0259, -0.4025, -0.0575, 2.0, 0.0604, 0.0722, 0.9141])
 
         config_file = self.get_parameter('config_file').value
         if not os.path.exists(config_file):
