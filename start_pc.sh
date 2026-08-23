@@ -98,7 +98,12 @@ for i in $(seq 1 10); do
 done
 ros2 run realsense2_camera realsense2_camera_node \
   --ros-args -r __node:=camera -r __ns:=/camera \
-  -p align_depth.enable:=true -p publish_tf:=false &
+  -p align_depth.enable:=true \
+  -p publish_tf:=false \
+  -p depth_module.profile:=640x480x15 \
+  -p rgb_camera.profile:=640x480x15 \
+  -p enable_infra1:=false \
+  -p enable_infra2:=false &
 CAM_PID=$!
 
 sleep 3
