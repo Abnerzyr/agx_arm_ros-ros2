@@ -1,9 +1,10 @@
 #!/bin/bash
-# start_arm_yolo_shelf.sh : 货架分层抓取-放置完整工作流（真机）
+# start_shelf.sh : 货架分层抓取-放置完整工作流（真机，臂进 /arm 命名空间版）
+# 臂与底盘同时常驻时使用；臂的 TF/话题带 /arm 前缀，避免 base_link 冲突。
 #
-# 流程: 归位 → /task_command(层号) → 粗对准该层 → aruco 精对准 →
-#       yolo 检测该层物体 → /manual_grasp_start 抓取 → 回初始位 →
-#       /release_command → place_planner 选点放置到眼前平面
+# 流程: 归位 → /arm/task_command(层号) → 粗对准该层 → aruco 精对准 →
+#       yolo 检测该层物体 → /arm/manual_grasp_start 抓取 → 回初始位 →
+#       /arm/release_command → place_planner 选点放置到眼前平面
 #
 # 与 start_arm_yolo.sh 的差异: 额外启动 aruco_tracker 与 shelf_workflow 编排节点。
 cd /home/s1/tiaozhanbei/agx_arm_ros-ros2
@@ -84,7 +85,7 @@ pkill -9 -f grasp_executor 2>/dev/null || true
 pkill -9 -f vision_grasp_node 2>/dev/null || true
 sleep 1
 
-echo "=== Launching MoveIt + Arm ($CAN_PORT) ==="
+echo "=== Launching MoveIt + Arm ($CAN_PORT) in /arm ==="
 ros2 launch agx_arm_ctrl start_single_agx_arm_moveit.launch.py \
   can_port:=$CAN_PORT \
   arm_type:=nero \
@@ -95,7 +96,8 @@ ros2 launch agx_arm_ctrl start_single_agx_arm_moveit.launch.py \
   fw_version:=v111 \
   auto_home:=true \
   use_rviz:=false \
-  follow:=true &
+  follow:=true \
+  namespace:=arm &
 MOVEIT_PID=$!
 
 echo "=== Waiting for MoveIt ... ==="
@@ -110,8 +112,10 @@ for i in $(seq 1 10); do
     sleep 2
 done
 
-echo "=== Starting RViz ==="
-rviz2 -d /home/s1/tiaozhanbei/agx_arm_ros-ros2/src/config/yolo_config.rviz &
+echo "=== Starting RViz (in /arm via launch) ==="
+ros2 launch agx_arm_moveit manual_rviz.launch.py \
+  namespace:=arm \
+  rviz_config:=/home/s1/tiaozhanbei/agx_arm_ros-ros2/src/config/yolo_config_armns.rviz &
 RVIZ_PID=$!
 echo "  rviz PID=$RVIZ_PID"
 
@@ -137,40 +141,54 @@ ros2 run aruco_opencv aruco_tracker_autostart \
 ARUCO_PID=$!
 echo "  aruco_tracker PID=$ARUCO_PID"
 
-echo "=== Starting YOLO+Grasp ==="
-ros2 run agx_arm_vision yolo_grasp &>/tmp/yolo.log &
+echo "=== Starting YOLO+Grasp (in /arm) ==="
+ros2 run agx_arm_vision yolo_grasp \
+  --ros-args -r __ns:=/arm \
+  -p base_frame:=arm/base_link \
+  -p camera_optical_frame:=arm/camera_color_optical_frame &>/tmp/yolo.log &
 YOLO_PID=$!
 echo "  yolo_grasp PID=$YOLO_PID"
 
-echo "=== Starting place planner ==="
-ros2 run agx_arm_vision place_planner &>/tmp/place.log &
+echo "=== Starting place planner (in /arm) ==="
+ros2 run agx_arm_vision place_planner \
+  --ros-args -r __ns:=/arm \
+  -p base_frame:=arm/base_link \
+  -p camera_optical_frame:=arm/camera_color_optical_frame &>/tmp/place.log &
 PLACE_PID=$!
 echo "  place_planner PID=$PLACE_PID"
 
-echo "=== Starting grasp target marker ==="
-ros2 run agx_arm_vision grasp_target_marker &>/tmp/marker.log &
+echo "=== Starting grasp target marker (in /arm) ==="
+ros2 run agx_arm_vision grasp_target_marker \
+  --ros-args -r __ns:=/arm &>/tmp/marker.log &
 MARKER_PID=$!
 echo "  marker PID=$MARKER_PID"
 
 sleep 2
 
-echo "=== Starting grasp executor ==="
-ros2 run agx_arm_vision grasp_executor &>/tmp/grasp.log &
+echo "=== Starting grasp executor (in /arm) ==="
+ros2 run agx_arm_vision grasp_executor \
+  --ros-args -r __ns:=/arm \
+  -p base_link:=arm/base_link \
+  -p end_effector_link:=arm/tcp_link &>/tmp/grasp.log &
 GRASP_PID=$!
 echo "  grasp_executor PID=$GRASP_PID"
 
-echo "=== Starting shelf workflow ==="
-ros2 run agx_arm_vision shelf_workflow &>/tmp/shelf.log &
+echo "=== Starting shelf workflow (in /arm) ==="
+ros2 run agx_arm_vision shelf_workflow \
+  --ros-args -r __ns:=/arm \
+  -p base_frame:=arm/base_link \
+  -p end_effector_link:=arm/tcp_link \
+  -p camera_frame:=arm/camera_color_optical_frame &>/tmp/shelf.log &
 SHELF_PID=$!
 echo "  shelf_workflow PID=$SHELF_PID"
 
 echo "=== All started (YOLO + shelf workflow) ==="
 echo "CAN=$CAN_PORT  MoveIt=$MOVEIT_PID  Cam=$CAM_PID  ArUco=$ARUCO_PID  YOLO=$YOLO_PID  Place=$PLACE_PID  Marker=$MARKER_PID  Grasp=$GRASP_PID  Shelf=$SHELF_PID"
 echo ""
-echo "Manual commands:"
-echo "  ros2 topic pub --once -w 1 /task_command std_msgs/msg/Int32 '{data: 1}'"
-echo "  ros2 topic pub --once -w 1 /release_command std_msgs/msg/Empty '{}'"
-echo "  ros2 topic pub --once -w 1 /manual_grasp_start std_msgs/msg/Empty '{}'"
-echo "  ros2 topic pub --once -w 1 /manual_release std_msgs/msg/Empty '{}'"
-echo "  ros2 service call /move_home std_srvs/srv/Empty"
+echo "Manual commands (注意 /arm/ 前缀):"
+echo "  ros2 topic pub --once -w 1 /arm/task_command std_msgs/msg/Int32 '{data: 1}'"
+echo "  ros2 topic pub --once -w 1 /arm/release_command std_msgs/msg/Empty '{}'"
+echo "  ros2 topic pub --once -w 1 /arm/manual_grasp_start std_msgs/msg/Empty '{}'"
+echo "  ros2 topic pub --once -w 1 /arm/manual_release std_msgs/msg/Empty '{}'"
+echo "  ros2 service call /arm/move_home std_srvs/srv/Empty"
 wait
