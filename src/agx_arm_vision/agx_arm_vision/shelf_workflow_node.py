@@ -61,7 +61,7 @@ class ShelfWorkflowNode(Node):
     EXECUTOR_IDLE = 0
     EXECUTOR_WAIT_RELEASE = 6
 
-    ALIGN_DIST_EPS = 0.02
+    ALIGN_DIST_EPS = 0.42#for test remember to change it back to 0.02!!!!在rviz测试时临时使用！！！
 
     # TCP-referenced viewing pose offsets: the TCP lands TCP_BACK_OFFSET
     # toward the arm and TCP_HEIGHT_OFFSET above the marker.

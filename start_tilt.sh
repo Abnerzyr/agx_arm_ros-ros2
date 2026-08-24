@@ -139,7 +139,7 @@ grep -E "TILT ANGLE|n_meas|n_pred|New camera_mount|negligible|Correction" \
     /tmp/tilt.log || tail -10 /tmp/tilt.log
 
 echo "=== Starting YOLO+Grasp ==="
-ros2 run agx_arm_vision yolo_grasp &>/tmp/yolo.log &
+OMP_NUM_THREADS=2 ros2 run agx_arm_vision yolo_grasp &>/tmp/yolo.log &
 YOLO_PID=$!
 echo "  yolo_grasp PID=$YOLO_PID"
 

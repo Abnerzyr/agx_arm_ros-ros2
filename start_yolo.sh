@@ -1,4 +1,13 @@
 #!/bin/bash
+# start_yolo_armns.sh : start_yolo.sh 的命名空间版（臂进 /arm，用于与底盘同时常驻）
+#
+# 与 start_yolo.sh 的差异：
+#   - MoveIt 加 namespace:=arm → TF 帧变 arm/world→arm/base_link→...，话题变 /arm/...
+#   - 视觉节点进 __ns:=/arm 且帧参数带 arm/ 前缀（相机话题 /camera/... 保持全局绝对）
+#   - 手动触发话题带 /arm/ 前缀
+# 其余（真机 CAN、yolo_grasp、place_planner、grasp_executor、RViz）与 start_yolo.sh 一致。
+#
+# 前提：车（chassis_bridge）已在根命名空间运行；本脚本与车互不干扰。
 cd /home/s1/tiaozhanbei/agx_arm_ros-ros2
 rm -f /dev/shm/fastrtps* 2>/dev/null
 source install/setup.bash
@@ -76,7 +85,7 @@ pkill -9 -f grasp_executor 2>/dev/null || true
 pkill -9 -f vision_grasp_node 2>/dev/null || true
 sleep 1
 
-echo "=== Launching MoveIt + Arm ($CAN_PORT) ==="
+echo "=== Launching MoveIt + Arm ($CAN_PORT) in /arm namespace ==="
 ros2 launch agx_arm_ctrl start_single_agx_arm_moveit.launch.py \
   can_port:=$CAN_PORT \
   arm_type:=nero \
@@ -87,7 +96,8 @@ ros2 launch agx_arm_ctrl start_single_agx_arm_moveit.launch.py \
   fw_version:=v111 \
   auto_home:=true \
   use_rviz:=false \
-  follow:=true &
+  follow:=true \
+  namespace:=arm &
 MOVEIT_PID=$!
 
 echo "=== Waiting for MoveIt ... ==="
@@ -102,12 +112,14 @@ for i in $(seq 1 10); do
     sleep 2
 done
 
-echo "=== Starting RViz ==="
-rviz2 -d /home/s1/tiaozhanbei/agx_arm_ros-ros2/src/config/yolo_config.rviz &
+echo "=== Starting RViz (in /arm via launch) ==="
+ros2 launch agx_arm_moveit manual_rviz.launch.py \
+  namespace:=arm \
+  rviz_config:=/home/s1/tiaozhanbei/agx_arm_ros-ros2/src/config/yolo_config_armns.rviz &
 RVIZ_PID=$!
 echo "  rviz PID=$RVIZ_PID"
 
-echo "=== Starting camera ==="
+echo "=== Starting camera (global /camera) ==="
 ros2 run realsense2_camera realsense2_camera_node \
   --ros-args -r __node:=camera -r __ns:=/camera \
   -p align_depth.enable:=true \
@@ -120,33 +132,44 @@ CAM_PID=$!
 
 sleep 3
 
-echo "=== Starting YOLO+Grasp ==="
-ros2 run agx_arm_vision yolo_grasp &>/tmp/yolo.log &
+echo "=== Starting YOLO+Grasp (in /arm) ==="
+OMP_NUM_THREADS=2 ros2 run agx_arm_vision yolo_grasp \
+  --ros-args -r __ns:=/arm \
+  -p base_frame:=arm/base_link \
+  -p camera_optical_frame:=arm/camera_color_optical_frame &>/tmp/yolo.log &
 YOLO_PID=$!
 echo "  yolo_grasp PID=$YOLO_PID"
 
-echo "=== Starting place planner ==="
-ros2 run agx_arm_vision place_planner &>/tmp/place.log &
+echo "=== Starting place planner (in /arm) ==="
+OPENBLAS_NUM_THREADS=2 ros2 run agx_arm_vision place_planner \
+  --ros-args -r __ns:=/arm \
+  -p base_frame:=arm/base_link \
+  -p camera_optical_frame:=arm/camera_color_optical_frame \
+  -p process_period:=1.0 &>/tmp/place.log &
 PLACE_PID=$!
 echo "  place_planner PID=$PLACE_PID"
 
-echo "=== Starting grasp target marker ==="
-ros2 run agx_arm_vision grasp_target_marker &>/tmp/marker.log &
+echo "=== Starting grasp target marker (in /arm) ==="
+ros2 run agx_arm_vision grasp_target_marker \
+  --ros-args -r __ns:=/arm &>/tmp/marker.log &
 MARKER_PID=$!
 echo "  marker PID=$MARKER_PID"
 
 sleep 2
 
-echo "=== Starting grasp executor ==="
-ros2 run agx_arm_vision grasp_executor &>/tmp/grasp.log &
+echo "=== Starting grasp executor (in /arm) ==="
+ros2 run agx_arm_vision grasp_executor \
+  --ros-args -r __ns:=/arm \
+  -p base_link:=arm/base_link \
+  -p end_effector_link:=arm/tcp_link &>/tmp/grasp.log &
 GRASP_PID=$!
 echo "  grasp_executor PID=$GRASP_PID"
 
-echo "=== All started (YOLO) ==="
-echo "CAN=$CAN_PORT  MoveIt=$MOVEIT_PID  Cam=$CAM_PID  YOLO=$YOLO_PID  Place=$PLACE_PID  Marker=$MARKER_PID  Grasp=$GRASP_PID"
+echo "=== All started (YOLO, namespace=arm) ==="
+echo "CAN=$CAN_PORT  MoveIt=$MOVEIT_PID  RViz=$RVIZ_PID  Cam=$CAM_PID  YOLO=$YOLO_PID  Place=$PLACE_PID  Marker=$MARKER_PID  Grasp=$GRASP_PID"
 echo ""
-echo "Manual commands:"
-echo "  ros2 topic pub --once -w 1 /manual_grasp_start std_msgs/msg/Empty '{}'"
-echo "  ros2 topic pub --once -w 1 /manual_release std_msgs/msg/Empty '{}'"
-echo "  ros2 service call /move_home std_srvs/srv/Empty"
+echo "Manual commands (注意 /arm/ 前缀):"
+echo "  ros2 topic pub --once -w 1 /arm/manual_grasp_start std_msgs/msg/Empty '{}'"
+echo "  ros2 topic pub --once -w 1 /arm/manual_release std_msgs/msg/Empty '{}'"
+echo "  ros2 service call /arm/move_home std_srvs/srv/Empty"
 wait

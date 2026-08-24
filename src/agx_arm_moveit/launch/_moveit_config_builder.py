@@ -84,6 +84,10 @@ _SRDF_TIP_LINK_RE = re.compile(r'(tip_link=")([^"]+)(")')
 _SRDF_LINK1_RE = re.compile(r'(link1=")([^"]+)(")')
 _SRDF_LINK2_RE = re.compile(r'(link2=")([^"]+)(")')
 _SRDF_PARENT_LINK_RE = re.compile(r'(parent_link=")([^"]+)(")')
+# virtual joint 的属性（parent_frame / child_link）也要带前缀，
+# 否则 static_virtual_joint_tfs 仍会发布无前缀 world→base_link 的孤立 TF。
+_SRDF_PARENT_FRAME_RE = re.compile(r'(parent_frame=")([^"]+)(")')
+_SRDF_CHILD_LINK_RE = re.compile(r'(child_link=")([^"]+)(")')
 
 
 def _pfx(match, prefix):
@@ -105,6 +109,8 @@ def _bake_srdf_links(xml, prefix):
     xml = _SRDF_LINK1_RE.sub(lambda m: _pfx(m, prefix), xml)
     xml = _SRDF_LINK2_RE.sub(lambda m: _pfx(m, prefix), xml)
     xml = _SRDF_PARENT_LINK_RE.sub(lambda m: _pfx(m, prefix), xml)
+    xml = _SRDF_PARENT_FRAME_RE.sub(lambda m: _pfx(m, prefix), xml)
+    xml = _SRDF_CHILD_LINK_RE.sub(lambda m: _pfx(m, prefix), xml)
     return xml
 
 

@@ -7,6 +7,10 @@ import cv2
 import numpy as np
 import rclpy
 import torch
+
+# Jetson Orin：torch 默认抢占全部 6 核，推理时 CPU 打满导致 RViz/相机/规划卡顿。
+# 限制为 2 线程：CPU 让给系统，同时降低线程缓冲的内存峰值（推理几乎不受影响）。
+torch.set_num_threads(2)
 from cv_bridge import CvBridge
 from geometry_msgs.msg import PoseStamped
 from image_geometry import PinholeCameraModel

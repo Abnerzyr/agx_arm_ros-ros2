@@ -125,7 +125,7 @@ class PlacePlanner(Node):
         best_inl = 0
         best_n = None
         best_d = None
-        for _ in range(60):
+        for _ in range(30):
             i3 = rng.choice(len(sub), 3, replace=False)
             p0, p1, p2 = sub[i3]
             n = np.cross(p1 - p0, p2 - p0)
@@ -157,7 +157,7 @@ class PlacePlanner(Node):
         if transform is None:
             return
 
-        ds = 4
+        ds = 8
         uu, vv = np.meshgrid(
             np.arange(0, w, ds), np.arange(0, h, ds))
         z = depth[vv, uu]

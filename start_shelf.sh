@@ -142,7 +142,7 @@ ARUCO_PID=$!
 echo "  aruco_tracker PID=$ARUCO_PID"
 
 echo "=== Starting YOLO+Grasp (in /arm) ==="
-ros2 run agx_arm_vision yolo_grasp \
+OMP_NUM_THREADS=2 ros2 run agx_arm_vision yolo_grasp \
   --ros-args -r __ns:=/arm \
   -p base_frame:=arm/base_link \
   -p camera_optical_frame:=arm/camera_color_optical_frame &>/tmp/yolo.log &
@@ -150,10 +150,11 @@ YOLO_PID=$!
 echo "  yolo_grasp PID=$YOLO_PID"
 
 echo "=== Starting place planner (in /arm) ==="
-ros2 run agx_arm_vision place_planner \
+OPENBLAS_NUM_THREADS=2 ros2 run agx_arm_vision place_planner \
   --ros-args -r __ns:=/arm \
   -p base_frame:=arm/base_link \
-  -p camera_optical_frame:=arm/camera_color_optical_frame &>/tmp/place.log &
+  -p camera_optical_frame:=arm/camera_color_optical_frame \
+  -p process_period:=1.0 &>/tmp/place.log &
 PLACE_PID=$!
 echo "  place_planner PID=$PLACE_PID"
 

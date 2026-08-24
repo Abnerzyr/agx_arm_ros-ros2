@@ -1,22 +1,26 @@
 #!/bin/bash
-# start_shelf_realcam.sh : 货架分层抓取-放置（真机相机 + 仿真机械臂，臂进 /arm 命名空间版）
+# start_aruco_align_armns.sh : 仅 Aruco 码识别 + 机械臂对准流程（真实相机 + 仿真臂，/arm 版）
 #
-# 与底盘同时常驻时使用；臂的 TF/话题带 /arm 前缀，避免 base_link 冲突
-# （与 start_shelf.sh / start_yolo_armns.sh / start_shelf_sim.sh 同一套机制）。
+# 最小化流程：只做 shelf 全流程里的"对准"环节，用于快速验证
+# aruco 码识别与机械臂对准（ALIGN）逻辑，不启动 yolo_grasp / place_planner。
 #
-# 与 start_shelf_sim.sh（纯仿真）的区别：视觉全部用真机——RealSense 相机、
-# 真实 aruco_tracker、真实 yolo_grasp、真实 place_planner；机械臂仍用
-# MoveIt 仿真(FakeSystem)。用于交叉验证：真视觉 vs 虚拟视觉 在同一个
-# mock 臂 + MoveIt 规划下的差异，定位问题出在视觉侧还是运动/规划侧。
+# 节点组成（真实相机 + 仿真臂，臂进 /arm 命名空间）：
+#   - MoveIt FakeSystem (demo.launch.py, namespace:=arm)
+#   - RViz (manual_rviz.launch.py, /arm) —— 看臂模型与 TF
+#   - mock_gripper + grasp_executor —— shelf_workflow 依赖 executor 的
+#     /arm/grasp_executor_state 判断"空闲才允许移动"（grasp_executor 不抓取，纯 idle）
+#   - RealSense 相机（全局 /camera/...）+ aruco_tracker（全局 /aruco_detections）
+#   - shelf_workflow（/arm）—— HOME_CHECK → NOMINAL_POSE → ALIGN
 #
-# 相机(/camera/...) 与 aruco(/aruco_detections) 保持全局绝对话题；其余进 /arm。
-# 手动触发话题带 /arm/ 前缀。
+# 流程：发 /arm/task_command 后，机械臂回 home → 移到名义观察位姿 →
+#       aruco 精对准（日志出现 "Aligned to marker" 即对准成功）。
+#       之后进入 WAIT_DETECT（无 yolo，只会周期性打警告，流程停住），
+#       用于观察对准结果；重测再发一次 /arm/task_command。
 #
 # 前提：
 #   - 真机 RealSense 相机已连接
-#   - 相机前放一个 yolo 可检出的物体（默认类别: rubik's cube）
 #   - 真实 aruco 码(4X4_50) 摆放在 shelf_layers_sim.yaml 对应位置附近
-#     （层1 约为 base_link 系 (-0.40, -0.22, 0.30)，若出视野 ALIGN 会卡住）
+#     （层1 约为 base_link 系 (-0.40, -0.22, 0.30)，若出视野 ALIGN 会卡住后放弃）
 cd /home/s1/tiaozhanbei/agx_arm_ros-ros2
 rm -f /dev/shm/fastrtps* 2>/dev/null
 source install/setup.bash
@@ -32,9 +36,6 @@ pkill -9 -f rviz2 2>/dev/null || true
 pkill -9 -f mock_gripper 2>/dev/null || true
 pkill -9 -f realsense2_camera 2>/dev/null || true
 pkill -9 -f aruco_tracker 2>/dev/null || true
-pkill -9 -f yolo_grasp 2>/dev/null || true
-pkill -9 -f place_planner 2>/dev/null || true
-pkill -9 -f grasp_target_marker 2>/dev/null || true
 pkill -9 -f grasp_executor 2>/dev/null || true
 pkill -9 -f shelf_workflow 2>/dev/null || true
 pkill -9 -f 'ros2 launch' 2>/dev/null || true
@@ -94,34 +95,12 @@ ros2 run aruco_opencv aruco_tracker_autostart \
 ARUCO_PID=$!
 echo "  aruco_tracker PID=$ARUCO_PID"
 
-echo "=== Starting YOLO+Grasp (real, in /arm) ==="
-OMP_NUM_THREADS=2 ros2 run agx_arm_vision yolo_grasp \
-  --ros-args -r __ns:=/arm \
-  -p base_frame:=arm/base_link \
-  -p camera_optical_frame:=arm/camera_color_optical_frame &>/tmp/yolo.log &
-YOLO_PID=$!
-echo "  yolo_grasp PID=$YOLO_PID"
-
-echo "=== Starting place planner (in /arm) ==="
-OPENBLAS_NUM_THREADS=2 ros2 run agx_arm_vision place_planner \
-  --ros-args -r __ns:=/arm \
-  -p base_frame:=arm/base_link \
-  -p camera_optical_frame:=arm/camera_color_optical_frame \
-  -p process_period:=1.0 &>/tmp/place.log &
-PLACE_PID=$!
-echo "  place_planner PID=$PLACE_PID"
-
-echo "=== Starting grasp target marker (in /arm) ==="
-ros2 run agx_arm_vision grasp_target_marker \
-  --ros-args -r __ns:=/arm &>/tmp/marker.log &
-MARKER_PID=$!
-echo "  marker PID=$MARKER_PID"
-
 sleep 2
 
-echo "=== Starting grasp executor (in /arm) ==="
-# 仿真关节反馈在 /arm/control/joint_states（真机为 /feedback/joint_states）；
-# remap 用相对写法，命名空间下自动解析为 /arm/feedback/joint_states := /arm/control/joint_states
+echo "=== Starting grasp executor (in /arm, idle only) ==="
+# shelf_workflow 在 NOMINAL_POSE / ALIGN 前会检查 executor 是否 IDLE；
+# 本脚本不抓取，executor 只负责发布 /arm/grasp_executor_state=IDLE。
+# 仿真关节反馈在 /arm/control/joint_states，remap 用相对写法。
 ros2 run agx_arm_vision grasp_executor \
   --ros-args -r __ns:=/arm \
   -r feedback/joint_states:=control/joint_states \
@@ -141,12 +120,12 @@ ros2 run agx_arm_vision shelf_workflow \
 SHELF_PID=$!
 echo "  shelf_workflow PID=$SHELF_PID"
 
-echo "=== All started (real camera + simulated arm + shelf workflow, in /arm) ==="
-echo "MoveIt=$MOVEIT_PID  RViz=$RVIZ_PID  MockGripper=$MOCK_GRIPPER_PID  Cam=$CAM_PID  ArUco=$ARUCO_PID  YOLO=$YOLO_PID  Place=$PLACE_PID  Marker=$MARKER_PID  Grasp=$GRASP_PID  Shelf=$SHELF_PID"
+echo "=== All started (aruco align only, real camera + simulated arm, in /arm) ==="
+echo "MoveIt=$MOVEIT_PID  RViz=$RVIZ_PID  MockGripper=$MOCK_GRIPPER_PID  Cam=$CAM_PID  ArUco=$ARUCO_PID  Grasp=$GRASP_PID  Shelf=$SHELF_PID"
 echo ""
 echo "Manual commands (注意 /arm/ 前缀):"
 echo "  ros2 topic pub --once -w 1 /arm/task_command std_msgs/msg/Int32 '{data: 1}'"
-echo "  ros2 topic pub --once -w 1 /arm/release_command std_msgs/msg/Empty '{}'"
 echo ""
-echo "Logs: /tmp/shelf.log /tmp/grasp.log /tmp/yolo.log /tmp/aruco.log /tmp/place.log"
+echo "看对准结果: tail -f /tmp/shelf.log   (出现 'Aligned to marker' 即对准成功)"
+echo "Logs: /tmp/shelf.log /tmp/grasp.log /tmp/aruco.log /tmp/mock_gripper.log"
 wait

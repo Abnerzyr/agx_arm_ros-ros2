@@ -1,22 +1,15 @@
 #!/bin/bash
-# start_shelf_realcam.sh : 货架分层抓取-放置（真机相机 + 仿真机械臂，臂进 /arm 命名空间版）
+# start_yolo_sim.sh : YOLO 视觉抓取（真机相机 + 仿真机械臂，臂进 /arm 命名空间版）
 #
 # 与底盘同时常驻时使用；臂的 TF/话题带 /arm 前缀，避免 base_link 冲突
-# （与 start_shelf.sh / start_yolo_armns.sh / start_shelf_sim.sh 同一套机制）。
+# （与 start_shelf.sh / start_yolo_armns.sh 同一套机制）。
 #
-# 与 start_shelf_sim.sh（纯仿真）的区别：视觉全部用真机——RealSense 相机、
-# 真实 aruco_tracker、真实 yolo_grasp、真实 place_planner；机械臂仍用
-# MoveIt 仿真(FakeSystem)。用于交叉验证：真视觉 vs 虚拟视觉 在同一个
-# mock 臂 + MoveIt 规划下的差异，定位问题出在视觉侧还是运动/规划侧。
+# 与真机流程的唯一差异：机械臂不启用真机/CAN，改用 MoveIt 仿真(FakeSystem)
+# 在 RViz 内模拟运动；其余（真机相机、yolo_grasp、grasp_target_marker、
+# grasp_executor、RViz、手动触发）与真机一致，但话题进 /arm。
 #
-# 相机(/camera/...) 与 aruco(/aruco_detections) 保持全局绝对话题；其余进 /arm。
-# 手动触发话题带 /arm/ 前缀。
-#
-# 前提：
-#   - 真机 RealSense 相机已连接
-#   - 相机前放一个 yolo 可检出的物体（默认类别: rubik's cube）
-#   - 真实 aruco 码(4X4_50) 摆放在 shelf_layers_sim.yaml 对应位置附近
-#     （层1 约为 base_link 系 (-0.40, -0.22, 0.30)，若出视野 ALIGN 会卡住）
+# 相机(/camera/...) 保持全局绝对话题；手动触发话题带 /arm/ 前缀。
+# 需要真机 RealSense 相机已连接；未插相机时 realsense2_camera 会报错。
 cd /home/s1/tiaozhanbei/agx_arm_ros-ros2
 rm -f /dev/shm/fastrtps* 2>/dev/null
 source install/setup.bash
@@ -31,12 +24,10 @@ pkill -9 -f robot_state_publisher 2>/dev/null || true
 pkill -9 -f rviz2 2>/dev/null || true
 pkill -9 -f mock_gripper 2>/dev/null || true
 pkill -9 -f realsense2_camera 2>/dev/null || true
-pkill -9 -f aruco_tracker 2>/dev/null || true
 pkill -9 -f yolo_grasp 2>/dev/null || true
 pkill -9 -f place_planner 2>/dev/null || true
 pkill -9 -f grasp_target_marker 2>/dev/null || true
 pkill -9 -f grasp_executor 2>/dev/null || true
-pkill -9 -f shelf_workflow 2>/dev/null || true
 pkill -9 -f 'ros2 launch' 2>/dev/null || true
 sleep 1
 
@@ -62,7 +53,7 @@ done
 echo "=== Starting RViz (in /arm via launch) ==="
 ros2 launch agx_arm_moveit manual_rviz.launch.py \
   namespace:=arm \
-  rviz_config:=/home/s1/tiaozhanbei/agx_arm_ros-ros2/src/agx_arm_vision/rviz/shelf_realcam_armns.rviz &
+  rviz_config:=/home/s1/tiaozhanbei/agx_arm_ros-ros2/src/config/yolo_config_armns.rviz &
 RVIZ_PID=$!
 echo "  rviz PID=$RVIZ_PID"
 
@@ -85,16 +76,7 @@ CAM_PID=$!
 
 sleep 3
 
-echo "=== Starting ArUco tracker (real, global) ==="
-ros2 run aruco_opencv aruco_tracker_autostart \
-  --ros-args \
-  -p cam_base_topic:=/camera/camera/color/image_raw \
-  -p marker_dict:=4X4_50 \
-  -p marker_size:=0.05 &>/tmp/aruco.log &
-ARUCO_PID=$!
-echo "  aruco_tracker PID=$ARUCO_PID"
-
-echo "=== Starting YOLO+Grasp (real, in /arm) ==="
+echo "=== Starting YOLO+Grasp (in /arm) ==="
 OMP_NUM_THREADS=2 ros2 run agx_arm_vision yolo_grasp \
   --ros-args -r __ns:=/arm \
   -p base_frame:=arm/base_link \
@@ -130,23 +112,12 @@ ros2 run agx_arm_vision grasp_executor \
 GRASP_PID=$!
 echo "  grasp_executor PID=$GRASP_PID"
 
-echo "=== Starting shelf workflow (in /arm, sim config) ==="
-ros2 run agx_arm_vision shelf_workflow \
-  --ros-args -r __ns:=/arm \
-  -p base_frame:=arm/base_link \
-  -p end_effector_link:=arm/tcp_link \
-  -p camera_frame:=arm/camera_color_optical_frame \
-  -p config_file:=/home/s1/tiaozhanbei/agx_arm_ros-ros2/src/agx_arm_vision/config/shelf_layers_sim.yaml \
-  &>/tmp/shelf.log &
-SHELF_PID=$!
-echo "  shelf_workflow PID=$SHELF_PID"
-
-echo "=== All started (real camera + simulated arm + shelf workflow, in /arm) ==="
-echo "MoveIt=$MOVEIT_PID  RViz=$RVIZ_PID  MockGripper=$MOCK_GRIPPER_PID  Cam=$CAM_PID  ArUco=$ARUCO_PID  YOLO=$YOLO_PID  Place=$PLACE_PID  Marker=$MARKER_PID  Grasp=$GRASP_PID  Shelf=$SHELF_PID"
+echo "=== All started (YOLO + simulated arm, in /arm) ==="
+echo "MoveIt=$MOVEIT_PID  RViz=$RVIZ_PID  MockGripper=$MOCK_GRIPPER_PID  Cam=$CAM_PID  YOLO=$YOLO_PID  Place=$PLACE_PID  Marker=$MARKER_PID  Grasp=$GRASP_PID"
 echo ""
 echo "Manual commands (注意 /arm/ 前缀):"
-echo "  ros2 topic pub --once -w 1 /arm/task_command std_msgs/msg/Int32 '{data: 1}'"
-echo "  ros2 topic pub --once -w 1 /arm/release_command std_msgs/msg/Empty '{}'"
+echo "  ros2 topic pub --once -w 1 /arm/manual_grasp_start std_msgs/msg/Empty '{}'"
+echo "  ros2 topic pub --once -w 1 /arm/manual_release std_msgs/msg/Empty '{}'"
 echo ""
-echo "Logs: /tmp/shelf.log /tmp/grasp.log /tmp/yolo.log /tmp/aruco.log /tmp/place.log"
+echo "Logs: /tmp/yolo.log /tmp/grasp.log /tmp/mock_gripper.log"
 wait

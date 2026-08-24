@@ -40,9 +40,9 @@ class VirtualYoloTarget(Node):
             self.get_parameter('grasp_yaw_deg').value)
 
         self.grasp_pub = self.create_publisher(
-            PoseStamped, '/grasp_pose', 10)
+            PoseStamped, 'grasp_pose', 10)
         self.box_pub = self.create_publisher(
-            Marker, '/yolo/target_box', 10)
+            Marker, 'yolo/target_box', 10)
 
         self.create_timer(1.0 / self.get_parameter('rate').value,
                           self.publish)
