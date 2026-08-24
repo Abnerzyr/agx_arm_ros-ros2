@@ -40,7 +40,7 @@ class YoloGraspNode(Node):
             'rgb_topic', '/camera/camera/color/image_raw')
         self.declare_parameter(
             'info_topic', '/camera/camera/color/camera_info')
-        self.declare_parameter('confidence_threshold', 0.25)
+        self.declare_parameter('confidence_threshold', 0.15)
         self.declare_parameter('grasp_quality_threshold', 0.3)
         self.declare_parameter('input_size', 224)
         self.declare_parameter('box_padding', 0.005)

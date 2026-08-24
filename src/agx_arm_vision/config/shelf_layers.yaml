@@ -1,21 +1,22 @@
 # 货架分层抓取-放置工作流配置
 # 所有高度/距离单位: m, 角度单位: deg
+# 名义位姿参数已与 shelf_layers_sim.yaml 同步（前向为 -x，数值为 mock/真机可达的测试值）
 
 base_frame: base_link
 camera_frame: camera_color_optical_frame
 
-base_height: 0.5          # 底座平台离地高度 (m)
-standoff: 0.40            # 相机到 marker/物体的工作距离 (m)
-shelf_x: 0.45             # 货架相对底座的水平距离 (m)，默认值，后续实测调整
-shelf_y: 0.0              # 货架相对底座的横向偏移 (m)
+base_height: 0.3          # 底座平台离地高度 (m)
+standoff: 0.30            # 相机到 marker/物体的工作距离 (m)
+shelf_x: -0.40            # nominal 瞄准点 x (m)；home 时手臂前向为 -x
+shelf_y: -0.16            # nominal 瞄准点 y (m)，左右居中
 
 layers:
   - layer: 1
-    aruco_id: 1
-    layer_height: 0.6     # 层平面离地高度 → base_link 相对 z = 0.1
+    aruco_id: 0
+    layer_height: 0.6     # base_link 相对 z = 0.3
   - layer: 2
     aruco_id: 2
-    layer_height: 0.9     # → 0.4
+    layer_height: 0.9     # → 0.6
   - layer: 3
     aruco_id: 3
-    layer_height: 1.2     # → 0.7
+    layer_height: 1.2     # → 0.9

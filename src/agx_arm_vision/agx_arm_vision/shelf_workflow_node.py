@@ -36,19 +36,18 @@ def _default_config_path():
 
 class ShelfWorkflowNode(Node):
     IDLE = 0
-    HOME_CHECK = 1
-    NOMINAL_POSE = 2
-    ALIGN = 3
-    WAIT_DETECT = 4
-    TRIGGER_GRASP = 5
-    GRASPING = 6
-    WAIT_RELEASE_CMD = 7
-    PLACING = 8
+    NOMINAL_POSE = 1
+    ALIGN = 2
+    WAIT_DETECT = 3
+    TRIGGER_GRASP = 4
+    GRASPING = 5
+    WAIT_RELEASE_CMD = 6
+    PLACING = 7
 
     STATE_NAMES = {
-        0: 'IDLE', 1: 'HOME_CHECK', 2: 'NOMINAL_POSE', 3: 'ALIGN',
-        4: 'WAIT_DETECT', 5: 'TRIGGER_GRASP', 6: 'GRASPING',
-        7: 'WAIT_RELEASE_CMD', 8: 'PLACING',
+        0: 'IDLE', 1: 'NOMINAL_POSE', 2: 'ALIGN',
+        3: 'WAIT_DETECT', 4: 'TRIGGER_GRASP', 5: 'GRASPING',
+        6: 'WAIT_RELEASE_CMD', 7: 'PLACING',
     }
 
     EXECUTOR_STATE_NAMES = {
@@ -61,12 +60,12 @@ class ShelfWorkflowNode(Node):
     EXECUTOR_IDLE = 0
     EXECUTOR_WAIT_RELEASE = 6
 
-    ALIGN_DIST_EPS = 0.42#for test remember to change it back to 0.02!!!!在rviz测试时临时使用！！！
+    ALIGN_DIST_EPS = 0.02#for test remember to change it back to 0.02!!!!在rviz测试时临时使用！！！
 
     # TCP-referenced viewing pose offsets: the TCP lands TCP_BACK_OFFSET
     # toward the arm and TCP_HEIGHT_OFFSET above the marker.
-    TCP_BACK_OFFSET = 0.05
-    TCP_HEIGHT_OFFSET = 0.1
+    TCP_BACK_OFFSET = 0.1
+    TCP_HEIGHT_OFFSET = 0.2
     # Fixed home tcp_link orientation fallback (xyzw), used when the TF
     # lookup at startup is unavailable.
     HOME_TCP_QUAT = (0.683, 0.692, -0.171, -0.161)
@@ -155,6 +154,10 @@ class ShelfWorkflowNode(Node):
             PoseStamped, 'grasp_pose', self.grasp_pose_cb, 10)
         self.create_subscription(
             Int32, 'grasp_executor_state', self.executor_state_cb, 10)
+        self.create_subscription(
+            Empty, 'shelf/skip_align', self.skip_align_cb, 10)
+        self.create_subscription(
+            Empty, 'shelf/preset_home', self.preset_home_cb, 10)
 
         self.state = self.IDLE
         self._layer = None
@@ -164,6 +167,9 @@ class ShelfWorkflowNode(Node):
         self._executor_state = None
         self._executor_state_time = 0.0
         self._release_pending = False
+        self._skip_align = False
+        self._preset_home = False
+        self._startup_home_sent = False
         self._home_sent = False
         self._home_done = False
         self._home_done_time = 0.0
@@ -207,7 +213,16 @@ class ShelfWorkflowNode(Node):
         self.get_logger().info(
             f'Task received: layer={layer} aruco_id={cfg.get("aruco_id")} '
             f'layer_height={cfg.get("layer_height")} m')
-        self._set_state(self.HOME_CHECK)
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if self._skip_align:
+            self._detect_start = now
+            self._detect_warn_logged = False
+            self.get_logger().info(
+                '[TEST] skip_align: entering WAIT_DETECT directly '
+                '(skip nominal/align)')
+            self._set_state(self.WAIT_DETECT)
+        else:
+            self._set_state(self.NOMINAL_POSE)
 
     def release_cmd_cb(self, msg):
         del msg
@@ -233,6 +248,18 @@ class ShelfWorkflowNode(Node):
     def executor_state_cb(self, msg):
         self._executor_state = int(msg.data)
         self._executor_state_time = self.get_clock().now().nanoseconds * 1e-9
+
+    def skip_align_cb(self, msg):
+        del msg
+        self._skip_align = True
+        self.get_logger().warn(
+            '[TEST] skip_align set; will skip ALIGN when reached')
+
+    def preset_home_cb(self, msg):
+        del msg
+        self._preset_home = True
+        self.get_logger().warn(
+            '[TEST] preset_home set; NOMINAL_POSE will use home position')
 
     # ------------------------------------------------------------------
     # helpers
@@ -449,33 +476,17 @@ class ShelfWorkflowNode(Node):
     def tick(self):
         now = self.get_clock().now().nanoseconds * 1e-9
 
-        if self.state == self.IDLE:
-            return
-
-        if self.state == self.HOME_CHECK:
-            if not self._home_sent:
-                self._home_sent = True
+        # 启动一次性归位（等 move_group 就绪后发一次，之后不再归位）
+        if not self._startup_home_sent:
+            if self.arm.action.server_is_ready():
+                self._startup_home_sent = True
                 self.get_logger().info(
-                    'Moving to home (initial pose)')
+                    'Startup: moving to home (one-time)')
                 self.arm.move_to_joints(
                     self.home_joints,
                     velocity_scaling=self.velocity_scaling)
-                return
-            if not self.arm.is_done():
-                return
-            if not self.arm.success:
-                self.get_logger().error(
-                    'Home move failed; send /task_command to retry')
-                self._reset_cycle_vars()
-                self._set_state(self.IDLE)
-                return
-            if not self._home_done:
-                self._home_done = True
-                self._home_done_time = now
-                self.get_logger().info('Home motion completed')
-                return
-            if now - self._home_done_time >= self.settle_after_home:
-                self._set_state(self.NOMINAL_POSE)
+
+        if self.state == self.IDLE:
             return
 
         if self.state == self.NOMINAL_POSE:
@@ -486,22 +497,38 @@ class ShelfWorkflowNode(Node):
                     self._busy_executor_logged = True
                 return
             if not self._nominal_sent:
-                pose = self._nominal_tcp_pose()
-                if pose is None:
-                    return
-                self._nominal_target_pose = pose
-                self.get_logger().info(
-                    'Moving to nominal shelf-view pose...')
-                self._publish_align_target(pose)
-                self.arm.move_to_pose(
-                    pose, self.base_frame,
-                    velocity_scaling=self.velocity_scaling)
+                if self._preset_home:
+                    self._nominal_target_pose = None
+                    self.get_logger().info(
+                        '[TEST] preset_home: moving to home joints '
+                        '(preset position)')
+                    self.arm.move_to_joints(
+                        self.home_joints,
+                        velocity_scaling=self.velocity_scaling)
+                else:
+                    pose = self._nominal_tcp_pose()
+                    if pose is None:
+                        return
+                    self._nominal_target_pose = pose
+                    self.get_logger().info(
+                        'Moving to nominal shelf-view pose...')
+                    self._publish_align_target(pose)
+                    self.arm.move_to_pose(
+                        pose, self.base_frame,
+                        velocity_scaling=self.velocity_scaling)
                 self._nominal_sent = True
                 return
             if not self.arm.is_done():
                 return
             self._nominal_sent = False
             if self.arm.success:
+                if self._skip_align:
+                    self._detect_start = now
+                    self._detect_warn_logged = False
+                    self.get_logger().info(
+                        '[TEST] Skipping ALIGN; entering WAIT_DETECT')
+                    self._set_state(self.WAIT_DETECT)
+                    return
                 self._align_start = now
                 self._align_iter = 0
                 self._align_sent = False
@@ -510,17 +537,29 @@ class ShelfWorkflowNode(Node):
                     'Nominal pose reached; searching aruco marker')
                 self._set_state(self.ALIGN)
             else:
-                p = self._nominal_target_pose.position
-                self.get_logger().error(
-                    f'Nominal pose move failed; target tcp='
-                    f'({p.x:.3f},{p.y:.3f},{p.z:.3f}). Adjust shelf_x/'
-                    f'shelf_y/layer_height/standoff, then send '
-                    f'/task_command to retry')
+                if self._nominal_target_pose is not None:
+                    p = self._nominal_target_pose.position
+                    self.get_logger().error(
+                        f'Nominal pose move failed; target tcp='
+                        f'({p.x:.3f},{p.y:.3f},{p.z:.3f}). Adjust shelf_x/'
+                        f'shelf_y/layer_height/standoff, then send '
+                        f'/task_command to retry')
+                else:
+                    self.get_logger().error(
+                        'Nominal move failed (nominal=home); '
+                        'check home reachability')
                 self._reset_cycle_vars()
                 self._set_state(self.IDLE)
             return
 
         if self.state == self.ALIGN:
+            if self._skip_align:
+                self._detect_start = now
+                self._detect_warn_logged = False
+                self.get_logger().info(
+                    '[TEST] Skipping ALIGN (in ALIGN); entering WAIT_DETECT')
+                self._set_state(self.WAIT_DETECT)
+                return
             if self._executor_state != self.EXECUTOR_IDLE:
                 if not self._busy_executor_logged:
                     self.get_logger().warn(

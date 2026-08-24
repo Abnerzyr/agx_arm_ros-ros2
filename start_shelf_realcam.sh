@@ -145,6 +145,7 @@ echo "=== All started (real camera + simulated arm + shelf workflow, in /arm) ==
 echo "MoveIt=$MOVEIT_PID  RViz=$RVIZ_PID  MockGripper=$MOCK_GRIPPER_PID  Cam=$CAM_PID  ArUco=$ARUCO_PID  YOLO=$YOLO_PID  Place=$PLACE_PID  Marker=$MARKER_PID  Grasp=$GRASP_PID  Shelf=$SHELF_PID"
 echo ""
 echo "Manual commands (注意 /arm/ 前缀):"
+echo "  ros2 topic pub --once -w 1 /arm/shelf/skip_align std_msgs/msg/Empty '{}'  # 无aruco时跳过对准(测试)"
 echo "  ros2 topic pub --once -w 1 /arm/task_command std_msgs/msg/Int32 '{data: 1}'"
 echo "  ros2 topic pub --once -w 1 /arm/release_command std_msgs/msg/Empty '{}'"
 echo ""
