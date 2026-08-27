@@ -164,7 +164,7 @@ ros2 service call /move_home std_srvs/srv/Empty
 | `grasp_quality_threshold` | `0.3` | 抓取质量阈值 |
 | `input_size` | `224` | GR-ConvNet 输入尺寸 |
 | `box_padding` | `0.005` | 目标包围盒各向膨胀量 (m) |
-| `target_classes` | `["rubik's cube"]` | 目标类别；自定义类别需安装 CLIP 并调用 `set_classes` |
+| `masked_depth_window` | `True` | 抓取点深度窗口是否用物体内部掩膜约束，避免混入背景深度 |
 
 **话题：**
 

@@ -46,7 +46,7 @@ class YoloGraspNode(Node):
         self.declare_parameter('box_padding', 0.005)
         self.declare_parameter('min_range', 0.15)
         self.declare_parameter('box_exclude_window', 2.0)
-        self.declare_parameter('target_classes', ["rubik's cube"])
+        self.declare_parameter('masked_depth_window', True)
 
         self.base_frame = self.get_parameter('base_frame').value
         self.camera_optical_frame = self.get_parameter(
@@ -58,7 +58,8 @@ class YoloGraspNode(Node):
         self.min_range = self.get_parameter('min_range').value
         self.box_exclude_window = self.get_parameter(
             'box_exclude_window').value
-        self.target_classes = self.get_parameter('target_classes').value
+        self.masked_depth_window = self.get_parameter(
+            'masked_depth_window').value
 
         self.bridge = CvBridge()
         self.model_cam = PinholeCameraModel()
@@ -81,20 +82,9 @@ class YoloGraspNode(Node):
         pkg_dir = os.path.dirname(os.path.abspath(__file__))
         yolo_path = os.path.join(pkg_dir, 'models', 'yolov8s-worldv2.pt')
         self.yolo = YOLO(yolo_path)
-        coco_names = list(self.yolo.names.values())
-        if self.target_classes:
-            try:
-                import clip  # noqa: F401
-            except ImportError:
-                self.get_logger().error(
-                    'Custom classes need the CLIP package; '
-                    'falling back to default COCO classes. Install with: '
-                    'pip3 install git+https://github.com/ultralytics/CLIP.git')
-            else:
-                self.yolo.set_classes(self.target_classes + coco_names)
-                self.get_logger().info(
-                    f'YOLO classes: {len(self.target_classes)} custom '
-                    f'({self.target_classes}) + {len(coco_names)} coco')
+        self.get_logger().info(
+            f'YOLO loaded with default classes '
+            f'({len(self.yolo.names)} classes)')
 
         self.grconv = self._load_grconv()
         self.get_logger().info('GR-ConvNet loaded')
@@ -383,9 +373,33 @@ class YoloGraspNode(Node):
         v_orig = min(max(v_orig, 0.0), float(h - 1))
         ui = int(round(u_orig))
         vi = int(round(v_orig))
-        win = depth[max(0, vi - 7):min(h, vi + 8),
-                    max(0, ui - 7):min(w, ui + 8)]
-        win_valid = win[(win > 0.05) & np.isfinite(win)]
+        r0 = max(0, vi - 7)
+        r1 = min(h, vi + 8)
+        c0 = max(0, ui - 7)
+        c1 = min(w, ui + 8)
+        win = depth[r0:r1, c0:c1]
+        valid_mask = (win > 0.05) & np.isfinite(win)
+        if self.masked_depth_window:
+            # 用物体内部掩膜 sel_valid 约束深度窗口，避免抓取点落在
+            # 物体边缘/背景时混入背景深度导致 z 偏移。
+            mask = np.zeros((r1 - r0, c1 - c0), dtype=bool)
+            cr0 = max(r0 - crop_y1, 0)
+            cr1 = min(r1 - crop_y1, crop_side)
+            cc0 = max(c0 - crop_x1, 0)
+            cc1 = min(c1 - crop_x1, crop_side)
+            if cr1 > cr0 and cc1 > cc0:
+                mask[cr0 - (r0 - crop_y1): cr1 - (r0 - crop_y1),
+                     cc0 - (c0 - crop_x1): cc1 - (c0 - crop_x1)] = \
+                    sel_valid[cr0:cr1, cc0:cc1]
+            if mask.any() and (valid_mask & mask).sum() < 10 \
+                    and valid_mask.sum() >= 10:
+                self.get_logger().warn(
+                    f'Masked depth window empty (obj mask excludes grasp '
+                    f'pixel); falling back to unmasked depth',
+                    throttle_duration_sec=10.0)
+            else:
+                valid_mask = valid_mask & mask
+        win_valid = win[valid_mask]
         if len(win_valid) >= 10:
             z_g = float(np.percentile(win_valid, 40))
         else:
