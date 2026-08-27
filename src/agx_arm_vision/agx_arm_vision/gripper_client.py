@@ -9,7 +9,7 @@ class GripperClient:
     TARGET_TOPIC = 'control/gripper_target'
 
     def __init__(self, node, joint_name, open_width=0.1, closed_width=0.0,
-                 force_threshold=1.5, width_tolerance=0.002, timeout=3.0):
+                 force_threshold=0.5, width_tolerance=0.002, timeout=3.0):
         self.node = node
         self.joint_name = joint_name
         self.open_width = open_width
@@ -56,7 +56,7 @@ class GripperClient:
         self._elapsed += dt
         if self.current_width is not None:
             if (self._closing
-                    and self.current_force > self.force_threshold):
+                    and abs(self.current_force) > self.force_threshold):
                 self.done = True
                 return
             if abs(self.current_width - self.target) <= self.width_tolerance:
@@ -72,4 +72,4 @@ class GripperClient:
     def holding(self):
         return (self.current_width is not None
                 and self.current_width > self.HOLD_WIDTH_MIN
-                and self.current_force > self.force_threshold)
+                and abs(self.current_force) > self.force_threshold)

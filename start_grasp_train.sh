@@ -129,7 +129,7 @@ done
 echo "=== Starting RViz (in /arm via launch) ==="
 ros2 launch agx_arm_moveit manual_rviz.launch.py \
   namespace:=arm \
-  rviz_config:=/home/s1/tiaozhanbei/agx_arm_ros-ros2/src/agx_arm_vision/rviz/yolo_config_armns.rviz &
+  rviz_config:=/home/s1/tiaozhanbei/agx_arm_ros-ros2/src/config/yolo_config_armns.rviz &
 RVIZ_PID=$!
 echo "  rviz PID=$RVIZ_PID"
 

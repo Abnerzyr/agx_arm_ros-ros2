@@ -30,7 +30,7 @@ class ManualGripper(Node):
         self.busy = False
         self.monitoring_grasp = False
         self.grasp_goal_handle = None
-        self.grasp_force_threshold = 1.0
+        self.grasp_force_threshold = 0.5
         self.current_force = 0.0
         self.current_width = 0.0
 
@@ -76,7 +76,7 @@ class ManualGripper(Node):
     def feedback_callback(self, msg):
         self.current_force = msg.force
         self.current_width = msg.width
-        if self.monitoring_grasp and msg.force > self.grasp_force_threshold:
+        if self.monitoring_grasp and abs(msg.force) > self.grasp_force_threshold:
             self.monitoring_grasp = False
             self.get_logger().info(
                 f'Object grasped! force={msg.force:.2f} N, '

@@ -357,9 +357,10 @@ class ShelfWorkflowNode(Node):
         return pose
 
     def _view_pose_from_marker(self, marker_pt):
-        """Fixed home orientation viewing pose: the TCP lands
-        TCP_BACK_OFFSET toward the arm and TCP_HEIGHT_OFFSET above the
-        marker, keeping the home TCP orientation."""
+        """Viewing pose: the TCP lands TCP_BACK_OFFSET toward the arm and
+        TCP_HEIGHT_OFFSET above the marker; the TCP orientation makes the
+        wrist camera optical axis face the marker with roll constrained to
+        world-up (no wrist flip)."""
         v = marker_pt.copy()
         v[2] = 0.0
         nv = np.linalg.norm(v)
@@ -367,6 +368,32 @@ class ShelfWorkflowNode(Node):
         tcp_pos = (marker_pt
                    - self.TCP_BACK_OFFSET * dirh
                    + np.array([0.0, 0.0, self.TCP_HEIGHT_OFFSET]))
+
+        view_dir = marker_pt - tcp_pos
+        nv_dir = float(np.linalg.norm(view_dir))
+        t_base_cam = self._lookup_matrix(
+            self.base_frame, self.camera_frame)
+        t_base_tcp = self._lookup_matrix(
+            self.base_frame, self.end_effector)
+        if (nv_dir > 1e-9 and t_base_cam is not None
+                and t_base_tcp is not None):
+            # 相机 look-at（滚转约束到世界向上，不翻转），再乘相机→TCP 安装旋转
+            R_base_cam = self._rot_from_view(view_dir)
+            t_tcp_cam = np.linalg.inv(t_base_tcp) @ t_base_cam
+            R_cam_tcp = t_tcp_cam[:3, :3].T
+            R_tcp = R_base_cam @ R_cam_tcp
+            quat = R.from_matrix(R_tcp).as_quat()
+            pose = Pose()
+            pose.position.x = float(tcp_pos[0])
+            pose.position.y = float(tcp_pos[1])
+            pose.position.z = float(tcp_pos[2])
+            pose.orientation.x = float(quat[0])
+            pose.orientation.y = float(quat[1])
+            pose.orientation.z = float(quat[2])
+            pose.orientation.w = float(quat[3])
+            return pose
+
+        # 回退固定 home 姿态（TF 不可用时）
         pose = Pose()
         pose.position.x = float(tcp_pos[0])
         pose.position.y = float(tcp_pos[1])

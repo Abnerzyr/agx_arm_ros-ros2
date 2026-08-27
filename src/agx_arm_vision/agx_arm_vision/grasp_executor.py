@@ -44,7 +44,7 @@ class GraspExecutor(Node):
         self.declare_parameter('target_z_offset', 0.0)
         self.declare_parameter('require_target_box', True)
         self.declare_parameter('box_wait_timeout', 1.0)
-        self.declare_parameter('force_threshold', 1.5)
+        self.declare_parameter('force_threshold', 0.5)
         self.declare_parameter('reach_tolerance', 0.03)
         self.declare_parameter('reach_timeout', 45.0)
         self.declare_parameter('pre_approach_distance', 0.10)
