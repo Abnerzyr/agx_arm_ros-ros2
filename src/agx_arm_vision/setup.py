@@ -46,6 +46,7 @@ setup(
             'virtual_obstacle_cloud = agx_arm_vision.virtual_obstacle_cloud:main',
             'shelf_workflow = agx_arm_vision.shelf_workflow_node:main',
             'virtual_yolo_target = agx_arm_vision.virtual_yolo_target:main',
+            'grasp_train_driver = agx_arm_vision.grasp_train_driver:main',
         ],
     },
 )

@@ -68,6 +68,7 @@ class GraspExecutor(Node):
         self.declare_parameter(
             'home_joints',
             [-0.0259, -0.4025, -0.0575, 2.0, 0.0604, 0.0722, 0.9141])
+        self.declare_parameter('grasp_only', False)
 
         self.base_link = self.get_parameter('base_link').value
         self.end_effector = self.get_parameter('end_effector_link').value
@@ -106,6 +107,7 @@ class GraspExecutor(Node):
         self.place_lower_timeout = self.get_parameter(
             'place_lower_timeout').value
         self.home_joints = self.get_parameter('home_joints').value
+        self.grasp_only = bool(self.get_parameter('grasp_only').value)
         self.arm = MoveIt2(
             node=self,
             base_link=self.base_link,
@@ -193,6 +195,10 @@ class GraspExecutor(Node):
             Bool, 'map_update_enable', 10)
         self.place_update_pub = self.create_publisher(
             Bool, 'place_update_enable', 10)
+        self.grasp_result_pub = self.create_publisher(
+            Int32, 'grasp_result', 10)
+        self._grasp_result_published = False
+        self._grasp_only_drop = False
 
         self.create_subscription(
             PoseStamped, 'grasp_pose', self.grasp_callback, 10)
@@ -366,6 +372,8 @@ class GraspExecutor(Node):
         self._place_validation_sent = False
         self._place_cycle_home = False
         self._place_abort_open = False
+        self._grasp_result_published = False
+        self._grasp_only_drop = False
         p = self.target_pose.position
         self._t_trigger = self.get_clock().now().nanoseconds * 1e-9
         self._last_mark = self._t_trigger
@@ -545,6 +553,7 @@ class GraspExecutor(Node):
                 self.target_pose = None
                 self.target_frame = None
                 self._fire_box_remove()
+                self._publish_grasp_result(0)
                 self.get_logger().warning(
                     'Target is unreachable; remaining IDLE')
             return
@@ -576,8 +585,13 @@ class GraspExecutor(Node):
                 self.gripper.open()
                 self.triggered = True
             elif self.gripper.done:
-                self.state = self.IDLE
-                self.triggered = False
+                if self._grasp_only_drop:
+                    self._grasp_only_drop = False
+                    self._place_cycle_home = True
+                    self._enter_home()
+                else:
+                    self.state = self.IDLE
+                    self.triggered = False
             return
         if self.state == self.MOVE_TO_TARGET:
             if not self.triggered:
@@ -593,6 +607,7 @@ class GraspExecutor(Node):
             elif self.arm.is_done():
                 if not self.arm.success:
                     self._mark('plan_failed')
+                    self._publish_grasp_result(0)
                     self.get_logger().error('Arm motion to hover failed')
                     self._enter_home()
                     return
@@ -610,6 +625,7 @@ class GraspExecutor(Node):
                         self.triggered = False
                     else:
                         self._mark('plan_failed')
+                        self._publish_grasp_result(0)
                         self.get_logger().error(
                             'Cartesian descent failed; going home')
                         self._enter_home()
@@ -633,6 +649,7 @@ class GraspExecutor(Node):
                 self.state = self.CLOSE_GRIPPER
                 return
             if elapsed > self.reach_timeout:
+                self._publish_grasp_result(0)
                 self.get_logger().warning(
                     f'TCP reach timeout ({self.reach_timeout:.1f}s), '
                     f'error={error}')
@@ -645,13 +662,22 @@ class GraspExecutor(Node):
             elif self.gripper.done:
                 self._mark('gripper_done')
                 if self.gripper.holding():
+                    self._publish_grasp_result(2)
                     self.get_logger().info(
                         'Grasp sequence completed (object held)')
                     self._latched_box = None
                 else:
+                    self._publish_grasp_result(1)
                     self.get_logger().info(
                         'Grasp sequence completed (nothing grasped)')
-                self._enter_home()
+                if self.grasp_only:
+                    self.get_logger().info(
+                        'grasp_only: releasing in place (drop back on shelf)')
+                    self._grasp_only_drop = True
+                    self.state = self.OPEN_GRIPPER
+                    self.triggered = False
+                else:
+                    self._enter_home()
             return
         if self.state == self.MOVE_HOME:
             if not self.triggered:
@@ -871,6 +897,17 @@ class GraspExecutor(Node):
         self.triggered = False
         self._home_clear_waited = False
         self._home_clear_start = 0.0
+
+    def _publish_grasp_result(self, code):
+        """Publish grasp outcome once per attempt.
+
+        0 = not executed / failed before grasp, 1 = executed but empty,
+        2 = object held. Used by the RL refiner as the reward signal.
+        """
+        if self._grasp_result_published:
+            return
+        self._grasp_result_published = True
+        self.grasp_result_pub.publish(Int32(data=int(code)))
 
     def _init_open(self):
         self.state = self.OPEN_GRIPPER

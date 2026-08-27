@@ -20,3 +20,4 @@ oculus_reader/oculus_reader
 
 weights/clip/
 .dsh/
+grasp_rl_data/

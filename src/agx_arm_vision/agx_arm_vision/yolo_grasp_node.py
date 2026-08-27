@@ -25,10 +25,19 @@ from tf2_ros import Buffer, TransformException, TransformListener
 from ultralytics import YOLO
 from visualization_msgs.msg import Marker
 
+from agx_arm_vision.grasp_rl import GraspRLRefiner, build_patch
+
 
 class YoloGraspNode(Node):
     CAMERA_OPTICAL_FRAME = 'camera_color_optical_frame'
     MAP_ENABLE_TIMEOUT = 1.0
+
+    @staticmethod
+    def _rl_data_dir():
+        """RL data root: $GRASP_RL_DATA_DIR if set, else ~/.grasp_rl."""
+        return os.environ.get(
+            'GRASP_RL_DATA_DIR',
+            os.path.join(os.path.expanduser('~'), '.grasp_rl'))
 
     def __init__(self):
         super().__init__('yolo_grasp_node')
@@ -47,6 +56,30 @@ class YoloGraspNode(Node):
         self.declare_parameter('min_range', 0.15)
         self.declare_parameter('box_exclude_window', 2.0)
         self.declare_parameter('masked_depth_window', True)
+        self.declare_parameter('rl_enable', False)
+        self.declare_parameter('rl_patch_size', 32)
+        self.declare_parameter('rl_pixel_step', 6.0)
+        self.declare_parameter('rl_angle_step_deg', 10.0)
+        self.declare_parameter('rl_depth_step', 0.015)
+        self.declare_parameter('rl_epsilon_start', 0.3)
+        self.declare_parameter('rl_epsilon_end', 0.02)
+        self.declare_parameter('rl_epsilon_decay', 0.998)
+        self.declare_parameter('rl_replay_capacity', 500)
+        self.declare_parameter('rl_batch_size', 32)
+        self.declare_parameter('rl_grad_steps', 4)
+        self.declare_parameter('rl_lr', 0.001)
+        self.declare_parameter('rl_checkpoint_interval', 10)
+        self.declare_parameter(
+            'rl_checkpoint_dir',
+            os.path.join(self._rl_data_dir(), 'checkpoint'))
+        self.declare_parameter(
+            'rl_log_dir',
+            os.path.join(self._rl_data_dir(), 'samples'))
+        self.declare_parameter('rl_inflight_timeout', 180.0)
+        self.declare_parameter('rl_reward_success', 1.0)
+        self.declare_parameter('rl_reward_empty', 0.2)
+        self.declare_parameter('rl_reward_fail', -1.0)
+        self.declare_parameter('rl_stats_interval', 20)
 
         self.base_frame = self.get_parameter('base_frame').value
         self.camera_optical_frame = self.get_parameter(
@@ -60,6 +93,9 @@ class YoloGraspNode(Node):
             'box_exclude_window').value
         self.masked_depth_window = self.get_parameter(
             'masked_depth_window').value
+        self.rl_enable = self.get_parameter('rl_enable').value
+        self.rl_patch_size = int(
+            self.get_parameter('rl_patch_size').value)
 
         self.bridge = CvBridge()
         self.model_cam = PinholeCameraModel()
@@ -117,7 +153,42 @@ class YoloGraspNode(Node):
             Marker, 'yolo/target_box', 10)
 
         self.create_timer(0.5, self.process)
-        self.get_logger().info('YOLO+Grasp node ready')
+        self._rl = None
+        if self.rl_enable:
+            self._rl = GraspRLRefiner(self, {
+                'patch_size': self.get_parameter('rl_patch_size').value,
+                'pixel_step': self.get_parameter('rl_pixel_step').value,
+                'angle_step_deg': self.get_parameter(
+                    'rl_angle_step_deg').value,
+                'depth_step': self.get_parameter('rl_depth_step').value,
+                'epsilon_start': self.get_parameter(
+                    'rl_epsilon_start').value,
+                'epsilon_end': self.get_parameter('rl_epsilon_end').value,
+                'epsilon_decay': self.get_parameter(
+                    'rl_epsilon_decay').value,
+                'replay_capacity': self.get_parameter(
+                    'rl_replay_capacity').value,
+                'batch_size': self.get_parameter('rl_batch_size').value,
+                'grad_steps': self.get_parameter('rl_grad_steps').value,
+                'lr': self.get_parameter('rl_lr').value,
+                'checkpoint_interval': self.get_parameter(
+                    'rl_checkpoint_interval').value,
+                'checkpoint_dir': self.get_parameter(
+                    'rl_checkpoint_dir').value,
+                'log_dir': self.get_parameter('rl_log_dir').value,
+                'inflight_timeout': self.get_parameter(
+                    'rl_inflight_timeout').value,
+                'reward_success': self.get_parameter(
+                    'rl_reward_success').value,
+                'reward_empty': self.get_parameter('rl_reward_empty').value,
+                'reward_fail': self.get_parameter('rl_reward_fail').value,
+                'stats_interval': self.get_parameter(
+                    'rl_stats_interval').value,
+                'n_scalars': 4,
+            })
+            self.get_logger().info('[RL] grasp refiner enabled')
+        else:
+            self.get_logger().info('RL disabled (passthrough mode)')
 
     def _load_grconv(self):
         pkg_dir = os.path.dirname(os.path.abspath(__file__))
@@ -373,6 +444,43 @@ class YoloGraspNode(Node):
         v_orig = min(max(v_orig, 0.0), float(h - 1))
         ui = int(round(u_orig))
         vi = int(round(v_orig))
+        z_g = self._grasp_z_at(
+            ui, vi, depth, sel_valid, crop_x1, crop_y1, crop_side, box_z)
+        if self._rl is not None:
+            patch = build_patch(depth, rgb, u_orig, v_orig,
+                                self.rl_patch_size, z_g)
+            scalars = np.array([
+                z_g / 1.0,
+                angle / math.pi,
+                min(max(best_score, -1.0), 1.0),
+                grasp_level / 3.0,
+            ], np.float32)
+            action = self._rl.observe(patch, scalars)
+            u_orig, v_orig, angle, dz = self._rl.apply_action(
+                action, u_orig, v_orig, angle, w, h)
+            u_orig = min(max(u_orig, 0.0), float(w - 1))
+            v_orig = min(max(v_orig, 0.0), float(h - 1))
+            z_rl = self._grasp_z_at(
+                int(round(u_orig)), int(round(v_orig)),
+                depth, sel_valid, crop_x1, crop_y1, crop_side, box_z)
+            z_g = min(max(z_rl + dz, 0.05), 2.0)
+        x_g = (u_orig - fcx) * z_g / fx
+        y_g = (v_orig - fcy) * z_g / fy
+
+        self._publish(
+            x_g, y_g, z_g, angle, grasp_width, best_score,
+            box_center=(box_cx, box_cy, box_cz),
+            box_scale=(box_sx, box_sy, box_sz),
+            box_orientation=box_quat)
+
+    def _grasp_z_at(self, ui, vi, depth, sel_valid, crop_x1, crop_y1,
+                    crop_side, box_z):
+        """Depth at a grasp pixel, constrained to the object-interior mask.
+
+        Same semantics as the original 15x15 window logic; the mask keeps
+        background depth out when the pixel sits near the object edge.
+        """
+        h, w = depth.shape
         r0 = max(0, vi - 7)
         r1 = min(h, vi + 8)
         c0 = max(0, ui - 7)
@@ -380,8 +488,6 @@ class YoloGraspNode(Node):
         win = depth[r0:r1, c0:c1]
         valid_mask = (win > 0.05) & np.isfinite(win)
         if self.masked_depth_window:
-            # 用物体内部掩膜 sel_valid 约束深度窗口，避免抓取点落在
-            # 物体边缘/背景时混入背景深度导致 z 偏移。
             mask = np.zeros((r1 - r0, c1 - c0), dtype=bool)
             cr0 = max(r0 - crop_y1, 0)
             cr1 = min(r1 - crop_y1, crop_side)
@@ -394,24 +500,15 @@ class YoloGraspNode(Node):
             if mask.any() and (valid_mask & mask).sum() < 10 \
                     and valid_mask.sum() >= 10:
                 self.get_logger().warn(
-                    f'Masked depth window empty (obj mask excludes grasp '
-                    f'pixel); falling back to unmasked depth',
+                    'Masked depth window empty (obj mask excludes grasp '
+                    'pixel); falling back to unmasked depth',
                     throttle_duration_sec=10.0)
             else:
                 valid_mask = valid_mask & mask
         win_valid = win[valid_mask]
         if len(win_valid) >= 10:
-            z_g = float(np.percentile(win_valid, 40))
-        else:
-            z_g = box_z
-        x_g = (u_orig - fcx) * z_g / fx
-        y_g = (v_orig - fcy) * z_g / fy
-
-        self._publish(
-            x_g, y_g, z_g, angle, grasp_width, best_score,
-            box_center=(box_cx, box_cy, box_cz),
-            box_scale=(box_sx, box_sy, box_sz),
-            box_orientation=box_quat)
+            return float(np.percentile(win_valid, 40))
+        return box_z
 
     def _publish(self, x, y, z, angle, width, score,
                  box_center=None, box_scale=None, box_orientation=None):
@@ -819,6 +916,11 @@ class YoloGraspNode(Node):
         msg.is_bigendian = False
         msg.data = img.tobytes()
         pub.publish(msg)
+
+    def destroy_node(self):
+        if self._rl is not None:
+            self._rl.save_checkpoint()
+        super().destroy_node()
 
 
 def main():
