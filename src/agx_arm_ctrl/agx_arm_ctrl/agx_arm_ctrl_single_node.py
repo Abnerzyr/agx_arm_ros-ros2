@@ -119,7 +119,7 @@ class AgxArmRosNode(Node):
         self.declare_parameter("effector_type", "none")
         self.declare_parameter("revo2_type", "left")
         self.declare_parameter("tcp_offset", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-        self.declare_parameter("gripper_default_effort", 1.0)
+        self.declare_parameter("gripper_default_effort", 3.0)
         self.declare_parameter("control_enabled", True)
         self.declare_parameter("auto_home", True)
         self.declare_parameter(
@@ -158,9 +158,9 @@ class AgxArmRosNode(Node):
         if self.gripper_default_effort < 0:
             self.get_logger().warn(
                 f"gripper_default_effort should be greater than 0, but got {self.gripper_default_effort}. "
-                "Setting it to default value 1.0"
+                "Setting it to default value 3.0"
             )
-            self.gripper_default_effort = 1.0
+            self.gripper_default_effort = 3.0
 
         ### variables
         self.is_piper = "piper" in self.arm_type

@@ -94,7 +94,7 @@ def generate_launch_description():
 
     gripper_default_effort_arg = DeclareLaunchArgument(
         'gripper_default_effort',
-        default_value='1.0',
+        default_value='3.0',
         description='Default effort for gripper commands (>= 0.0).'
     )
 

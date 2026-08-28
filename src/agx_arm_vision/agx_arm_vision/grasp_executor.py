@@ -28,6 +28,7 @@ class GraspExecutor(Node):
     LOWER_TO_PLACE = 8
     PLACE_OPEN = 9
     PLACE_LIFT = 10
+    LIFT_VERIFY = 11
 
     BOX_PAIR_WINDOW = 2.0
 
@@ -69,6 +70,11 @@ class GraspExecutor(Node):
             'home_joints',
             [-0.0259, -0.4025, -0.0575, 2.0, 0.0604, 0.0722, 0.9141])
         self.declare_parameter('grasp_only', False)
+        self.declare_parameter('lift_verify', True)
+        self.declare_parameter('lift_distance', 0.03)
+        self.declare_parameter('lift_hold_time', 2.0)
+        self.declare_parameter('slip_width_tol', 0.008)
+        self.declare_parameter('lift_slip_ticks', 3)
 
         self.base_link = self.get_parameter('base_link').value
         self.end_effector = self.get_parameter('end_effector_link').value
@@ -108,6 +114,15 @@ class GraspExecutor(Node):
             'place_lower_timeout').value
         self.home_joints = self.get_parameter('home_joints').value
         self.grasp_only = bool(self.get_parameter('grasp_only').value)
+        self.lift_verify = bool(self.get_parameter('lift_verify').value)
+        self.lift_distance = float(
+            self.get_parameter('lift_distance').value)
+        self.lift_hold_time = float(
+            self.get_parameter('lift_hold_time').value)
+        self.slip_width_tol = float(
+            self.get_parameter('slip_width_tol').value)
+        self.lift_slip_ticks = int(
+            self.get_parameter('lift_slip_ticks').value)
         self.arm = MoveIt2(
             node=self,
             base_link=self.base_link,
@@ -138,6 +153,10 @@ class GraspExecutor(Node):
         self.target_frame = None
         self.reach_wait_start = 0.0
         self.reach_ok_count = 0
+        self._lift_phase = 0
+        self._width_clamped = 0.0
+        self._hold_start = 0.0
+        self._lift_slip_count = 0
         self.current_joints = [0.0] * 7
         self._prev_tick_joints = None
         self._joint_stable_ticks = 0
@@ -661,23 +680,96 @@ class GraspExecutor(Node):
                 self.triggered = True
             elif self.gripper.done:
                 self._mark('gripper_done')
-                if self.gripper.holding():
-                    self._publish_grasp_result(2)
-                    self.get_logger().info(
-                        'Grasp sequence completed (object held)')
-                    self._latched_box = None
+                if self.grasp_only and self.lift_verify:
+                    if self.gripper.holding():
+                        self._width_clamped = self.gripper.current_width
+                        self._lift_phase = 0
+                        self._lift_slip_count = 0
+                        self._hold_start = 0.0
+                        self.state = self.LIFT_VERIFY
+                        self.triggered = False
+                        self.get_logger().info(
+                            'Clamped; starting lift-verify '
+                            f'(width_clamped='
+                            f'{self._width_clamped:.4f} m)')
+                    else:
+                        self._publish_grasp_result(1)
+                        self.get_logger().info(
+                            'Grasp sequence completed '
+                            '(nothing grasped)')
+                        self._grasp_only_drop = True
+                        self.state = self.OPEN_GRIPPER
+                        self.triggered = False
                 else:
-                    self._publish_grasp_result(1)
-                    self.get_logger().info(
-                        'Grasp sequence completed (nothing grasped)')
-                if self.grasp_only:
-                    self.get_logger().info(
-                        'grasp_only: releasing in place (drop back on shelf)')
-                    self._grasp_only_drop = True
-                    self.state = self.OPEN_GRIPPER
-                    self.triggered = False
-                else:
-                    self._enter_home()
+                    if self.gripper.holding():
+                        self._publish_grasp_result(2)
+                        self.get_logger().info(
+                            'Grasp sequence completed '
+                            '(object held)')
+                        self._latched_box = None
+                    else:
+                        self._publish_grasp_result(1)
+                        self.get_logger().info(
+                            'Grasp sequence completed '
+                            '(nothing grasped)')
+                    if self.grasp_only:
+                        self._grasp_only_drop = True
+                        self.state = self.OPEN_GRIPPER
+                        self.triggered = False
+                    else:
+                        self._enter_home()
+            return
+        if self.state == self.LIFT_VERIFY:
+            if self._lift_phase == 0:
+                if not self._ensure_box_removed():
+                    return
+                if self._lift_slip():
+                    self._lift_fail('slipped before lift')
+                    return
+                p = self.target_pose.position
+                lift_pose = Pose(
+                    position=Point(
+                        x=p.x, y=p.y, z=p.z + self.lift_distance),
+                    orientation=self.target_pose.orientation)
+                self._lift_phase = 1
+                self._mark('lift_sent')
+                self.arm.move_cartesian_to(
+                    [lift_pose], self.target_frame)
+                self.get_logger().info(
+                    f'Lift-verify: moving up '
+                    f'{self.lift_distance:.2f} m')
+                return
+            if self._lift_phase == 1:
+                if self._lift_slip():
+                    self._lift_fail('slipped during lift')
+                    return
+                if not self.arm.is_done():
+                    return
+                if not self.arm.success:
+                    self._lift_fail('lift plan failed')
+                    return
+                self._lift_phase = 2
+                self._hold_start = (
+                    self.get_clock().now().nanoseconds * 1e-9)
+                self.get_logger().info(
+                    f'Lifted; holding {self.lift_hold_time:.1f} s '
+                    'for drop check')
+                return
+            if self._lift_phase == 2:
+                if self._lift_slip():
+                    self._lift_fail('slipped during hold')
+                    return
+                now_hold = (
+                    self.get_clock().now().nanoseconds * 1e-9)
+                if now_hold - self._hold_start < self.lift_hold_time:
+                    return
+                self._mark('lift_done')
+                self._publish_grasp_result(2)
+                self._latched_box = None
+                self.get_logger().info(
+                    'Grasp sequence completed '
+                    '(object held, lift-verify)')
+                self._finish_lift_verify()
             return
         if self.state == self.MOVE_HOME:
             if not self.triggered:
@@ -892,6 +984,29 @@ class GraspExecutor(Node):
                 self._enter_home()
             return
 
+    def _lift_slip(self):
+        if self.gripper.current_width is None:
+            return False
+        w_drift = abs(self.gripper.current_width - self._width_clamped)
+        f_ok = abs(self.gripper.current_force) > self.force_threshold
+        if (w_drift > self.slip_width_tol) or (not f_ok):
+            self._lift_slip_count += 1
+        else:
+            self._lift_slip_count = 0
+        return self._lift_slip_count >= self.lift_slip_ticks
+
+    def _lift_fail(self, reason):
+        self._mark('lift_done')
+        self._publish_grasp_result(1)
+        self.get_logger().warning(
+            f'Lift-verify failed ({reason}); releasing in place')
+        self._finish_lift_verify()
+
+    def _finish_lift_verify(self):
+        self._grasp_only_drop = True
+        self.state = self.OPEN_GRIPPER
+        self.triggered = False
+
     def _enter_home(self):
         self.state = self.MOVE_HOME
         self.triggered = False
@@ -1040,6 +1155,7 @@ class GraspExecutor(Node):
             ('plan_done', 'plan_sent', 'exec_plan'),
             ('reached', 'plan_done', 'traj_exec'),
             ('gripper_done', 'reached', 'gripper_close'),
+            ('lift_done', 'gripper_done', 'lift_verify'),
             ('home_done', 'gripper_done', 'home_move'),
         ]
         parts = []

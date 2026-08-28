@@ -111,6 +111,7 @@ ros2 launch agx_arm_ctrl start_single_agx_arm_moveit.launch.py \
   auto_home:=true \
   use_rviz:=false \
   follow:=true \
+  gripper_default_effort:=3.0 \
   namespace:=arm &
 MOVEIT_PID=$!
 

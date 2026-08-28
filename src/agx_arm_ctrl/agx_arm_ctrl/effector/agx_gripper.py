@@ -49,7 +49,7 @@ class AgxGripperWrapper:
     WIDTH_MIN: float = 0.0      # minimum width, unit: m
     WIDTH_MAX: float = 0.1      # maximum width, unit: m
     FORCE_MIN: float = 0.5      # minimum force, unit: N
-    FORCE_MAX: float = 3.0      # maximum force, unit: N
+    FORCE_MAX: float = 5.0      # maximum force, unit: N
     
     def __init__(self, agx_arm):
         self._agx_arm: Optional[ArmDriverAbstract] = agx_arm

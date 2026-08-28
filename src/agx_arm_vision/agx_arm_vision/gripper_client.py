@@ -24,6 +24,7 @@ class GripperClient:
         self.done = False
         self._closing = False
         self._ok_ticks = 0
+        self._force_ticks = 0
         self._elapsed = 0.0
 
         self.pub = node.create_publisher(JointState, self.TARGET_TOPIC, 1)
@@ -44,6 +45,7 @@ class GripperClient:
         self.target = width
         self.done = False
         self._ok_ticks = 0
+        self._force_ticks = 0
         self._elapsed = 0.0
         msg = JointState()
         msg.name = [self.joint_name]
@@ -55,10 +57,14 @@ class GripperClient:
             return
         self._elapsed += dt
         if self.current_width is not None:
-            if (self._closing
-                    and abs(self.current_force) > self.force_threshold):
-                self.done = True
-                return
+            if self._closing:
+                if abs(self.current_force) > self.force_threshold:
+                    self._force_ticks += 1
+                else:
+                    self._force_ticks = 0
+                if self._force_ticks >= self.SETTLE_TICKS:
+                    self.done = True
+                    return
             if abs(self.current_width - self.target) <= self.width_tolerance:
                 self._ok_ticks += 1
             else:
@@ -72,4 +78,4 @@ class GripperClient:
     def holding(self):
         return (self.current_width is not None
                 and self.current_width > self.HOLD_WIDTH_MIN
-                and abs(self.current_force) > self.force_threshold)
+                and self._force_ticks >= self.SETTLE_TICKS)
