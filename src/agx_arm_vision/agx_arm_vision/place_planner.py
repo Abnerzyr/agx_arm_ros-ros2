@@ -21,6 +21,7 @@ class PlacePlanner(Node):
     def __init__(self):
         super().__init__('place_planner')
         self.declare_parameter('base_frame', 'base_link')
+        self.declare_parameter('end_effector_link', 'tcp_link')
         self.declare_parameter('camera_optical_frame', 'camera_color_optical_frame')
         self.declare_parameter(
             'depth_topic', '/camera/camera/aligned_depth_to_color/image_raw')
@@ -35,6 +36,8 @@ class PlacePlanner(Node):
         self.declare_parameter('process_period', 0.5)
 
         self.base_frame = self.get_parameter('base_frame').value
+        self.end_effector_link = self.get_parameter(
+            'end_effector_link').value
         self.camera_optical_frame = self.get_parameter(
             'camera_optical_frame').value
         self.table_dist = self.get_parameter('table_distance_threshold').value
@@ -55,6 +58,7 @@ class PlacePlanner(Node):
         self.depth_stamp = None
         self._place_enabled = True
         self._last_place_msg_time = 0.0
+        self._last_spot_idx = None
 
         self.create_subscription(
             Image, self.get_parameter('depth_topic').value,
@@ -109,7 +113,7 @@ class PlacePlanner(Node):
     def _lookup_tcp_base(self):
         try:
             t = self.tf_buffer.lookup_transform(
-                self.base_frame, 'tcp_link',
+                self.base_frame, self.end_effector_link,
                 rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=1.0),
             )
@@ -145,6 +149,8 @@ class PlacePlanner(Node):
 
     def process(self):
         if self.depth_img is None or self.camera_info is None:
+            self.get_logger().info(
+                '[PLACE] skip: no depth/camera_info', throttle_duration_sec=5.0)
             return
         depth = self._depth_meters(self.depth_img)
         h, w = depth.shape
@@ -155,6 +161,9 @@ class PlacePlanner(Node):
 
         transform = self._lookup_transform()
         if transform is None:
+            self.get_logger().info(
+                '[PLACE] skip: TF base<-camera unavailable',
+                throttle_duration_sec=5.0)
             return
 
         ds = 8
@@ -168,6 +177,10 @@ class PlacePlanner(Node):
         pts = np.stack([xs[valid], ys[valid], z[valid]], axis=1)
         plane = self._ransac_plane(pts)
         if plane is None:
+            self.get_logger().info(
+                '[PLACE] skip: table plane fit failed '
+                f'({int(valid.sum())} valid px)',
+                throttle_duration_sec=5.0)
             return
         n, d = plane
 
@@ -182,8 +195,11 @@ class PlacePlanner(Node):
                 uu[cloud_keep], vv[cloud_keep], z[cloud_keep], transform)
 
         # find the empty spot farthest from obstacles and table edges,
-        # but restricted to the arm's reachable area around the current TCP
-        free = (table_mask & ~occupied_mask).astype(np.uint8)
+        # but restricted to the arm's reachable area around the current TCP.
+        # 可达限制只作软偏好：若 TCP 周围可达自由区太小，回退到全可见桌面，
+        # 保证有桌就有 /place_pose（可达性由 executor 的 plan_only 校验兜底）。
+        free_all = (table_mask & ~occupied_mask).astype(np.uint8)
+        free = free_all
         if self.reach_radius > 0.0:
             tcp_xy = self._lookup_tcp_base()
             if tcp_xy is not None:
@@ -195,14 +211,42 @@ class PlacePlanner(Node):
                 by = mat[1, 0] * xs + mat[1, 1] * ys + mat[1, 2] * z + ty
                 d2 = (bx - tcp_xy[0]) ** 2 + (by - tcp_xy[1]) ** 2
                 reachable = (d2 <= self.reach_radius ** 2) & valid
-                free &= reachable
+                free_reach = free_all & reachable
+                if free_reach.sum() >= 50:
+                    free = free_reach
+                else:
+                    self.get_logger().info(
+                        'Reachable free area too small '
+                        f'({int(free_reach.sum())}px); falling back to '
+                        'full visible table', throttle_duration_sec=5.0)
         if free.sum() < 50:
+            self._last_spot_idx = None
+            self.get_logger().info(
+                '[PLACE] skip: free area too small '
+                f'({int(free.sum())}px)',
+                throttle_duration_sec=5.0)
             return
         dist = cv2.distanceTransform(free, cv2.DIST_L2, 3)
         max_d = float(dist.max())
         if not np.isfinite(max_d) or max_d <= 0:
+            self._last_spot_idx = None
+            self.get_logger().info(
+                '[PLACE] skip: no clear spot (dist<=0)',
+                throttle_duration_sec=5.0)
             return
-        v_idx, u_idx = np.unravel_index(np.argmax(dist), dist.shape)
+        # 滞回：上一帧放置点仍空闲则沿用，避免放置点每帧乱跳
+        # （否则执行器在 manual_release 时刻抓到的快照可能不可达）。
+        spot_idx = None
+        if self._last_spot_idx is not None:
+            li, lj = self._last_spot_idx
+            if (0 <= li < dist.shape[0] and 0 <= lj < dist.shape[1]
+                    and free[li, lj]):
+                spot_idx = (int(li), int(lj))
+        if spot_idx is None:
+            v_idx, u_idx = np.unravel_index(np.argmax(dist), dist.shape)
+            spot_idx = (int(v_idx), int(u_idx))
+        self._last_spot_idx = spot_idx
+        v_idx, u_idx = spot_idx
         u_spot = int(u_idx * ds)
         v_spot = int(v_idx * ds)
 
@@ -211,13 +255,23 @@ class PlacePlanner(Node):
             + (v_spot - fcy) / fy * n[1]
             + n[2])
         if abs(denom) < 1e-6:
+            self.get_logger().info(
+                '[PLACE] skip: denom~0 at spot',
+                throttle_duration_sec=5.0)
             return
         z_spot = -d / denom
         if not np.isfinite(z_spot) or z_spot <= 0.05 or z_spot > self.max_range:
+            self.get_logger().info(
+                '[PLACE] skip: bad spot z '
+                f'({z_spot:.3f})', throttle_duration_sec=5.0)
             return
 
         clearance_m = max_d * ds * z_spot / fx
         if clearance_m < self.min_clearance:
+            self.get_logger().info(
+                f'[PLACE] skip: clearance {clearance_m:.3f}m < '
+                f'min_clearance {self.min_clearance:.3f}m',
+                throttle_duration_sec=5.0)
             return
 
         x_spot = (u_spot - fcx) * z_spot / fx

@@ -6,7 +6,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import JointState, PointCloud2
-from std_msgs.msg import Bool, Int32
+from std_msgs.msg import Bool, Float32, Int32
 from std_msgs.msg import Empty as EmptyMsg
 from std_srvs.srv import Empty as EmptySrv
 from tf2_ros import Buffer, TransformException, TransformListener
@@ -60,7 +60,8 @@ class GraspExecutor(Node):
         self.declare_parameter(
             'place_filtered_cloud_topic', 'place_filtered_cloud')
         self.declare_parameter('place_z_clearance', 0.05)
-        self.declare_parameter('place_pose_timeout', 2.0)
+        self.declare_parameter('place_z_margin', 0.01)
+        self.declare_parameter('place_pose_timeout', 30.0)
         self.declare_parameter('place_lower_timeout', 20.0)
         self.declare_parameter(
             'filtered_cloud_topic', 'filtered_cloud')
@@ -108,6 +109,8 @@ class GraspExecutor(Node):
             'place_filtered_cloud_topic').value
         self.place_z_clearance = self.get_parameter(
             'place_z_clearance').value
+        self.place_z_margin = float(
+            self.get_parameter('place_z_margin').value)
         self.place_pose_timeout = self.get_parameter(
             'place_pose_timeout').value
         self.place_lower_timeout = self.get_parameter(
@@ -168,6 +171,8 @@ class GraspExecutor(Node):
         self.stored_pose = None
         self.stored_frame = None
         self._latest_box = None
+        self._table_height = None
+        self._table_height_time = 0.0
         self._latched_box = None
         self._pending_pose = None
         self._pending_time = 0.0
@@ -226,6 +231,8 @@ class GraspExecutor(Node):
         self.create_subscription(
             PointCloud2, 'yolo/points_filtered', self.cloud_time_callback, 10)
         self.create_subscription(
+            Float32, 'yolo/table_height', self.table_height_cb, 10)
+        self.create_subscription(
             PointCloud2,
             self.get_parameter('filtered_cloud_topic').value,
             self.filtered_cloud_callback,
@@ -234,6 +241,9 @@ class GraspExecutor(Node):
             EmptyMsg, 'manual_grasp_start', self.manual_start_cb, 10)
         self.create_subscription(
             EmptyMsg, 'manual_release', self.manual_release_cb, 10)
+        self.create_subscription(
+            EmptyMsg, 'manual_release_force',
+            self.manual_release_force_cb, 10)
         self.create_subscription(
             PoseStamped, self.place_pose_topic,
             self.place_pose_callback, 10)
@@ -281,6 +291,10 @@ class GraspExecutor(Node):
         }
         self._latest_box = (
             self.get_clock().now().nanoseconds * 1e-9, box)
+
+    def table_height_cb(self, msg):
+        self._table_height = float(msg.data)
+        self._table_height_time = self.get_clock().now().nanoseconds * 1e-9
 
     def cloud_time_callback(self, msg):
         del msg
@@ -332,7 +346,13 @@ class GraspExecutor(Node):
             ),
         )
         self.stored_frame = frame_id
-        if self._latched_box is not None:
+        # 优先用 yolo 发布的桌面高度（base 系），替代盒底（盒拟合可能不准）。
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if (self._table_height is not None
+                and now - self._table_height_time <= 3.0):
+            self.grasp_offset = (
+                self.stored_pose.position.z - self._table_height)
+        elif self._latched_box is not None:
             box_bottom = (
                 self._latched_box['position'][2]
                 - self._latched_box['size'][2] / 2.0)
@@ -410,13 +430,16 @@ class GraspExecutor(Node):
         if (self._latest_place_pose is None
                 or now - self._latest_place_pose[0] > self.place_pose_timeout):
             self.get_logger().warning(
-                'No fresh /place_pose available; opening gripper in place')
-            self.state = self.OPEN_GRIPPER
+                'No fresh /place_pose; staying in WAIT_RELEASE. '
+                'Retry /manual_release or use /manual_release_force')
+            self._place_validating = False
             self.triggered = False
             return
         p = self._latest_place_pose[1].pose
         self._place_frame = self._latest_place_pose[1].header.frame_id
-        self._place_z = p.position.z + self.grasp_offset
+        # 放置最终点再抬高 place_z_margin(默认 1cm)，留容错防压到桌面。
+        self._place_z = (p.position.z + self.grasp_offset
+                         + self.place_z_margin)
         self._place_hover_z = self._place_z + self.place_z_clearance
         ori = self.stored_pose.orientation if self.stored_pose is not None \
             else Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
@@ -441,6 +464,19 @@ class GraspExecutor(Node):
             f'Manual place triggered: table_z={p.position.z:.3f} '
             f'grasp_offset={self.grasp_offset:.3f} '
             f'place_z={self._place_z:.3f}')
+
+    def manual_release_force_cb(self, msg):
+        """Force release: open the gripper wherever the arm currently is.
+
+        Final manual fallback when automated placement cannot proceed.
+        """
+        del msg
+        self.get_logger().warn(
+            'FORCE RELEASE: opening gripper in place (manual override)')
+        self._place_validating = False
+        self._place_abort_open = False
+        self.state = self.OPEN_GRIPPER
+        self.triggered = False
 
     def gripper_feedback_cb(self, msg):
         self.gripper.feedback(msg.width, msg.force)
@@ -813,9 +849,11 @@ class GraspExecutor(Node):
                             'Reached home position')
                         if self._place_abort_open:
                             self._place_abort_open = False
-                            self.get_logger().info(
-                                'Place failed; opening gripper at home')
-                            self.state = self.OPEN_GRIPPER
+                            self.get_logger().warning(
+                                'Place aborted; holding at home. Retry '
+                                '/manual_release or use '
+                                '/manual_release_force')
+                            self.state = self.WAIT_RELEASE
                         elif self._place_cycle_home:
                             self._place_cycle_home = False
                             self.state = self.IDLE
@@ -895,8 +933,8 @@ class GraspExecutor(Node):
                 else:
                     self._mark('place_validate_failed')
                     self.get_logger().warning(
-                        'Place point unreachable; opening gripper in place')
-                    self.state = self.OPEN_GRIPPER
+                        'Place point unreachable; staying in WAIT_RELEASE. '
+                        'Retry /manual_release or use /manual_release_force')
                     self.triggered = False
             return
         if self.state == self.MOVE_TO_PLACE_ABOVE:
@@ -955,8 +993,10 @@ class GraspExecutor(Node):
                 elif elapsed > self.place_lower_timeout:
                     self.get_logger().warning(
                         f'Place reach timeout, error={error}; '
-                        'releasing in place')
-                    self.state = self.PLACE_OPEN
+                        'going home (holding; use /manual_release_force '
+                        'to drop)')
+                    self._place_abort_open = True
+                    self._enter_home()
                     self.triggered = False
             return
         if self.state == self.PLACE_OPEN:

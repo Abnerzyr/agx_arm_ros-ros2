@@ -106,6 +106,7 @@ echo "=== Starting place planner (in /arm) ==="
 OPENBLAS_NUM_THREADS=2 ros2 run agx_arm_vision place_planner \
   --ros-args -r __ns:=/arm \
   -p base_frame:=arm/base_link \
+  -p end_effector_link:=arm/tcp_link \
   -p camera_optical_frame:=arm/camera_color_optical_frame \
   -p process_period:=1.0 &>/tmp/place.log &
 PLACE_PID=$!
@@ -148,6 +149,7 @@ echo "Manual commands (注意 /arm/ 前缀):"
 echo "  ros2 topic pub --once -w 1 /arm/shelf/skip_align std_msgs/msg/Empty '{}'  # 无aruco时跳过对准(测试)"
 echo "  ros2 topic pub --once -w 1 /arm/task_command std_msgs/msg/Int32 '{data: 1}'"
 echo "  ros2 topic pub --once -w 1 /arm/release_command std_msgs/msg/Empty '{}'"
+echo "  ros2 topic pub --once -w 1 /arm/manual_release_force std_msgs/msg/Empty '{}'  # 原地松爪（手动兜底）"
 echo ""
 echo "Logs: /tmp/shelf.log /tmp/grasp.log /tmp/yolo.log /tmp/aruco.log /tmp/place.log"
 wait

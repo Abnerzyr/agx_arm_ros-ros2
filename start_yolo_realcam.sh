@@ -88,6 +88,7 @@ echo "=== Starting place planner (in /arm) ==="
 OPENBLAS_NUM_THREADS=2 ros2 run agx_arm_vision place_planner \
   --ros-args -r __ns:=/arm \
   -p base_frame:=arm/base_link \
+  -p end_effector_link:=arm/tcp_link \
   -p camera_optical_frame:=arm/camera_color_optical_frame \
   -p process_period:=1.0 &>/tmp/place.log &
 PLACE_PID=$!

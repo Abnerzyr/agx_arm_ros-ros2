@@ -19,7 +19,7 @@ from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import (
     CameraInfo, Image, PointCloud2, PointField)
 from skimage.filters import gaussian
-from std_msgs.msg import Bool, ColorRGBA, Header
+from std_msgs.msg import Bool, ColorRGBA, Float32, Header
 from tf2_geometry_msgs import do_transform_pose_stamped
 from tf2_ros import Buffer, TransformException, TransformListener
 from ultralytics import YOLO
@@ -60,6 +60,9 @@ class YoloGraspNode(Node):
         self.declare_parameter('input_size', 224)
         self.declare_parameter('box_padding', 0.005)
         self.declare_parameter('min_range', 0.15)
+        self.declare_parameter('table_removal_tol', 0.01)
+        self.declare_parameter('min_depth_span', 0.02)
+        self.declare_parameter('min_grasp_height', 0.01)
         self.declare_parameter('box_exclude_window', 2.0)
         self.declare_parameter('prefer_aruco_nearby', True)
         self.declare_parameter('aruco_timeout', 8.0)
@@ -105,6 +108,12 @@ class YoloGraspNode(Node):
         self.min_range = self.get_parameter('min_range').value
         self.box_exclude_window = self.get_parameter(
             'box_exclude_window').value
+        self.table_removal_tol = float(
+            self.get_parameter('table_removal_tol').value)
+        self.min_depth_span = float(
+            self.get_parameter('min_depth_span').value)
+        self.min_grasp_height = float(
+            self.get_parameter('min_grasp_height').value)
         self.masked_depth_window = self.get_parameter(
             'masked_depth_window').value
         self.prefer_aruco_nearby = bool(
@@ -144,6 +153,10 @@ class YoloGraspNode(Node):
         self._locked_target = None
         self._lock_candidate = None
         self._lock_frames = 0
+        self._mask_plane = None
+        self._mask_plane_ref = None
+        self._mask_plane_time = 0.0
+        self._last_obj_hgt = None
 
         pkg_dir = os.path.dirname(os.path.abspath(__file__))
         yolo_path = os.path.join(pkg_dir, 'models', 'yolov8s-worldv2.pt')
@@ -184,6 +197,8 @@ class YoloGraspNode(Node):
             PointCloud2, 'yolo/points_filtered', 10)
         self.target_box_pub = self.create_publisher(
             Marker, 'yolo/target_box', 10)
+        self.table_z_pub = self.create_publisher(
+            Float32, 'yolo/table_height', 10)
 
         self.create_timer(0.5, self.process)
         self._rl = None
@@ -352,6 +367,11 @@ class YoloGraspNode(Node):
             valid = d[d > 0.05]
             if len(valid) < 50:
                 continue
+            # 扁平假目标过滤（aruco 纸/货架面等）：深度跨度过小则不是可抓实体。
+            dmin = float(np.percentile(valid, 10))
+            dmax = float(np.percentile(valid, 90))
+            if (dmax - dmin) < self.min_depth_span:
+                continue
             out.append((x1, y1, x2, y2))
         return out
 
@@ -422,6 +442,10 @@ class YoloGraspNode(Node):
                     best_box = (x1, y1, x2, y2)
 
         if best_box is None:
+            self.get_logger().info(
+                f'[GRASP] skip: no valid target box '
+                f'({len(valid_boxes)} valid, conf>={self.conf_threshold})',
+                throttle_duration_sec=5.0)
             now = self.get_clock().now().nanoseconds * 1e-9
             if (self._last_target_exclude is not None
                     and now - self._last_target_exclude_time
@@ -438,13 +462,12 @@ class YoloGraspNode(Node):
         bh = y2 - y1
         margin_px = max(
             1, int(0.03 * self.model_cam.fx() / max(best_depth, 0.1)))
-        exclude_box = (
+        box_exclude = (
             max(0, x1 - margin_px), max(0, y1 - margin_px),
             min(w - 1, x2 + margin_px), min(h - 1, y2 + margin_px))
-        self._last_target_exclude = exclude_box
+        self._last_target_exclude = box_exclude
         self._last_target_exclude_time = (
             self.get_clock().now().nanoseconds * 1e-9)
-        self._publish_cloud(depth, exclude_box=exclude_box)
         margin = int(max(bw, bh) * 0.2)
         crop_x1 = max(0, x1 - margin)
         crop_y1 = max(0, y1 - margin)
@@ -466,35 +489,108 @@ class YoloGraspNode(Node):
 
         d_valid = (crop_d > 0.05) & np.isfinite(crop_d)
         if d_valid.sum() < 100:
+            self.get_logger().info(
+                f'[GRASP] skip: crop valid depth < 100 '
+                f'({int(d_valid.sum())}px)', throttle_duration_sec=5.0)
+            self._publish_cloud(depth, exclude_box=box_exclude)
             return
-        sel_valid = np.zeros((crop_side, crop_side), bool)
-        by1, by2 = y1 - crop_y1, y2 - crop_y1
-        bx1, bx2 = x1 - crop_x1, x2 - crop_x1
-        sel_valid[by1:by2, bx1:bx2] = d_valid[by1:by2, bx1:bx2]
         fx = self.model_cam.fx()
         fy = self.model_cam.fy()
         fcx = self.model_cam.cx()
         fcy = self.model_cam.cy()
-        plane = self._table_plane_from_frame(depth)
+        plane = self._mask_table_plane(depth, cx, cy)
+
+        # 物体点集：YOLO 框只做种子，实际范围由点云决定。
+        # 1) 高于支撑面的有效深度 → 2) 连通域。组件选择"最高"而非"面积最大"，
+        #    避免种子落在桌面时把大块桌面当成物体（会导致抓取点飞走）。
+        uu_c, vv_c = np.meshgrid(
+            np.arange(crop_x1, crop_x2), np.arange(crop_y1, crop_y2))
+        z_c = depth[crop_y1:crop_y2, crop_x1:crop_x2]
+        ok_c = (z_c > 0.05) & (z_c < 2.0) & np.isfinite(z_c)
+        hgt = None
         if plane is not None:
-            n, d = plane
-            uu_c, vv_c = np.meshgrid(
-                np.arange(crop_x1, crop_x2), np.arange(crop_y1, crop_y2))
-            z_c = depth[crop_y1:crop_y2, crop_x1:crop_x2]
-            ok_c = (z_c > 0.05) & (z_c < 2.0) & np.isfinite(z_c)
+            n_p, d_p = plane
             xs_c = (uu_c - fcx) * z_c / fx
             ys_c = (vv_c - fcy) * z_c / fy
-            dist_c = np.abs(xs_c * n[0] + ys_c * n[1] + z_c * n[2] + d)
-            near = np.zeros((crop_side, crop_side), bool)
-            near[:ch, :cw_real] = ok_c & (dist_c < 0.02)
-            sel_valid &= ~near
+            hgt = xs_c * n_p[0] + ys_c * n_p[1] + z_c * n_p[2] + d_p
+            above = ok_c & (hgt > self.table_removal_tol)
+        else:
+            above = ok_c
+        comp_mask = above.astype(np.uint8)
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(
+            comp_mask, connectivity=8)
+        sel_real = np.zeros((ch, cw_real), bool)
+        chosen = -1
+        if num > 1:
+            seed_u = min(max(int(cx) - crop_x1, 0), cw_real - 1)
+            seed_v = min(max(int(cy) - crop_y1, 0), ch - 1)
+            seed_label = int(labels[seed_v, seed_u])
+            if hgt is not None:
+                max_hgt = np.zeros(num, dtype=float)
+                np.maximum.at(max_hgt, labels.ravel(), hgt.ravel())
+                tallest = 1 + int(np.argmax(max_hgt[1:]))
+                min_h = 2.0 * self.table_removal_tol
+                if seed_label >= 1 and max_hgt[seed_label] > min_h:
+                    chosen = seed_label
+                    if seed_label != tallest:
+                        self.get_logger().warn(
+                            f'[MASK] seed comp hgt={max_hgt[seed_label]:.3f}m '
+                            f'vs tallest={tallest} '
+                            f'hgt={max_hgt[tallest]:.3f}m; keep seed',
+                            throttle_duration_sec=5.0)
+                elif max_hgt[tallest] > min_h:
+                    chosen = tallest
+                    self.get_logger().warn(
+                        f'[MASK] seed on flat/bg (hgt='
+                        f'{max_hgt[seed_label]:.3f}m); picked tallest '
+                        f'{tallest} hgt={max_hgt[tallest]:.3f}m',
+                        throttle_duration_sec=5.0)
+                # 所有分量都太矮 → chosen=-1 → 无有效物体
+            else:
+                if seed_label >= 1:
+                    chosen = seed_label
+                else:
+                    chosen = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+            if chosen >= 1:
+                sel_real = (labels == chosen)
+        obj_set = sel_real.copy()
+        if hgt is not None and sel_real.any():
+            self._last_obj_hgt = float(hgt[sel_real].max())
+        else:
+            self._last_obj_hgt = None
+        sel_valid = np.zeros((crop_side, crop_side), bool)
+        sel_valid[:ch, :cw_real] = sel_real
         dist_px = cv2.distanceTransform(
             sel_valid.astype(np.uint8), cv2.DIST_L2, 3)
         thr_px = np.where(crop_d > 0.05, 0.01 * fx / crop_d, 0.0)
         sel_valid &= dist_px >= thr_px
+        if sel_real.sum() < 30:
+            self.get_logger().info(
+                f'[GRASP] skip: object mask too small '
+                f'({int(sel_real.sum())}px, plane='
+                f'{"yes" if self._mask_plane is not None else "no"})',
+                throttle_duration_sec=5.0)
+            self._publish_cloud(depth, exclude_box=box_exclude)
+            return
         mask = ~d_valid
         if mask.any():
             crop_d = cv2.inpaint(crop_d, mask.astype(np.uint8), 3, cv2.INPAINT_TELEA)
+
+        # 点云排除区 = 物体真实范围外扩（不再用 YOLO 框矩形）。
+        ov, ou = np.nonzero(obj_set)
+        exclude_box = box_exclude
+        if len(ou) > 0:
+            ex1 = int(min(ou)) + crop_x1 - margin_px
+            ey1 = int(min(ov)) + crop_y1 - margin_px
+            ex2 = int(max(ou)) + crop_x1 + margin_px
+            ey2 = int(max(ov)) + crop_y1 + margin_px
+            exclude_box = (
+                max(0, ex1), max(0, ey1),
+                min(w - 1, ex2), min(h - 1, ey2))
+            self._last_target_exclude = exclude_box
+            self._last_target_exclude_time = (
+                self.get_clock().now().nanoseconds * 1e-9)
+        self._publish_cloud(depth, exclude_box=exclude_box)
 
         d_resized = cv2.resize(crop_d, (self.input_size, self.input_size))
         r_resized = cv2.resize(crop_rgb, (self.input_size, self.input_size))
@@ -527,7 +623,7 @@ class YoloGraspNode(Node):
         grasp_level = 0
         if not np.isfinite(best_score) or best_score < self.grasp_quality:
             relaxed = np.zeros((crop_side, crop_side), bool)
-            relaxed[by1:by2, bx1:bx2] = d_valid[by1:by2, bx1:bx2]
+            relaxed[:ch, :cw_real] = obj_set
             relaxed_small = cv2.resize(
                 relaxed.astype(np.uint8),
                 (self.input_size, self.input_size),
@@ -564,20 +660,23 @@ class YoloGraspNode(Node):
             u_orig = crop_x1 + u * scale
             v_orig = crop_y1 + v * scale
 
-        box_d = depth[y1:y2, x1:x2]
-        box_valid = box_d[(box_d > 0.05) & np.isfinite(box_d)]
-        if len(box_valid) > 0:
-            d_min = float(np.min(box_valid))
-            d_max = float(np.max(box_valid))
-            d_p40 = float(np.percentile(box_valid, 40))
+        obj_d = depth[crop_y1:crop_y2, crop_x1:crop_x2][obj_set]
+        obj_d = obj_d[(obj_d > 0.05) & np.isfinite(obj_d)]
+        if len(obj_d) > 30:
+            d_min = float(np.percentile(obj_d, 5))
+            d_max = float(np.percentile(obj_d, 95))
         else:
-            d_min = d_max = d_p40 = float(best_depth)
-        box_z = (d_min + d_p40) / 2.0
-        if box_z <= 0.05 or box_z > 2.0:
-            box_z = float(best_depth)
-        if box_z <= 0.05 or box_z > 2.0:
+            d_min = d_max = float(best_depth)
+        box_z = (d_min + d_max) / 2.0
+        box_z = min(max(box_z, 0.05), self.max_grasp_depth)
+        if box_z <= 0.05:
+            self.get_logger().info(
+                f'[GRASP] skip: bad grasp depth '
+                f'(d_min={d_min:.3f} d_max={d_max:.3f})',
+                throttle_duration_sec=5.0)
             return
-        box_fit = self._object_box_from_points(depth, x1, y1, x2, y2, plane)
+        box_fit = self._object_box_from_points(
+            depth, obj_set, crop_x1, crop_y1, plane)
         if box_fit is None:
             box_zc = (d_min + d_max) / 2.0
             box_cx = (cx - fcx) * box_zc / fx
@@ -588,8 +687,8 @@ class YoloGraspNode(Node):
             box_sz = min(max(d_max - d_min, 0.02), 0.2) + self.box_padding
             box_quat = self._table_box_quat(plane)
             self.get_logger().info(
-                f'Box (fallback): d_min={d_min:.3f} d_p40={d_p40:.3f} '
-                f'd_max={d_max:.3f} box_z={box_z:.3f} '
+                f'Box (fallback): d_min={d_min:.3f} d_max={d_max:.3f} '
+                f'box_z={box_z:.3f} '
                 f'box=({box_sx:.3f}x{box_sy:.3f}x{box_sz:.3f})')
         else:
             (box_cx, box_cy, box_cz), (box_sx, box_sy, box_sz), box_quat = box_fit
@@ -597,12 +696,66 @@ class YoloGraspNode(Node):
                 f'Box (world): center=({box_cx:.3f},{box_cy:.3f},'
                 f'{box_cz:.3f}) size=({box_sx:.3f}x{box_sy:.3f}x{box_sz:.3f})')
 
+        # 抓取位置 = 物体点集 3D 中位质心（不再用 GR-ConvNet argmax 像素）。
+        # 斜视下网络像素不可靠（曾横向偏 ~6cm）；质心落在物体中心附近，
+        # 角度仍取网络预测。
+        ov2, ou2 = np.nonzero(obj_set)
+        zc_pts = depth[crop_y1:crop_y2, crop_x1:crop_x2][obj_set]
+        okc = (zc_pts > 0.05) & (zc_pts < 2.0) & np.isfinite(zc_pts)
+        if okc.sum() < 20:
+            self.get_logger().info(
+                f'[GRASP] skip: centroid needs <20 valid pts '
+                f'({int(okc.sum())}px)', throttle_duration_sec=5.0)
+            return
+        zc_ok = zc_pts[okc]
+        ui_ok = ou2[okc] + crop_x1
+        vi_ok = ov2[okc] + crop_y1
+        xc = float(np.median((ui_ok - fcx) * zc_ok / fx))
+        yc = float(np.median((vi_ok - fcy) * zc_ok / fy))
+        zmed = float(np.median(zc_ok))
+        # 抓取点高度修正：可见面中位质心偏向顶面（前上方视角），沿桌面法线
+        # 把抓取点降到物体真实竖直中心 = 桌面 + max_hgt/2。水平位置不变。
+        if plane is not None and self._last_obj_hgt is not None \
+                and self._last_obj_hgt > 0.0:
+            hc = (n_p[0] * xc + n_p[1] * yc + n_p[2] * zmed + d_p)
+            lift = 0.5 * self._last_obj_hgt - hc
+            xc += n_p[0] * lift
+            yc += n_p[1] * lift
+            zmed += n_p[2] * lift
+        u_orig = fcx + xc * fx / zmed
+        v_orig = fcy + yc * fy / zmed
         u_orig = min(max(u_orig, 0.0), float(w - 1))
         v_orig = min(max(v_orig, 0.0), float(h - 1))
-        ui = int(round(u_orig))
-        vi = int(round(v_orig))
-        z_g = self._grasp_z_at(
-            ui, vi, depth, sel_valid, crop_x1, crop_y1, crop_side, box_z)
+
+        # 抓取点合理性门控：质心须高于桌面、且位于 YOLO 框（含 margin）内，
+        # 否则丢弃该帧（保留上一帧锁定点），杜绝"桌面/桌面以下"抓取点。
+        ok_grasp = True
+        if plane is not None:
+            centroid_hgt = (n_p[0] * xc + n_p[1] * yc
+                            + n_p[2] * zmed + d_p)
+            if self._last_obj_hgt is not None:
+                self.get_logger().info(
+                    f'[MASK] obj_max_hgt={self._last_obj_hgt:.3f}m '
+                    f'centroid_hgt={centroid_hgt:.3f}m',
+                    throttle_duration_sec=5.0)
+            if centroid_hgt < self.min_grasp_height:
+                ok_grasp = False
+                self.get_logger().warn(
+                    f'[MASK] grasp rejected: centroid_hgt='
+                    f'{centroid_hgt:.3f}m < min_grasp_height '
+                    f'({self.min_grasp_height:.3f}m)',
+                    throttle_duration_sec=5.0)
+        if ok_grasp and not (
+                x1 - margin_px <= u_orig <= x2 + margin_px
+                and y1 - margin_px <= v_orig <= y2 + margin_px):
+            ok_grasp = False
+            self.get_logger().warn(
+                f'[MASK] grasp rejected: centroid pixel '
+                f'({u_orig:.0f},{v_orig:.0f}) outside box',
+                throttle_duration_sec=5.0)
+        if not ok_grasp:
+            return
+        z_g = zmed
         if self._rl is not None:
             patch = build_patch(depth, rgb, u_orig, v_orig,
                                 self.rl_patch_size, z_g)
@@ -617,10 +770,7 @@ class YoloGraspNode(Node):
                 action, u_orig, v_orig, angle, w, h)
             u_orig = min(max(u_orig, 0.0), float(w - 1))
             v_orig = min(max(v_orig, 0.0), float(h - 1))
-            z_rl = self._grasp_z_at(
-                int(round(u_orig)), int(round(v_orig)),
-                depth, sel_valid, crop_x1, crop_y1, crop_side, box_z)
-            z_g = min(max(z_rl + dz, 0.05), 2.0)
+            z_g = min(max(zmed + dz, 0.05), 2.0)
         x_g = (u_orig - fcx) * z_g / fx
         y_g = (v_orig - fcy) * z_g / fy
 
@@ -636,46 +786,6 @@ class YoloGraspNode(Node):
             box_center=(box_cx, box_cy, box_cz),
             box_scale=(box_sx, box_sy, box_sz),
             box_orientation=box_quat)
-
-    def _grasp_z_at(self, ui, vi, depth, sel_valid, crop_x1, crop_y1,
-                    crop_side, box_z):
-        """Depth at a grasp pixel, constrained to the object-interior mask.
-
-        Same semantics as the original 15x15 window logic; the mask keeps
-        background depth out when the pixel sits near the object edge.
-        """
-        h, w = depth.shape
-        r0 = max(0, vi - 7)
-        r1 = min(h, vi + 8)
-        c0 = max(0, ui - 7)
-        c1 = min(w, ui + 8)
-        win = depth[r0:r1, c0:c1]
-        valid_mask = (win > 0.05) & np.isfinite(win)
-        if self.masked_depth_window:
-            mask = np.zeros((r1 - r0, c1 - c0), dtype=bool)
-            cr0 = max(r0 - crop_y1, 0)
-            cr1 = min(r1 - crop_y1, crop_side)
-            cc0 = max(c0 - crop_x1, 0)
-            cc1 = min(c1 - crop_x1, crop_side)
-            if cr1 > cr0 and cc1 > cc0:
-                mask[cr0 - (r0 - crop_y1): cr1 - (r0 - crop_y1),
-                     cc0 - (c0 - crop_x1): cc1 - (c0 - crop_x1)] = \
-                    sel_valid[cr0:cr1, cc0:cc1]
-            if mask.any() and (valid_mask & mask).sum() < 10 \
-                    and valid_mask.sum() >= 10:
-                self.get_logger().warn(
-                    'Masked depth window empty (obj mask excludes grasp '
-                    'pixel); falling back to unmasked depth',
-                    throttle_duration_sec=10.0)
-            else:
-                valid_mask = valid_mask & mask
-        win_valid = win[valid_mask]
-        if len(win_valid) >= 10:
-            zg = float(np.percentile(win_valid, 40))
-            if zg > self.max_grasp_depth:
-                return box_z
-            return zg
-        return box_z
 
     def _publish(self, x, y, z, angle, width, score,
                  box_center=None, box_scale=None, box_orientation=None):
@@ -735,6 +845,20 @@ class YoloGraspNode(Node):
             marker.scale.z = float(box_scale[2])
             marker.color = ColorRGBA(r=1.0, g=0.8, b=0.0, a=0.5)
             self.target_box_pub.publish(marker)
+
+        # 发布抓取点处的桌面高度（base 系），供 executor 用桌面高度算放置偏移。
+        if self._mask_plane is not None:
+            axes = self._table_box_axes(self._mask_plane)
+            if (axes is not None and axes['d_base'] is not None
+                    and abs(axes['n_base'][2]) > 1e-6):
+                n_b = axes['n_base']
+                d_b = axes['d_base']
+                bx = base_pose.pose.position.x
+                by = base_pose.pose.position.y
+                table_z = -(n_b[0] * bx + n_b[1] * by + d_b) / n_b[2]
+                tz = Float32()
+                tz.data = float(table_z)
+                self.table_z_pub.publish(tz)
 
         self.grasp_pub.publish(base_pose)
         self.get_logger().info(
@@ -909,7 +1033,8 @@ class YoloGraspNode(Node):
         return (float(quat[0]), float(quat[1]),
                 float(quat[2]), float(quat[3]))
 
-    def _object_box_from_points(self, depth, x1, y1, x2, y2, plane=None):
+    def _object_box_from_points(self, depth, sel_valid, crop_x1, crop_y1,
+                                plane=None):
         if plane is None:
             plane = self._table_plane_from_frame(depth)
         axes = self._table_box_axes(plane)
@@ -919,16 +1044,23 @@ class YoloGraspNode(Node):
         fy = self.model_cam.fy()
         fcx = self.model_cam.cx()
         fcy = self.model_cam.cy()
-        ds = 2
-        uu, vv = np.meshgrid(
-            np.arange(x1, x2, ds), np.arange(y1, y2, ds))
-        z = depth[vv, uu]
-        valid = (z > 0.05) & (z < 2.0) & np.isfinite(z)
-        if valid.sum() < 50:
+        h_img, w_img = depth.shape
+        vv_c, uu_c = np.nonzero(sel_valid)
+        if len(uu_c) < 20:
             return None
-        xs = (uu - fcx) * z / fx
-        ys = (vv - fcy) * z / fy
-        pts_cam = np.stack([xs[valid], ys[valid], z[valid]], axis=1)
+        ui = uu_c + crop_x1
+        vi = vv_c + crop_y1
+        inb = (ui >= 0) & (ui < w_img) & (vi >= 0) & (vi < h_img)
+        ui, vi = ui[inb], vi[inb]
+        z = depth[vi, ui]
+        valid = (z > 0.05) & (z < 2.0) & np.isfinite(z)
+        if valid.sum() < 20:
+            return None
+        z = z[valid]
+        ui, vi = ui[valid], vi[valid]
+        xs = (ui - fcx) * z / fx
+        ys = (vi - fcy) * z / fy
+        pts_cam = np.stack([xs, ys, z], axis=1)
         pts_all = (axes['rot_cb'] @ pts_cam.T).T + axes['trans']
         pts = pts_all
         d_base = axes['d_base']
@@ -983,6 +1115,27 @@ class YoloGraspNode(Node):
         return (tuple(float(c) for c in box_center),
                 box_dims,
                 tuple(float(qq) for qq in quat))
+
+    def _mask_table_plane(self, depth, cx, cy):
+        """Locked table plane for the object mask.
+
+        Re-fits only when missing, the object moved a lot in the image, or the
+        lock is old. Avoids frame-to-frame RANSAC wobble, which could make
+        desktop points leak into the mask and drag the grasp centroid away.
+        """
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if self._mask_plane is not None and self._mask_plane_ref is not None:
+            dx = cx - self._mask_plane_ref[0]
+            dy = cy - self._mask_plane_ref[1]
+            if (abs(dx) < 100 and abs(dy) < 100
+                    and (now - self._mask_plane_time) < 30.0):
+                return self._mask_plane
+        plane = self._table_plane_from_frame(depth)
+        if plane is not None:
+            self._mask_plane = plane
+            self._mask_plane_ref = (float(cx), float(cy))
+            self._mask_plane_time = now
+        return plane
 
     def _table_plane_from_frame(self, depth):
         h, w = depth.shape

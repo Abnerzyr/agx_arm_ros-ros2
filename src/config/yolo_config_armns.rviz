@@ -339,7 +339,7 @@ Visualization Manager:
       Value: true
     - Class: moveit_rviz_plugin/PlanningScene
       Enabled: true
-      Move Group Namespace: ""
+      Move Group Namespace: move_group
       Name: PlanningScene
       Planning Scene Topic: monitored_planning_scene
       Robot Description: robot_description
