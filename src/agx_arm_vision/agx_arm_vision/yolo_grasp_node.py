@@ -27,6 +27,11 @@ from visualization_msgs.msg import Marker
 
 from agx_arm_vision.grasp_rl import GraspRLRefiner, build_patch
 
+try:
+    from aruco_opencv_msgs.msg import ArucoDetection as _ArucoMsg
+except ImportError:
+    _ArucoMsg = None
+
 
 class YoloGraspNode(Node):
     CAMERA_OPTICAL_FRAME = 'camera_color_optical_frame'
@@ -51,10 +56,17 @@ class YoloGraspNode(Node):
             'info_topic', '/camera/camera/color/camera_info')
         self.declare_parameter('confidence_threshold', 0.15)
         self.declare_parameter('grasp_quality_threshold', 0.3)
+        self.declare_parameter('max_grasp_depth', 2.0)
         self.declare_parameter('input_size', 224)
         self.declare_parameter('box_padding', 0.005)
         self.declare_parameter('min_range', 0.15)
         self.declare_parameter('box_exclude_window', 2.0)
+        self.declare_parameter('prefer_aruco_nearby', True)
+        self.declare_parameter('aruco_timeout', 8.0)
+        self.declare_parameter('aruco_exclude_px', 8)
+        self.declare_parameter('lock_target_enable', True)
+        self.declare_parameter('lock_target_frames', 2)
+        self.declare_parameter('lock_target_tol', 0.03)
         self.declare_parameter('masked_depth_window', True)
         self.declare_parameter('rl_enable', False)
         self.declare_parameter('rl_patch_size', 32)
@@ -86,6 +98,8 @@ class YoloGraspNode(Node):
             'camera_optical_frame').value
         self.conf_threshold = self.get_parameter('confidence_threshold').value
         self.grasp_quality = self.get_parameter('grasp_quality_threshold').value
+        self.max_grasp_depth = float(
+            self.get_parameter('max_grasp_depth').value)
         self.input_size = self.get_parameter('input_size').value
         self.box_padding = self.get_parameter('box_padding').value
         self.min_range = self.get_parameter('min_range').value
@@ -93,6 +107,17 @@ class YoloGraspNode(Node):
             'box_exclude_window').value
         self.masked_depth_window = self.get_parameter(
             'masked_depth_window').value
+        self.prefer_aruco_nearby = bool(
+            self.get_parameter('prefer_aruco_nearby').value)
+        self.aruco_timeout = float(self.get_parameter('aruco_timeout').value)
+        self.aruco_exclude_px = float(
+            self.get_parameter('aruco_exclude_px').value)
+        self.lock_target_enable = bool(
+            self.get_parameter('lock_target_enable').value)
+        self.lock_target_frames = int(
+            self.get_parameter('lock_target_frames').value)
+        self.lock_target_tol = float(
+            self.get_parameter('lock_target_tol').value)
         self.rl_enable = self.get_parameter('rl_enable').value
         self.rl_patch_size = int(
             self.get_parameter('rl_patch_size').value)
@@ -114,6 +139,11 @@ class YoloGraspNode(Node):
         self._last_grasp_level = None
         self._last_target_exclude = None
         self._last_target_exclude_time = 0.0
+        self._aruco_pose = None
+        self._aruco_time = 0.0
+        self._locked_target = None
+        self._lock_candidate = None
+        self._lock_frames = 0
 
         pkg_dir = os.path.dirname(os.path.abspath(__file__))
         yolo_path = os.path.join(pkg_dir, 'models', 'yolov8s-worldv2.pt')
@@ -136,6 +166,9 @@ class YoloGraspNode(Node):
             self.info_callback, 10)
         self.create_subscription(
             Bool, 'map_update_enable', self.map_update_cb, 10)
+        if _ArucoMsg is not None:
+            self.create_subscription(
+                _ArucoMsg, '/aruco_detections', self.aruco_cb, 10)
 
         self.grasp_pub = self.create_publisher(
             PoseStamped, 'grasp_pose', 10)
@@ -225,6 +258,103 @@ class YoloGraspNode(Node):
             return img.astype(np.float32) * 0.001
         return img.astype(np.float32)
 
+    def aruco_cb(self, msg):
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if not msg.markers:
+            self._aruco_pose = None
+            self._aruco_time = now
+            return
+        self._aruco_pose = np.array([
+            msg.markers[0].pose.position.x,
+            msg.markers[0].pose.position.y,
+            msg.markers[0].pose.position.z], np.float64)
+        self._aruco_time = now
+        self.get_logger().info(
+            f'Aruco det: {len(msg.markers)} marker(s)',
+            throttle_duration_sec=5.0)
+
+    def _aruco_pixel(self):
+        if self._aruco_pose is None:
+            return None
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if now - self._aruco_time > self.aruco_timeout:
+            return None
+        x, y, z = self._aruco_pose
+        if z <= 0.05:
+            return None
+        u = self.model_cam.fx() * x / z + self.model_cam.cx()
+        v = self.model_cam.fy() * y / z + self.model_cam.cy()
+        return (u, v)
+
+    def _is_aruco_box(self, box, aruco_px):
+        """框是否属于 aruco：包含 aruco 像素，或中心距 aruco 像素在排除半径内。"""
+        x1, y1, x2, y2 = box
+        ua, va = aruco_px
+        if x1 <= ua <= x2 and y1 <= va <= y2:
+            return True
+        uc = (x1 + x2) / 2.0
+        vc = (y1 + y2) / 2.0
+        return math.hypot(uc - ua, vc - va) <= self.aruco_exclude_px
+
+    def _apply_target_lock(self, x, y, z, angle,
+                           box_cx, box_cy, box_cz,
+                           box_sx, box_sy, box_sz, box_quat):
+        """目标冻结：抓取点连续 lock_target_frames 帧稳定后，锁定并持续发布
+        同一目标（位置+朝向+框），直到目标移动超过 lock_target_tol 才重锁。
+        返回冻结后的完整发布参数。"""
+        if not self.lock_target_enable:
+            return (x, y, z, angle,
+                    box_cx, box_cy, box_cz,
+                    box_sx, box_sy, box_sz, box_quat)
+        cur = (x, y, z)
+        if self._locked_target is not None:
+            lt = self._locked_target
+            if (abs(x - lt[0]) < self.lock_target_tol
+                    and abs(y - lt[1]) < self.lock_target_tol
+                    and abs(z - lt[2]) < self.lock_target_tol):
+                return lt
+            self._locked_target = None
+            self._lock_candidate = cur
+            self._lock_frames = 1
+            self.get_logger().info('Target lock released (target changed)')
+        elif (self._lock_candidate is not None
+                and abs(x - self._lock_candidate[0]) < self.lock_target_tol
+                and abs(y - self._lock_candidate[1]) < self.lock_target_tol
+                and abs(z - self._lock_candidate[2]) < self.lock_target_tol):
+            self._lock_frames += 1
+            if self._lock_frames >= self.lock_target_frames:
+                self._locked_target = (
+                    x, y, z, angle,
+                    box_cx, box_cy, box_cz,
+                    box_sx, box_sy, box_sz, box_quat)
+                self._lock_candidate = None
+                self.get_logger().info(
+                    f'Target locked at ({x:.3f},{y:.3f},{z:.3f})')
+        else:
+            self._lock_candidate = cur
+            self._lock_frames = 1
+        return (x, y, z, angle,
+                box_cx, box_cy, box_cz,
+                box_sx, box_sy, box_sz, box_quat)
+
+    def _valid_boxes(self, boxes, depth, w, h):
+        out = []
+        for box in boxes:
+            conf = float(box.conf[0])
+            if conf < self.conf_threshold:
+                continue
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            x1, x2 = max(0, x1), min(w - 1, x2)
+            y1, y2 = max(0, y1), min(h - 1, y2)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            d = depth[y1:y2, x1:x2]
+            valid = d[d > 0.05]
+            if len(valid) < 50:
+                continue
+            out.append((x1, y1, x2, y2))
+        return out
+
     def process(self):
         if (self.depth_img is None or self.rgb_img is None
                 or self.camera_info is None):
@@ -244,25 +374,52 @@ class YoloGraspNode(Node):
         det_img = cv2.cvtColor(det_img, cv2.COLOR_RGB2BGR)
         self._publish_image(self.det_img_pub, det_img)
 
+        valid_boxes = self._valid_boxes(boxes, depth, w, h)
+
+        aruco_px = None
+        if self.prefer_aruco_nearby:
+            aruco_px = self._aruco_pixel()
+
         best_box = None
         best_depth = float('inf')
-        for box in boxes:
-            conf = float(box.conf[0])
-            if conf < self.conf_threshold:
-                continue
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            x1, x2 = max(0, x1), min(w - 1, x2)
-            y1, y2 = max(0, y1), min(h - 1, y2)
-            if x2 <= x1 or y2 <= y1:
-                continue
-            d = depth[y1:y2, x1:x2]
-            valid = d[d > 0.05]
-            if len(valid) < 50:
-                continue
-            med = np.median(valid)
-            if med < best_depth:
-                best_depth = med
-                best_box = (x1, y1, x2, y2)
+        if aruco_px is not None:
+            candidates = [
+                b for b in valid_boxes if not self._is_aruco_box(b, aruco_px)]
+            ua, va = aruco_px
+            best_dist = None
+            for (x1, y1, x2, y2) in candidates:
+                uc = (x1 + x2) / 2.0
+                vc = (y1 + y2) / 2.0
+                dist = math.hypot(uc - ua, vc - va)
+                if best_dist is None or dist < best_dist:
+                    best_dist = dist
+                    best_box = (x1, y1, x2, y2)
+                    d = depth[y1:y2, x1:x2]
+                    best_depth = np.median(d[d > 0.05])
+            if best_box is not None:
+                self.get_logger().info(
+                    f'Aruco-aware target: px=({ua:.0f},{va:.0f}) '
+                    f'box=({best_box[0]},{best_box[1]},{best_box[2]},'
+                    f'{best_box[3]})', throttle_duration_sec=5.0)
+
+        if best_box is None:
+            if aruco_px is not None:
+                candidates = [
+                    b for b in valid_boxes
+                    if not self._is_aruco_box(b, aruco_px)]
+                if not candidates:
+                    self.get_logger().info(
+                        'Aruco present but no non-aruco box; '
+                        'no grasp target this frame',
+                        throttle_duration_sec=5.0)
+            else:
+                candidates = valid_boxes
+            for (x1, y1, x2, y2) in candidates:
+                d = depth[y1:y2, x1:x2]
+                med = np.median(d[d > 0.05])
+                if med < best_depth:
+                    best_depth = med
+                    best_box = (x1, y1, x2, y2)
 
         if best_box is None:
             now = self.get_clock().now().nanoseconds * 1e-9
@@ -467,6 +624,13 @@ class YoloGraspNode(Node):
         x_g = (u_orig - fcx) * z_g / fx
         y_g = (v_orig - fcy) * z_g / fy
 
+        (x_g, y_g, z_g, angle,
+         box_cx, box_cy, box_cz,
+         box_sx, box_sy, box_sz, box_quat) = self._apply_target_lock(
+            x_g, y_g, z_g, angle,
+            box_cx, box_cy, box_cz,
+            box_sx, box_sy, box_sz, box_quat)
+
         self._publish(
             x_g, y_g, z_g, angle, grasp_width, best_score,
             box_center=(box_cx, box_cy, box_cz),
@@ -507,7 +671,10 @@ class YoloGraspNode(Node):
                 valid_mask = valid_mask & mask
         win_valid = win[valid_mask]
         if len(win_valid) >= 10:
-            return float(np.percentile(win_valid, 40))
+            zg = float(np.percentile(win_valid, 40))
+            if zg > self.max_grasp_depth:
+                return box_z
+            return zg
         return box_z
 
     def _publish(self, x, y, z, angle, width, score,

@@ -62,6 +62,11 @@ class ShelfWorkflowNode(Node):
 
     ALIGN_DIST_EPS = 0.02#for test remember to change it back to 0.02!!!!在rviz测试时临时使用！！！
 
+    # 精对准目标：aruco 距相机 align_dist 米、其中心投影到画面中心即成功。
+    ALIGN_DIST = 0.4          # aruco 距相机目标距离 (m)
+    ALIGN_DIST_TOL = 0.05     # 3D 距离容差 (m)
+    ALIGN_CENTER_TOL = 0.05   # 归一化画面中心容差 (x/z, y/z)
+
     # TCP-referenced viewing pose offsets: the TCP lands TCP_BACK_OFFSET
     # toward the arm and TCP_HEIGHT_OFFSET above the marker.
     TCP_BACK_OFFSET = 0.1
@@ -84,7 +89,13 @@ class ShelfWorkflowNode(Node):
         self.declare_parameter('grasp_give_up_timeout', 90.0)
         self.declare_parameter('place_give_up_timeout', 90.0)
         self.declare_parameter('detect_timeout', 5.0)
+        self.declare_parameter('align_settle_time', 3.0)
+        self.declare_parameter('box_stable_tol', 0.05)
         self.declare_parameter('align_max_iter', 2)
+        self.declare_parameter('skip_nominal', True)
+        self.declare_parameter('align_dist', 0.4)
+        self.declare_parameter('align_dist_tol', 0.05)
+        self.declare_parameter('align_center_tol', 0.05)
         self.declare_parameter('settle_after_home', 1.0)
         self.declare_parameter('marker_fresh_timeout', 1.0)
         self.declare_parameter(
@@ -115,7 +126,17 @@ class ShelfWorkflowNode(Node):
         self.place_give_up_timeout = self.get_parameter(
             'place_give_up_timeout').value
         self.detect_timeout = self.get_parameter('detect_timeout').value
+        self.align_settle_time = float(
+            self.get_parameter('align_settle_time').value)
+        self.box_stable_tol = float(
+            self.get_parameter('box_stable_tol').value)
         self.align_max_iter = self.get_parameter('align_max_iter').value
+        self.skip_nominal = bool(self.get_parameter('skip_nominal').value)
+        self.align_dist = float(self.get_parameter('align_dist').value)
+        self.align_dist_tol = float(
+            self.get_parameter('align_dist_tol').value)
+        self.align_center_tol = float(
+            self.get_parameter('align_center_tol').value)
         self.settle_after_home = self.get_parameter(
             'settle_after_home').value
         self.marker_fresh_timeout = self.get_parameter(
@@ -164,6 +185,9 @@ class ShelfWorkflowNode(Node):
         self._latest_aruco = None
         self._last_box_time = 0.0
         self._last_grasp_pose_time = 0.0
+        self._stable_ticks = 0
+        self._last_box_key = None
+        self._settle_logged = False
         self._executor_state = None
         self._executor_state_time = 0.0
         self._release_pending = False
@@ -221,6 +245,15 @@ class ShelfWorkflowNode(Node):
                 '[TEST] skip_align: entering WAIT_DETECT directly '
                 '(skip nominal/align)')
             self._set_state(self.WAIT_DETECT)
+        elif self.skip_nominal:
+            self._align_start = now
+            self._align_iter = 0
+            self._align_sent = False
+            self._align_no_marker_logged = False
+            self.get_logger().info(
+                '[TEST] skip_nominal: assuming coarse alignment done; '
+                'entering ALIGN (aruco search)')
+            self._set_state(self.ALIGN)
         else:
             self._set_state(self.NOMINAL_POSE)
 
@@ -238,8 +271,28 @@ class ShelfWorkflowNode(Node):
             self.get_clock().now().nanoseconds * 1e-9, msg)
 
     def target_box_cb(self, msg):
-        del msg
         self._last_box_time = self.get_clock().now().nanoseconds * 1e-9
+        p = msg.pose.position
+        s = msg.scale
+        cur = (float(p.x), float(p.y), float(p.z),
+               float(s.x), float(s.y), float(s.z))
+        prev = self._last_box_key
+        if prev is not None:
+            same = True
+            for a, b in zip(cur[:3], prev[:3]):
+                if abs(a - b) > self.box_stable_tol:
+                    same = False
+                    break
+            if same:
+                for a, b in zip(cur[3:], prev[3:]):
+                    if abs(a - b) > self.box_stable_tol:
+                        same = False
+                        break
+            if same:
+                self._stable_ticks += 1
+                return
+        self._last_box_key = cur
+        self._stable_ticks = 1
 
     def grasp_pose_cb(self, msg):
         del msg
@@ -284,6 +337,9 @@ class ShelfWorkflowNode(Node):
         self._align_sent = False
         self._align_no_marker_logged = False
         self._detect_warn_logged = False
+        self._stable_ticks = 0
+        self._last_box_key = None
+        self._settle_logged = False
         self._grasp_fail_start = None
         self._state_log_time = 0.0
         self._busy_executor_logged = False
@@ -441,12 +497,13 @@ class ShelfWorkflowNode(Node):
         return None
 
     def _align_tcp_pose(self, marker, detection_frame):
-        # Aruco detections are always expressed in the camera optical frame;
-        # use the configurable camera_frame so the lookup works under a
-        # namespace (detection header frame is unprefixed, TF frames are not).
+        # 精对准位姿：相机放在 aruco 前方 align_dist(0.4m) 处，相机 z 轴（光轴）
+        # 指向 aruco 坐标位置（使 aruco 中心投影到画面中心）。
+        # 只用 aruco 的【位置】，不用其朝向；不要求光轴与码平面平行或垂直。
         del detection_frame
         t_base_cam = self._lookup_matrix(self.base_frame, self.camera_frame)
-        if t_base_cam is None:
+        t_base_tcp = self._lookup_matrix(self.base_frame, self.end_effector)
+        if t_base_cam is None or t_base_tcp is None:
             return None
         p_cam = np.array([
             marker.pose.position.x,
@@ -454,8 +511,45 @@ class ShelfWorkflowNode(Node):
             marker.pose.position.z,
             1.0,
         ])
-        p_base = t_base_cam @ p_cam
-        return self._view_pose_from_marker(p_base[:3])
+        a_base = (t_base_cam @ p_cam)[:3]
+        cam0 = t_base_cam[:3, 3]
+        d = a_base - cam0
+        nd = float(np.linalg.norm(d))
+        if nd < 1e-6:
+            return None
+        dirv = d / nd
+        cam_pos = a_base - self.align_dist * dirv
+        R_base_cam = self._rot_from_view(dirv)
+        t_tcp_cam = np.linalg.inv(t_base_tcp) @ t_base_cam
+        R_cam_tcp = t_tcp_cam[:3, :3].T
+        R_tcp = R_base_cam @ R_cam_tcp
+        tcp_pos = cam_pos - R_tcp @ t_tcp_cam[:3, 3]
+        quat = R.from_matrix(R_tcp).as_quat()
+        pose = Pose()
+        pose.position.x = float(tcp_pos[0])
+        pose.position.y = float(tcp_pos[1])
+        pose.position.z = float(tcp_pos[2])
+        pose.orientation.x = float(quat[0])
+        pose.orientation.y = float(quat[1])
+        pose.orientation.z = float(quat[2])
+        pose.orientation.w = float(quat[3])
+        return pose
+
+    def _align_verified(self, marker, detection_frame):
+        """精对准成功判定：aruco 距相机约 align_dist 米，且其中心投影到画面中心。"""
+        del detection_frame
+        x = float(marker.pose.position.x)
+        y = float(marker.pose.position.y)
+        z = float(marker.pose.position.z)
+        if z <= 0.05:
+            return False
+        dist = float(np.sqrt(x * x + y * y + z * z))
+        if abs(dist - self.align_dist) > self.align_dist_tol:
+            return False
+        if (abs(x / z) > self.align_center_tol
+                or abs(y / z) > self.align_center_tol):
+            return False
+        return True
 
     def _tcp_position_error(self, pose):
         t_base_tcp = self._lookup_matrix(self.base_frame, self.end_effector)
@@ -614,17 +708,22 @@ class ShelfWorkflowNode(Node):
             self._align_no_marker_logged = False
             self._align_start = now
             marker, frame_id = found
-            pose = self._align_tcp_pose(marker, frame_id)
-            if pose is None:
-                return
-            error = self._tcp_position_error(pose)
-            if error is not None and error < self.ALIGN_DIST_EPS:
+            if self._align_verified(marker, frame_id):
+                x = float(marker.pose.position.x)
+                y = float(marker.pose.position.y)
+                z = float(marker.pose.position.z)
+                dist = float(np.sqrt(x * x + y * y + z * z))
                 self.get_logger().info(
-                    f'Aligned to marker (tcp error={error:.3f} m)')
+                    f'Aligned to marker (dist={dist:.3f} m, '
+                    f'center=({x / z:.3f},{y / z:.3f}))')
                 self._set_state(self.WAIT_DETECT)
                 self._detect_start = now
                 self._detect_warn_logged = False
                 return
+            pose = self._align_tcp_pose(marker, frame_id)
+            if pose is None:
+                return
+            error = self._tcp_position_error(pose)
             if not self._align_sent:
                 self.get_logger().info(
                     f'Refining alignment (iter={self._align_iter + 1}, '
@@ -657,11 +756,19 @@ class ShelfWorkflowNode(Node):
             return
 
         if self.state == self.WAIT_DETECT:
-            fresh_box = now - self._last_box_time <= 1.0
-            fresh_pose = now - self._last_grasp_pose_time <= 1.0
-            if fresh_box and fresh_pose:
+            if now - self._detect_start < self.align_settle_time:
+                if not self._settle_logged:
+                    self._settle_logged = True
+                    self.get_logger().info(
+                        f'Waiting {self.align_settle_time:.1f}s for camera '
+                        'to settle after alignment...')
+                return
+            fresh_box = now - self._last_box_time <= 6.0
+            fresh_pose = now - self._last_grasp_pose_time <= 6.0
+            if fresh_box and fresh_pose and self._stable_ticks >= 2:
                 self.get_logger().info(
-                    'Target detected by yolo; triggering grasp')
+                    f'Target detected (stable x{self._stable_ticks}); '
+                    'triggering grasp')
                 self._set_state(self.TRIGGER_GRASP)
             elif (now - self._detect_start > self.detect_timeout
                     and not self._detect_warn_logged):
