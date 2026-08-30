@@ -1,79 +1,78 @@
 #!/usr/bin/env python3
 
-"""Grasp-only training loop driver.
+"""完整 grasp+place 训练循环驱动（人工上报每轮结果）。
 
-Drives grasp_executor directly for grasp-only RL training: waits until a
-fresh yolo detection (target box + grasp pose) is available while the
-executor is IDLE, then publishes `manual_grasp_start`. Waits for the
-`grasp_result` (reward attribution is handled inside yolo_grasp's RL
-refiner) and for the executor to return to IDLE (grasp_only mode releases
-the object back onto the shelf), then starts the next attempt.
+每轮：触发抓取 → executor 自动完成 grasp+place（test_flow）→ 回 IDLE →
+等待人工上报 manual_round_result（1空夹/2未夹稳/3未放平/4放平）→
+收到后自动触发下一轮。等待上报期间发布 /arm/manual_awaiting=True。
 
-This node intentionally does NOT use shelf_workflow / aruco alignment /
-place_planner: the training loop is grasp-only and relies on the object
-being within the camera field of view at the home pose.
+若 executor 全程未离开 IDLE（校验/规划失败、机械臂没动）→ 自动跳过，
+不进入"等上报"，等 post_round_wait 后直接下一轮。开机等 startup_settle，
+每轮（含跳过）结束等 post_round_wait 再进入下一轮。
 """
 
 import rclpy
 from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
-from std_msgs.msg import Empty, Int32
+from std_msgs.msg import Bool, Empty, Int32
 from visualization_msgs.msg import Marker
 
 
 class GraspTrainDriver(Node):
     PHASE_START = 0
-    PHASE_DETECT = 1
-    PHASE_AWAIT_RESULT = 2
-    PHASE_AWAIT_IDLE = 3
+    PHASE_TRIGGER = 1
+    PHASE_AWAIT_DONE = 2
+    PHASE_WAIT_MANUAL = 3
 
     def __init__(self):
         super().__init__('grasp_train_driver')
-        self.declare_parameter('warmup', 5.0)
-        self.declare_parameter('settle', 3.0)
-        self.declare_parameter('max_attempts', 100)
-        self.declare_parameter('stop_on_failures', 5)
-        self.declare_parameter('result_timeout', 180.0)
+        self.declare_parameter('startup_settle', 15.0)
+        self.declare_parameter('post_round_wait', 15.0)
+        self.declare_parameter('max_rounds', 0)
         self.declare_parameter('detect_fresh', 1.0)
+        self.declare_parameter('min_round_time', 15.0)
+        self.declare_parameter('round_timeout', 180.0)
+        self.declare_parameter('manual_timeout', 300.0)
 
-        self.warmup = float(self.get_parameter('warmup').value)
-        self.settle = float(self.get_parameter('settle').value)
-        self.max_attempts = int(self.get_parameter('max_attempts').value)
-        self.stop_on_failures = int(
-            self.get_parameter('stop_on_failures').value)
-        self.result_timeout = float(
-            self.get_parameter('result_timeout').value)
+        self.startup_settle = float(
+            self.get_parameter('startup_settle').value)
+        self.post_round_wait = float(
+            self.get_parameter('post_round_wait').value)
+        self.max_rounds = int(self.get_parameter('max_rounds').value)
         self.detect_fresh = float(self.get_parameter('detect_fresh').value)
+        self.min_round_time = float(self.get_parameter('min_round_time').value)
+        self.round_timeout = float(self.get_parameter('round_timeout').value)
+        self.manual_timeout = float(self.get_parameter('manual_timeout').value)
 
         self.trigger_pub = self.create_publisher(
             Empty, 'manual_grasp_start', 10)
+        self.awaiting_pub = self.create_publisher(
+            Bool, 'manual_awaiting', 10)
 
         self.create_subscription(
             Marker, 'yolo/target_box', self._box_cb, 10)
         self.create_subscription(
             PoseStamped, 'grasp_pose', self._pose_cb, 10)
         self.create_subscription(
-            Int32, 'grasp_result', self._result_cb, 10)
-        self.create_subscription(
             Int32, 'grasp_executor_state', self._state_cb, 10)
+        self.create_subscription(
+            Int32, 'manual_round_result', self._manual_cb, 10)
 
         self._last_box = 0.0
         self._last_pose = 0.0
         self._exec_state = 0
+        self._manual_time = 0.0
+        self._manual_code = 0
         self._phase = self.PHASE_START
-        self._warmup_until = 0.0
-        self._attempt = 0
-        self._trigger_time = 0.0
-        self._idle_since = None
-        self._consec_fail = 0
+        self._start_at = 0.0
+        self._next_trigger_at = 0.0
+        self._round = 0
+        self._round_start = 0.0
+        self._was_running = False
         self._stopped = False
-        self._stats = {'succ': 0, 'empty': 0, 'fail': 0, 'timeout': 0}
 
         self.create_timer(0.5, self._tick)
-        self.get_logger().info(
-            f'Grasp train driver ready: max_attempts={self.max_attempts} '
-            f'stop_on_failures={self.stop_on_failures} '
-            f'settle={self.settle}s')
+        self.get_logger().info('Grasp train driver ready (manual report loop)')
 
     def _now(self):
         return self.get_clock().now().nanoseconds * 1e-9
@@ -86,94 +85,95 @@ class GraspTrainDriver(Node):
         del msg
         self._last_pose = self._now()
 
-    def _result_cb(self, msg):
-        if self._phase != self.PHASE_AWAIT_RESULT:
-            return
-        code = int(msg.data)
-        if code == 2:
-            self._stats['succ'] += 1
-            self._consec_fail = 0
-        elif code == 1:
-            self._stats['empty'] += 1
-            self._consec_fail += 1
-        else:
-            self._stats['fail'] += 1
-            self._consec_fail += 1
-        self.get_logger().info(
-            f'[TRAIN] attempt {self._attempt} result={code} '
-            f'(succ={self._stats["succ"]} empty={self._stats["empty"]} '
-            f'fail={self._stats["fail"]})')
-        self._phase = self.PHASE_AWAIT_IDLE
-        self._idle_since = None
-
     def _state_cb(self, msg):
         self._exec_state = int(msg.data)
 
+    def _manual_cb(self, msg):
+        self._manual_time = self._now()
+        self._manual_code = int(msg.data)
+
     def _tick(self):
+        await_b = Bool()
+        await_b.data = (self._phase == self.PHASE_WAIT_MANUAL)
+        self.awaiting_pub.publish(await_b)
         if self._stopped:
             return
         now = self._now()
 
         if self._phase == self.PHASE_START:
-            if self._warmup_until == 0.0:
-                self._warmup_until = now + self.warmup
+            if self._start_at == 0.0:
+                self._start_at = now + self.startup_settle
                 self.get_logger().info(
-                    f'[TRAIN] warmup {self.warmup:.0f}s, then auto-triggering')
-            elif now >= self._warmup_until:
-                self._phase = self.PHASE_DETECT
+                    f'[TRAIN] startup settle {self.startup_settle:.0f}s')
+            elif now >= self._start_at:
+                self._phase = self.PHASE_TRIGGER
+                self._next_trigger_at = now
             return
 
-        if self._attempt > self.max_attempts:
-            self._finish('max_attempts reached')
-            return
-        if self._consec_fail >= self.stop_on_failures:
-            self._finish(f'{self._consec_fail} consecutive failures')
+        if self.max_rounds > 0 and self._round >= self.max_rounds:
+            self._finish('max_rounds reached')
             return
 
-        if self._phase == self.PHASE_DETECT:
+        if self._phase == self.PHASE_TRIGGER:
+            if now < self._next_trigger_at:
+                return
             if self._exec_state != 0:
                 return
             if (now - self._last_box > self.detect_fresh
                     or now - self._last_pose > self.detect_fresh):
                 return
-            self._attempt += 1
+            self._round += 1
+            self._round_start = now
+            self._was_running = False
             self.trigger_pub.publish(Empty())
-            self._trigger_time = now
-            self._phase = self.PHASE_AWAIT_RESULT
+            self._phase = self.PHASE_AWAIT_DONE
             self.get_logger().info(
-                f'[TRAIN] triggered grasp {self._attempt}/{self.max_attempts}')
+                f'[TRAIN] round {self._round} triggered')
             return
 
-        if self._phase == self.PHASE_AWAIT_RESULT:
-            if now - self._trigger_time > self.result_timeout:
-                self._stats['timeout'] += 1
-                self._consec_fail += 1
+        if self._phase == self.PHASE_AWAIT_DONE:
+            if self._exec_state != 0:
+                self._was_running = True
+            if now - self._round_start > self.min_round_time:
+                if self._was_running and self._exec_state == 0:
+                    self._phase = self.PHASE_WAIT_MANUAL
+                    self.get_logger().warn(
+                        f'[TRAIN] round {self._round} done; WAITING for '
+                        'manual report (1空夹 2未夹稳 3未放平 4放平)')
+                    return
+                if not self._was_running:
+                    # 全程未离开 IDLE（校验/规划失败、机械臂没动）→ 自动跳过
+                    self.get_logger().warning(
+                        f'[TRAIN] round {self._round} no motion; skip '
+                        f'(wait {self.post_round_wait:.0f}s)')
+                    self._phase = self.PHASE_TRIGGER
+                    self._next_trigger_at = now + self.post_round_wait
+                    return
+            if now - self._round_start > self.round_timeout:
                 self.get_logger().warning(
-                    f'[TRAIN] attempt {self._attempt} timed out after '
-                    f'{self.result_timeout:.0f}s')
-                self._phase = self.PHASE_AWAIT_IDLE
-                self._idle_since = None
+                    f'[TRAIN] round {self._round} not done within '
+                    f'{self.round_timeout:.0f}s; stopping')
+                self._finish('round timeout')
             return
 
-        if self._phase == self.PHASE_AWAIT_IDLE:
-            if self._exec_state == 0:
-                if self._idle_since is None:
-                    self._idle_since = now
-                elif now - self._idle_since >= self.settle:
-                    self._idle_since = None
-                    self._phase = self.PHASE_DETECT
-            else:
-                self._idle_since = None
+        if self._phase == self.PHASE_WAIT_MANUAL:
+            if self._manual_time > self._round_start:
+                self.get_logger().info(
+                    f'[TRAIN] round {self._round} manual code='
+                    f'{self._manual_code}; next round '
+                    f'(wait {self.post_round_wait:.0f}s)')
+                self._phase = self.PHASE_TRIGGER
+                self._next_trigger_at = now + self.post_round_wait
+                return
+            if now - self._round_start > self.manual_timeout:
+                self.get_logger().error(
+                    '[TRAIN] manual report timeout; stopping')
+                self._finish('manual report timeout')
             return
 
     def _finish(self, reason):
         self._stopped = True
-        s = self._stats
-        total = s['succ'] + s['empty'] + s['fail'] + s['timeout']
-        self.get_logger().info(
-            f'[TRAIN] STOP ({reason}): total={total} '
-            f'succ={s["succ"]} empty={s["empty"]} fail={s["fail"]} '
-            f'timeout={s["timeout"]} rate={s["succ"] / max(total, 1):.2f}')
+        self.get_logger().info(f'[TRAIN] STOP ({reason})')
 
 
 def main():

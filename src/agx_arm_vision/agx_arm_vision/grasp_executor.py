@@ -71,6 +71,7 @@ class GraspExecutor(Node):
             'home_joints',
             [-0.0259, -0.4025, -0.0575, 2.0, 0.0604, 0.0722, 0.9141])
         self.declare_parameter('grasp_only', False)
+        self.declare_parameter('test_flow', False)
         self.declare_parameter('lift_verify', True)
         self.declare_parameter('lift_distance', 0.03)
         self.declare_parameter('lift_hold_time', 2.0)
@@ -117,6 +118,8 @@ class GraspExecutor(Node):
             'place_lower_timeout').value
         self.home_joints = self.get_parameter('home_joints').value
         self.grasp_only = bool(self.get_parameter('grasp_only').value)
+        self.test_flow = bool(self.get_parameter('test_flow').value)
+        self._auto_release_sent = False
         self.lift_verify = bool(self.get_parameter('lift_verify').value)
         self.lift_distance = float(
             self.get_parameter('lift_distance').value)
@@ -413,6 +416,7 @@ class GraspExecutor(Node):
         self._place_abort_open = False
         self._grasp_result_published = False
         self._grasp_only_drop = False
+        self._auto_release_sent = False
         p = self.target_pose.position
         self._t_trigger = self.get_clock().now().nanoseconds * 1e-9
         self._last_mark = self._t_trigger
@@ -434,6 +438,7 @@ class GraspExecutor(Node):
                 'Retry /manual_release or use /manual_release_force')
             self._place_validating = False
             self.triggered = False
+            self._auto_release_sent = False
             return
         p = self._latest_place_pose[1].pose
         self._place_frame = self._latest_place_pose[1].header.frame_id
@@ -880,6 +885,12 @@ class GraspExecutor(Node):
                     self._cycle_summary()
             return
         if self.state == self.WAIT_RELEASE:
+            # test_flow：抓取回 home 后自动触发放置（完整 grasp+place 一轮自含）
+            if self.test_flow and not self._auto_release_sent \
+                    and not self._place_validating:
+                self._auto_release_sent = True
+                self.get_logger().info('[TESTFLOW] auto release')
+                self.manual_release_cb(EmptyMsg())
             if self._place_validating:
                 if not self._place_rebuild_done:
                     now_place = (

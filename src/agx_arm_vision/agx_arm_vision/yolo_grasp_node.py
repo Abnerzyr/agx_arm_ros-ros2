@@ -94,6 +94,10 @@ class YoloGraspNode(Node):
         self.declare_parameter('rl_reward_success', 1.0)
         self.declare_parameter('rl_reward_empty', 0.2)
         self.declare_parameter('rl_reward_fail', -1.0)
+        self.declare_parameter('rl_manual_reward', True)
+        self.declare_parameter('rl_reward_manual_2', 0.5)
+        self.declare_parameter('rl_reward_manual_3', 1.5)
+        self.declare_parameter('rl_reward_manual_4', 3.0)
         self.declare_parameter('rl_stats_interval', 20)
 
         self.base_frame = self.get_parameter('base_frame').value
@@ -231,6 +235,14 @@ class YoloGraspNode(Node):
                     'rl_reward_success').value,
                 'reward_empty': self.get_parameter('rl_reward_empty').value,
                 'reward_fail': self.get_parameter('rl_reward_fail').value,
+                'manual_reward': bool(self.get_parameter(
+                    'rl_manual_reward').value),
+                'reward_manual_2': self.get_parameter(
+                    'rl_reward_manual_2').value,
+                'reward_manual_3': self.get_parameter(
+                    'rl_reward_manual_3').value,
+                'reward_manual_4': self.get_parameter(
+                    'rl_reward_manual_4').value,
                 'stats_interval': self.get_parameter(
                     'rl_stats_interval').value,
                 'n_scalars': 4,

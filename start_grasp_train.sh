@@ -1,11 +1,11 @@
 #!/bin/bash
-# start_grasp_train.sh : 仅抓取 RL 训练（无对准、无放置，臂进 /arm 命名空间版）
+# start_grasp_train.sh : 完整 grasp+place RL 训练 + 人工上报每轮结果（臂进 /arm）
 #
 # 与完整货架流程 start_shelf.sh 的区别：
-#   - 不启动 aruco_tracker / shelf_workflow / place_planner（训练链路不含对准与放置）
+#   - 不启动 aruco_tracker / shelf_workflow（训练链路不含对准与 aruco）
 #   - yolo_grasp 加 rl_enable:=true（进程内 RL 精修）
-#   - grasp_executor 加 grasp_only:=true（抓完原地松开放回货架，直接回 home）
-#   - AUTO=1 时启动 grasp_train_driver（自动循环触发抓取，无人值守）
+#   - grasp_executor 加 test_flow:=true（抓完回 home 自动放置，完整 grasp+place）
+#   - AUTO=1 时启动 grasp_train_driver：每轮抓+放完成后等人工上报结果，再自动下一轮
 #   - 物体需摆放在 home 位相机视野内
 #
 # 环境变量:
@@ -14,14 +14,14 @@
 #   MAX_ATTEMPTS  auto 训练最大尝试次数（默认 30）
 #   RL_DATA_DIR   RL 数据目录（默认 $PWD/grasp_rl_data，即工作空间内）
 #
-# 手动触发（AUTO=0 时）:
-#   ros2 topic pub --once -w 1 /arm/manual_grasp_start std_msgs/msg/Empty '{}'
+# 每轮结束后上报结果（1空夹 2未夹稳 3未放平 4放平）:
+#   ros2 topic pub --once -w 1 /arm/manual_round_result std_msgs/msg/Int32 '{data: 4}'
 cd /home/s1/tiaozhanbei/agx_arm_ros-ros2
 rm -f /dev/shm/fastrtps* 2>/dev/null
 source install/setup.bash
 
-AUTO=${AUTO:-0}
-TRAIN=${TRAIN:-0}
+AUTO=${AUTO:-1}
+TRAIN=${TRAIN:-1}
 MAX_ATTEMPTS=${MAX_ATTEMPTS:-30}
 RL_DATA_DIR=${RL_DATA_DIR:-$PWD/grasp_rl_data}
 export GRASP_RL_DATA_DIR=$RL_DATA_DIR
@@ -93,6 +93,7 @@ pkill -9 -f rviz2 2>/dev/null || true
 pkill -9 -f agx_arm_ctrl_single 2>/dev/null || true
 pkill -9 -f realsense2_camera 2>/dev/null || true
 pkill -9 -f yolo_grasp 2>/dev/null || true
+pkill -9 -f place_planner 2>/dev/null || true
 pkill -9 -f grasp_target_marker 2>/dev/null || true
 pkill -9 -f robot_state_publisher 2>/dev/null || true
 pkill -9 -f grasp_executor 2>/dev/null || true
@@ -162,14 +163,24 @@ ros2 run agx_arm_vision grasp_target_marker \
 MARKER_PID=$!
 echo "  marker PID=$MARKER_PID"
 
+echo "=== Starting place planner (in /arm) ==="
+OPENBLAS_NUM_THREADS=2 ros2 run agx_arm_vision place_planner \
+  --ros-args -r __ns:=/arm \
+  -p base_frame:=arm/base_link \
+  -p end_effector_link:=arm/tcp_link \
+  -p camera_optical_frame:=arm/camera_color_optical_frame \
+  -p process_period:=1.0 &>/tmp/place.log &
+PLACE_PID=$!
+echo "  place_planner PID=$PLACE_PID"
+
 sleep 2
 
-echo "=== Starting grasp executor (grasp_only, in /arm) ==="
+echo "=== Starting grasp executor (test_flow, in /arm) ==="
 ros2 run agx_arm_vision grasp_executor \
   --ros-args -r __ns:=/arm \
   -p base_link:=arm/base_link \
   -p end_effector_link:=arm/tcp_link \
-  -p grasp_only:=true &>/tmp/grasp.log &
+  -p test_flow:=true &>/tmp/grasp.log &
 GRASP_PID=$!
 echo "  grasp_executor PID=$GRASP_PID"
 
@@ -192,17 +203,20 @@ AUTO_PID=""
 if [ "$AUTO" = "1" ]; then
     ros2 run agx_arm_vision grasp_train_driver \
       --ros-args -r __ns:=/arm \
-      -p max_attempts:=$MAX_ATTEMPTS &>/tmp/grasp_train.log &
+      -p max_rounds:=$MAX_ATTEMPTS &>/tmp/grasp_train.log &
     AUTO_PID=$!
     echo "  grasp_train_driver PID=$AUTO_PID"
 else
     echo "  AUTO=0: manual trigger mode"
 fi
 
-echo "=== All started (grasp-only RL training stack, in /arm) ==="
-echo "MoveIt=$MOVEIT_PID  RViz=$RVIZ_PID  Cam=$CAM_PID  YOLO=$YOLO_PID  Marker=$MARKER_PID  Grasp=$GRASP_PID  TrainDriver=${AUTO_PID:-off}"
+echo "=== All started (full grasp+place RL training, manual report, in /arm) ==="
+echo "MoveIt=$MOVEIT_PID  RViz=$RVIZ_PID  Cam=$CAM_PID  YOLO=$YOLO_PID  Place=$PLACE_PID  Marker=$MARKER_PID  Grasp=$GRASP_PID  TrainDriver=${AUTO_PID:-off}"
 echo ""
 echo "Manual commands (注意 /arm/ 前缀):"
+echo "  每轮结束后上报结果（1空夹 2未夹稳 3未放平 4放平）:"
+echo "  ros2 topic pub --once -w 1 /arm/manual_round_result std_msgs/msg/Int32 '{data: 4}'"
+echo "  ros2 topic echo /arm/manual_awaiting   # True=等待上报，收到后自动进入下一轮"
 echo "  ros2 topic pub --once -w 1 /arm/manual_grasp_start std_msgs/msg/Empty '{}'   # AUTO=0 时手动触发一次抓取"
 echo "  ros2 service call /arm/grasp_rl/set_training std_srvs/srv/SetBool \"{data: true}\"    # 开训练"
 echo "  ros2 service call /arm/grasp_rl/set_training std_srvs/srv/SetBool \"{data: false}\"   # 关训练(冻结)"

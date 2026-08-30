@@ -102,6 +102,10 @@ class GraspRLRefiner:
         self.r_success = float(cfg['reward_success'])
         self.r_empty = float(cfg['reward_empty'])
         self.r_fail = float(cfg['reward_fail'])
+        self.manual_reward = bool(cfg.get('manual_reward', True))
+        self.r_manual_2 = float(cfg.get('reward_manual_2', 0.5))
+        self.r_manual_3 = float(cfg.get('reward_manual_3', 1.5))
+        self.r_manual_4 = float(cfg.get('reward_manual_4', 3.0))
         self.stats_interval = int(cfg['stats_interval'])
         self.n_scalars = int(cfg['n_scalars'])
         self.ckpt_dir = cfg['checkpoint_dir']
@@ -132,6 +136,8 @@ class GraspRLRefiner:
             Int32, 'task_command', self._task_cmd_cb, 10)
         node.create_subscription(
             Int32, 'grasp_result', self._grasp_result_cb, 10)
+        node.create_subscription(
+            Int32, 'manual_round_result', self._manual_result_cb, 10)
         node.create_subscription(
             EmptyMsg, 'manual_grasp_start', self._grasp_start_cb, 10)
         node.create_timer(1.0, self._tick)
@@ -219,6 +225,9 @@ class GraspRLRefiner:
             f'abort={self._inflight["external_abort"]}')
 
     def _grasp_result_cb(self, msg):
+        """自动 grasp_result：manual_reward 开启时忽略（奖励由人工上报决定）。"""
+        if self.manual_reward:
+            return
         code = int(msg.data)
         if self._inflight is None:
             self.log.warn(
@@ -242,6 +251,42 @@ class GraspRLRefiner:
         if self.step % self.ckpt_interval == 0:
             self.save_checkpoint()
         self._inflight = None
+
+    def _manual_result_cb(self, msg):
+        """人工上报每轮结果：1空夹 2未夹稳 3未放平 4放平 → 奖励并学习。"""
+        code = int(msg.data)
+        if self._inflight is None:
+            self.log.warn(
+                f'[RL] manual result={code} with no inflight; ignored')
+            return
+        if self._inflight['external_abort']:
+            reward = 0.0
+            self.log.info(
+                '[RL] external abort; sample logged but not learned')
+        else:
+            reward = self._manual_reward(code)
+        self.log.info(f'[RL] manual result code={code} reward={reward:.2f}')
+        self._log_sample(code, reward)
+        if self.training and not self._inflight['external_abort']:
+            self.replay.append(
+                (self._inflight['patch'], self._inflight['scalars'],
+                 self._inflight['action'], reward))
+            self._update()
+            self.eps = max(self.eps_end, self.eps * self.eps_decay)
+        self.step += 1
+        self._update_stats(code, self._inflight['external_abort'])
+        if self.step % self.ckpt_interval == 0:
+            self.save_checkpoint()
+        self._inflight = None
+
+    def _manual_reward(self, code):
+        if code == 4:
+            return self.r_manual_4   # 放平
+        if code == 3:
+            return self.r_manual_3   # 未放平
+        if code == 2:
+            return self.r_manual_2   # 未夹稳
+        return self.r_fail           # 空夹 (code 1)
 
     def _update(self):
         if len(self.replay) < self.batch_size:
