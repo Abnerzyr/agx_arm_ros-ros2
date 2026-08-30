@@ -156,6 +156,7 @@ class YoloGraspNode(Node):
         self._mask_plane = None
         self._mask_plane_ref = None
         self._mask_plane_time = 0.0
+        self._mask_force_refit = True
         self._last_obj_hgt = None
 
         pkg_dir = os.path.dirname(os.path.abspath(__file__))
@@ -554,6 +555,8 @@ class YoloGraspNode(Node):
             if chosen >= 1:
                 sel_real = (labels == chosen)
         obj_set = sel_real.copy()
+        # 掩码为空/过小 → 下一帧强制重拟合平面（坏平面自纠正）
+        self._mask_force_refit = (sel_real.sum() < 30)
         if hgt is not None and sel_real.any():
             self._last_obj_hgt = float(hgt[sel_real].max())
         else:
@@ -565,10 +568,13 @@ class YoloGraspNode(Node):
         thr_px = np.where(crop_d > 0.05, 0.01 * fx / crop_d, 0.0)
         sel_valid &= dist_px >= thr_px
         if sel_real.sum() < 30:
+            plane_d = (f', d={self._mask_plane[1]:.3f}'
+                       if self._mask_plane is not None else '')
             self.get_logger().info(
                 f'[GRASP] skip: object mask too small '
-                f'({int(sel_real.sum())}px, plane='
-                f'{"yes" if self._mask_plane is not None else "no"})',
+                f'({int(sel_real.sum())}px, ok_c={int(ok_c.sum())}px, '
+                f'plane={"yes" if self._mask_plane is not None else "no"}'
+                f'{plane_d})',
                 throttle_duration_sec=5.0)
             self._publish_cloud(depth, exclude_box=box_exclude)
             return
@@ -590,7 +596,10 @@ class YoloGraspNode(Node):
             self._last_target_exclude = exclude_box
             self._last_target_exclude_time = (
                 self.get_clock().now().nanoseconds * 1e-9)
-        self._publish_cloud(depth, exclude_box=exclude_box)
+        # 只挖物体真实轮廓（外圈桌面按真实点保留），避免 octomap 物体周围"少一圈"。
+        obj_full = np.zeros((h, w), bool)
+        obj_full[crop_y1:crop_y2, crop_x1:crop_x2] = sel_real
+        self._publish_cloud(depth, exclude_box=exclude_box, obj_mask=obj_full)
 
         d_resized = cv2.resize(crop_d, (self.input_size, self.input_size))
         r_resized = cv2.resize(crop_rgb, (self.input_size, self.input_size))
@@ -713,15 +722,53 @@ class YoloGraspNode(Node):
         xc = float(np.median((ui_ok - fcx) * zc_ok / fx))
         yc = float(np.median((vi_ok - fcy) * zc_ok / fy))
         zmed = float(np.median(zc_ok))
-        # 抓取点高度修正：可见面中位质心偏向顶面（前上方视角），沿桌面法线
-        # 把抓取点降到物体真实竖直中心 = 桌面 + max_hgt/2。水平位置不变。
+        # 抓取位置 = 顶面投影足迹中心 + max_hgt/2。顶面完整可见时，把顶面点
+        # 投影到桌面即完整足迹，宽度/深度都准（不再受前面点把中心拉偏影响）。
+        # 顶面点带为空时回退全可见点中位 + 高度修正。
+        top_ok = False
         if plane is not None and self._last_obj_hgt is not None \
                 and self._last_obj_hgt > 0.0:
-            hc = (n_p[0] * xc + n_p[1] * yc + n_p[2] * zmed + d_p)
-            lift = 0.5 * self._last_obj_hgt - hc
-            xc += n_p[0] * lift
-            yc += n_p[1] * lift
-            zmed += n_p[2] * lift
+            mh = self._last_obj_hgt
+            band = 0.02
+            m_hgt = hgt[obj_set]
+            top_sel = m_hgt > (mh - band)
+            if top_sel.sum() >= 10:
+                u_t = ou2[top_sel] + crop_x1
+                v_t = ov2[top_sel] + crop_y1
+                z_t = depth[v_t, u_t]
+                ok_t = (z_t > 0.05) & (z_t < 2.0) & np.isfinite(z_t)
+                if ok_t.sum() >= 10:
+                    z_t = z_t[ok_t]
+                    u_t = u_t[ok_t]
+                    v_t = v_t[ok_t]
+                    p_top = np.stack(
+                        [(u_t - fcx) * z_t / fx,
+                         (v_t - fcy) * z_t / fy,
+                         z_t], axis=1)
+                    h_top = p_top @ n_p + d_p
+                    p_plane = p_top - h_top[:, None] * n_p
+                    fc = np.median(p_plane, axis=0)
+                    grasp = fc + (mh / 2.0) * n_p
+                    xc, yc, zmed = (float(grasp[0]), float(grasp[1]),
+                                    float(grasp[2]))
+                    top_ok = True
+                else:
+                    self.get_logger().info(
+                        '[GRASP] top-band depth invalid; fallback median',
+                        throttle_duration_sec=5.0)
+            else:
+                self.get_logger().info(
+                    '[GRASP] top band empty; fallback median',
+                    throttle_duration_sec=5.0)
+        if not top_ok:
+            # 回退：全可见点中位 + 高度修正（降回 max_hgt/2）
+            if plane is not None and self._last_obj_hgt is not None \
+                    and self._last_obj_hgt > 0.0:
+                hc = (n_p[0] * xc + n_p[1] * yc + n_p[2] * zmed + d_p)
+                lift = 0.5 * self._last_obj_hgt - hc
+                xc += n_p[0] * lift
+                yc += n_p[1] * lift
+                zmed += n_p[2] * lift
         u_orig = fcx + xc * fx / zmed
         v_orig = fcy + yc * fy / zmed
         u_orig = min(max(u_orig, 0.0), float(w - 1))
@@ -868,7 +915,7 @@ class YoloGraspNode(Node):
             f'angle={math.degrees(angle):.1f}° '
             f'width={width:.3f}m score={score:.2f}')
 
-    def _publish_cloud(self, depth, exclude_box=None):
+    def _publish_cloud(self, depth, exclude_box=None, obj_mask=None):
         if not self._cloud_ok:
             return
         try:
@@ -891,9 +938,14 @@ class YoloGraspNode(Node):
         self._publish_points(
             self.cloud_pub, uu[valid], vv[valid], z[valid], t)
 
-        if exclude_box is not None:
-            ex1, ey1, ex2, ey2 = exclude_box
-            inside = (uu >= ex1) & (uu <= ex2) & (vv >= ey1) & (vv <= ey2)
+        # obj_mask 优先：只挖物体真实轮廓（外圈桌面保留为真实点，避免 octomap
+        # 物体周围"少一圈"）。无 obj_mask 时回退到矩形 exclude_box。
+        if exclude_box is not None or obj_mask is not None:
+            if obj_mask is not None:
+                inside = obj_mask[vv, uu]
+            else:
+                ex1, ey1, ex2, ey2 = exclude_box
+                inside = (uu >= ex1) & (uu <= ex2) & (vv >= ey1) & (vv <= ey2)
             keep = valid & ~inside
 
             fx = self.model_cam.fx()
@@ -911,9 +963,10 @@ class YoloGraspNode(Node):
             ]).as_matrix()
             n_cam = rot[2, :]
 
+            # 重建平面从外部真实桌面(keep)拟合，保证重建高度与周围一致。
             plane = self._get_table_plane(
                 n_cam,
-                xs[inside & valid], ys[inside & valid], z[inside & valid])
+                xs[keep], ys[keep], z[keep])
 
             if plane is None:
                 if not self._fallback_logged:
@@ -1119,23 +1172,61 @@ class YoloGraspNode(Node):
     def _mask_table_plane(self, depth, cx, cy):
         """Locked table plane for the object mask.
 
-        Re-fits only when missing, the object moved a lot in the image, or the
-        lock is old. Avoids frame-to-frame RANSAC wobble, which could make
-        desktop points leak into the mask and drag the grasp centroid away.
+        Re-fits when missing, the object moved a lot in the image, the lock is
+        old, or the previous mask was empty (self-correction). A sanity check
+        rejects a too-high/non-horizontal plane that would filter the object
+        out of the mask.
         """
         now = self.get_clock().now().nanoseconds * 1e-9
-        if self._mask_plane is not None and self._mask_plane_ref is not None:
+        if (self._mask_plane is not None and self._mask_plane_ref is not None
+                and not self._mask_force_refit):
             dx = cx - self._mask_plane_ref[0]
             dy = cy - self._mask_plane_ref[1]
             if (abs(dx) < 100 and abs(dy) < 100
                     and (now - self._mask_plane_time) < 30.0):
                 return self._mask_plane
         plane = self._table_plane_from_frame(depth)
+        if plane is not None and not self._mask_plane_sane(plane, depth):
+            self.get_logger().warn(
+                f'[MASK] rejected implausible plane '
+                f'(n=({plane[0][0]:.2f},{plane[0][1]:.2f},'
+                f'{plane[0][2]:.2f}) d={plane[1]:.3f}); refitting',
+                throttle_duration_sec=5.0)
+            plane = None
         if plane is not None:
             self._mask_plane = plane
             self._mask_plane_ref = (float(cx), float(cy))
             self._mask_plane_time = now
+            self._mask_force_refit = False
+        else:
+            self._mask_force_refit = True
         return plane
+
+    def _mask_plane_sane(self, plane, depth):
+        """校验平面可作为支撑面：近似水平（相机系近垂直），且帧内有效点不应
+        大量位于其下方（否则是偏高/非桌面平面，会把物体滤掉致掩码为空）。"""
+        n_p, d_p = plane
+        if abs(n_p[2]) < 0.3:
+            return False
+        h_img, w_img = depth.shape
+        fx = self.model_cam.fx()
+        fy = self.model_cam.fy()
+        fcx = self.model_cam.cx()
+        fcy = self.model_cam.cy()
+        ds = 8
+        uu, vv = np.meshgrid(
+            np.arange(0, w_img, ds), np.arange(0, h_img, ds))
+        z = depth[vv, uu]
+        valid = (z > 0.05) & (z < 2.0) & np.isfinite(z)
+        if valid.sum() < 100:
+            return False
+        xs = (uu - fcx) * z / fx
+        ys = (vv - fcy) * z / fy
+        hgt = xs * n_p[0] + ys * n_p[1] + z * n_p[2] + d_p
+        frac_below = float(((hgt < -0.02) & valid).sum() / valid.sum())
+        if frac_below > 0.2:
+            return False
+        return True
 
     def _table_plane_from_frame(self, depth):
         h, w = depth.shape

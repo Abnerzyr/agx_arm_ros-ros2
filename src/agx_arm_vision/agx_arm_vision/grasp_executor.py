@@ -964,7 +964,7 @@ class GraspExecutor(Node):
                     self._place_target_pose, self._place_frame,
                     velocity_scaling=self.velocity_scaling,
                     constrain_orientation=True,
-                    orientation_tolerance=0.35)
+                    orientation_tolerance=0.1)
                 self.triggered = True
                 self._place_reach_start = (
                     self.get_clock().now().nanoseconds * 1e-9)
