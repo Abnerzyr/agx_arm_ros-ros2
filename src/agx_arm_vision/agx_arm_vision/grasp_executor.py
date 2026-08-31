@@ -63,6 +63,7 @@ class GraspExecutor(Node):
         self.declare_parameter('place_z_margin', 0.01)
         self.declare_parameter('place_pose_timeout', 30.0)
         self.declare_parameter('place_lower_timeout', 20.0)
+        self.declare_parameter('place_max_retries', 5)
         self.declare_parameter(
             'filtered_cloud_topic', 'filtered_cloud')
         self.declare_parameter(
@@ -116,6 +117,8 @@ class GraspExecutor(Node):
             'place_pose_timeout').value
         self.place_lower_timeout = self.get_parameter(
             'place_lower_timeout').value
+        self.place_max_retries = int(self.get_parameter(
+            'place_max_retries').value)
         self.home_joints = self.get_parameter('home_joints').value
         self.grasp_only = bool(self.get_parameter('grasp_only').value)
         self.test_flow = bool(self.get_parameter('test_flow').value)
@@ -214,6 +217,8 @@ class GraspExecutor(Node):
         self._place_filtered_time = 0.0
         self._place_cycle_home = False
         self._place_abort_open = False
+        self._place_attempt = 0
+        self._place_retry_state = None
         self.move_j_pub = self.create_publisher(
             JointState, 'control/move_j', 10)
         self.state_pub = self.create_publisher(
@@ -465,6 +470,8 @@ class GraspExecutor(Node):
         self._place_reach_ok_count = 0
         self._stable_wait_logged = False
         self._place_validating = True
+        self._place_attempt = 1
+        self._place_retry_state = None
         self.get_logger().info(
             f'Manual place triggered: table_z={p.position.z:.3f} '
             f'grasp_offset={self.grasp_offset:.3f} '
@@ -923,6 +930,13 @@ class GraspExecutor(Node):
                     else:
                         return
                 if not self._place_validation_sent:
+                    if self._place_retry_state is not None:
+                        retry_state = self._place_retry_state
+                        self._place_retry_state = None
+                        self._place_validating = False
+                        self.state = retry_state
+                        self.triggered = False
+                        return
                     if not self._joints_stable():
                         self._log_stable_wait()
                         return
@@ -962,8 +976,7 @@ class GraspExecutor(Node):
                     self._place_reach_ok_count = 0
                 else:
                     self.get_logger().error('Move to place-above failed')
-                    self._place_abort_open = True
-                    self._enter_home()
+                    self._place_fail_retry(self.MOVE_TO_PLACE_ABOVE)
             return
         if self.state == self.LOWER_TO_PLACE:
             if not self.triggered:
@@ -982,8 +995,7 @@ class GraspExecutor(Node):
             elif self.arm.is_done():
                 if not self.arm.success:
                     self.get_logger().error('Lower to place failed')
-                    self._place_abort_open = True
-                    self._enter_home()
+                    self._place_fail_retry(self.LOWER_TO_PLACE)
                     return
                 elapsed = (
                     self.get_clock().now().nanoseconds * 1e-9
@@ -1004,10 +1016,8 @@ class GraspExecutor(Node):
                 elif elapsed > self.place_lower_timeout:
                     self.get_logger().warning(
                         f'Place reach timeout, error={error}; '
-                        'going home (holding; use /manual_release_force '
-                        'to drop)')
-                    self._place_abort_open = True
-                    self._enter_home()
+                        f'retry {self._place_attempt}/{self.place_max_retries}')
+                    self._place_fail_retry(self.LOWER_TO_PLACE)
                     self.triggered = False
             return
         if self.state == self.PLACE_OPEN:
@@ -1063,6 +1073,29 @@ class GraspExecutor(Node):
         self.triggered = False
         self._home_clear_waited = False
         self._home_clear_start = 0.0
+
+    def _place_fail_retry(self, failed_state):
+        """放回某步失败：重试（清 octomap→重建→重发该步）或用尽后回家等人工。"""
+        if self._place_attempt < self.place_max_retries:
+            self._place_attempt += 1
+            self._place_retry_state = failed_state
+            self._place_validating = True
+            self._place_rebuild_done = False
+            self._place_validation_sent = False
+            self._place_clear_time = None
+            self.state = self.WAIT_RELEASE
+            self.triggered = False
+            self.get_logger().warning(
+                f'Place attempt {self._place_attempt}/'
+                f'{self.place_max_retries} failed; clearing octomap '
+                'and retrying')
+        else:
+            self.get_logger().error(
+                f'Place failed after {self.place_max_retries} attempts; '
+                'going home holding; handle manually '
+                '(/manual_release or /manual_release_force)')
+            self._place_abort_open = True
+            self._enter_home()
 
     def _publish_grasp_result(self, code):
         """Publish grasp outcome once per attempt.
