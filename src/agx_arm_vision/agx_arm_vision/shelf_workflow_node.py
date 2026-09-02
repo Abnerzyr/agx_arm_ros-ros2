@@ -9,6 +9,7 @@ from aruco_opencv_msgs.msg import ArucoDetection
 from geometry_msgs.msg import Pose, PoseStamped
 from rclpy.node import Node
 from scipy.spatial.transform import Rotation as R
+from sensor_msgs.msg import Image, JointState
 from std_msgs.msg import ColorRGBA, Empty, Header, Int32
 from tf2_ros import Buffer, TransformException, TransformListener
 from visualization_msgs.msg import Marker
@@ -179,6 +180,14 @@ class ShelfWorkflowNode(Node):
             Empty, 'shelf/skip_align', self.skip_align_cb, 10)
         self.create_subscription(
             Empty, 'shelf/preset_home', self.preset_home_cb, 10)
+        # 深度停滞监测（诊断用）：订阅对齐深度，只记到达时刻
+        self._depth_mon_sub = self.create_subscription(
+            Image, '/camera/camera/aligned_depth_to_color/image_raw',
+            self.depth_mon_cb, 1)
+        # 关节状态（用于"臂稳定才规划下一动"）
+        self.create_subscription(
+            JointState, 'feedback/joint_states', self.joint_state_cb, 10)
+        self.create_timer(0.2, self._joint_stability_update)
 
         self.state = self.IDLE
         self._layer = None
@@ -205,6 +214,21 @@ class ShelfWorkflowNode(Node):
         self._align_no_marker_logged = False
         self._detect_start = 0.0
         self._detect_warn_logged = False
+        self._depth_arrival = 0.0
+        self._depth_mon_on = False
+        self._depth_mon_start = 0.0
+        self._depth_stalling = False
+        self._depth_stall_count = 0
+        self._depth_max_gap = 0.0
+        self._depth_stall_accum = 0.0
+        self._depth_stall_start = 0.0
+        self._depth_stall_logged = 0.0
+        self._joint_pos = None
+        self._joint_prev = None
+        self._joint_stable_ticks = 0
+        self._joint_last_feedback = 0.0
+        self._joint_stable = False
+        self._align_stable_logged = 0.0
         self._grasp_trigger_time = 0.0
         self._grasp_fail_start = None
         self._place_start = 0.0
@@ -298,6 +322,98 @@ class ShelfWorkflowNode(Node):
         del msg
         self._last_grasp_pose_time = self.get_clock().now().nanoseconds * 1e-9
 
+    def depth_mon_cb(self, msg):
+        del msg
+        self._depth_arrival = self.get_clock().now().nanoseconds * 1e-9
+
+    def joint_state_cb(self, msg):
+        names = ['joint1', 'joint2', 'joint3', 'joint4',
+                 'joint5', 'joint6', 'joint7']
+        if self._joint_pos is None:
+            self._joint_pos = [0.0] * 7
+        for n, name in enumerate(names):
+            if name in msg.name:
+                idx = msg.name.index(name)
+                if idx < len(msg.position):
+                    self._joint_pos[n] = msg.position[idx]
+        self._joint_last_feedback = self.get_clock().now().nanoseconds * 1e-9
+
+    def _joint_stability_update(self):
+        """0.2s 采样关节：delta<0.01rad 连续 3 次判定稳定。"""
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if now - self._joint_last_feedback > 0.5:
+            self._joint_stable = False
+            self._joint_stable_ticks = 0
+            return
+        cur = self._joint_pos
+        if cur is None:
+            self._joint_stable = False
+            return
+        if self._joint_prev is None:
+            self._joint_prev = list(cur)
+            return
+        delta = max(abs(a - b) for a, b in zip(cur, self._joint_prev))
+        self._joint_prev = list(cur)
+        if delta < 0.01:
+            self._joint_stable_ticks += 1
+        else:
+            self._joint_stable_ticks = 0
+        self._joint_stable = (self._joint_stable_ticks >= 3)
+
+    def _joints_stable(self):
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if now - self._joint_last_feedback > 0.5:
+            return False
+        return self._joint_stable
+
+    def _start_depth_monitor(self):
+        self._depth_arrival = self.get_clock().now().nanoseconds * 1e-9
+        self._depth_mon_on = True
+        self._depth_mon_start = self._depth_arrival
+        self._depth_stalling = False
+        self._depth_stall_count = 0
+        self._depth_max_gap = 0.0
+        self._depth_stall_accum = 0.0
+        self._depth_stall_logged = 0.0
+        self.get_logger().info('[MON] depth monitor started (align done)')
+
+    def _depth_monitor_tick(self, now):
+        """监测深度流停滞：gap>3s 记录一次，恢复时记录时长。"""
+        if not self._depth_mon_on or self._depth_arrival <= 0.0:
+            return
+        gap = now - self._depth_arrival
+        if gap > self._depth_max_gap:
+            self._depth_max_gap = gap
+        if gap > 3.0:
+            if not self._depth_stalling:
+                self._depth_stalling = True
+                self._depth_stall_count += 1
+                self._depth_stall_start = now
+                self.get_logger().warning(
+                    f'[MON] depth stalled: {gap:.1f}s no frame '
+                    f'(stall #{self._depth_stall_count})')
+            elif (now - self._depth_stall_logged > 5.0):
+                self._depth_stall_logged = now
+                self.get_logger().warning(
+                    f'[MON] depth still stalled: {gap:.1f}s')
+        else:
+            if self._depth_stalling:
+                self._depth_stalling = False
+                duration = now - self._depth_stall_start
+                self._depth_stall_accum += duration
+                self.get_logger().warning(
+                    f'[MON] depth resumed after {duration:.1f}s '
+                    f'(gap now {gap:.2f}s)')
+
+    def _stop_depth_monitor(self):
+        if not self._depth_mon_on:
+            return
+        self._depth_mon_on = False
+        self.get_logger().info(
+            f'[MON] depth monitor end: {self._depth_stall_count} stall(s), '
+            f'max gap {self._depth_max_gap:.1f}s, '
+            f'accum stalled {self._depth_stall_accum:.1f}s')
+
     def executor_state_cb(self, msg):
         self._executor_state = int(msg.data)
         self._executor_state_time = self.get_clock().now().nanoseconds * 1e-9
@@ -324,6 +440,10 @@ class ShelfWorkflowNode(Node):
             f'State: {self.STATE_NAMES.get(self.state)} -> '
             f'{self.STATE_NAMES.get(state)}')
         self.state = state
+        if state == self.WAIT_DETECT:
+            self._start_depth_monitor()
+        elif state == self.IDLE:
+            self._stop_depth_monitor()
 
     def _reset_cycle_vars(self):
         self._release_pending = False
@@ -610,6 +730,8 @@ class ShelfWorkflowNode(Node):
         if self.state == self.IDLE:
             return
 
+        self._depth_monitor_tick(now)
+
         if self.state == self.NOMINAL_POSE:
             if self._executor_state != self.EXECUTOR_IDLE:
                 if not self._busy_executor_logged:
@@ -725,6 +847,16 @@ class ShelfWorkflowNode(Node):
                 return
             error = self._tcp_position_error(pose)
             if not self._align_sent:
+                # 等臂真正停稳再规划/发送下一动，避免 MoveIt 从中间状态规划导致
+                # 轨迹起点与实际不符（Invalid Trajectory: start point deviates）
+                if not self._joints_stable():
+                    now_s = self.get_clock().now().nanoseconds * 1e-9
+                    if now_s - self._align_stable_logged > 3.0:
+                        self._align_stable_logged = now_s
+                        self.get_logger().info(
+                            '[ALIGN] waiting for arm joints to settle '
+                            'before next move')
+                    return
                 self.get_logger().info(
                     f'Refining alignment (iter={self._align_iter + 1}, '
                     f'current error={error if error is not None else -1:.3f} m)')

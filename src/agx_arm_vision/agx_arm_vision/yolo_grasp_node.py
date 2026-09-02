@@ -17,7 +17,7 @@ from image_geometry import PinholeCameraModel
 from rclpy.node import Node
 from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import (
-    CameraInfo, Image, PointCloud2, PointField)
+    CameraInfo, Image, JointState, PointCloud2, PointField)
 from skimage.filters import gaussian
 from std_msgs.msg import Bool, ColorRGBA, Float32, Header
 from tf2_geometry_msgs import do_transform_pose_stamped
@@ -60,6 +60,7 @@ class YoloGraspNode(Node):
         self.declare_parameter('input_size', 224)
         self.declare_parameter('box_padding', 0.005)
         self.declare_parameter('min_range', 0.15)
+        self.declare_parameter('depth_stale_timeout', 3.0)
         self.declare_parameter('table_removal_tol', 0.01)
         self.declare_parameter('min_depth_span', 0.02)
         self.declare_parameter('min_grasp_height', 0.01)
@@ -110,6 +111,8 @@ class YoloGraspNode(Node):
         self.input_size = self.get_parameter('input_size').value
         self.box_padding = self.get_parameter('box_padding').value
         self.min_range = self.get_parameter('min_range').value
+        self.depth_stale_timeout = float(
+            self.get_parameter('depth_stale_timeout').value)
         self.box_exclude_window = self.get_parameter(
             'box_exclude_window').value
         self.table_removal_tol = float(
@@ -143,6 +146,14 @@ class YoloGraspNode(Node):
         self.rgb_img = None
         self.camera_info = None
         self.depth_stamp = None
+        self._last_depth_time = 0.0
+        self._depth_stale_logged = 0.0
+        self._joint_stable = False
+        self._joint_stable_ticks = 0
+        self._joint_last_feedback = 0.0
+        self._joint_prev = None
+        self._joint_pos = None
+        self._joint_moving_logged = 0.0
         self._map_enabled = True
         self._last_map_msg_time = 0.0
         self._cloud_ok = True
@@ -184,6 +195,8 @@ class YoloGraspNode(Node):
             self.info_callback, 10)
         self.create_subscription(
             Bool, 'map_update_enable', self.map_update_cb, 10)
+        self.create_subscription(
+            JointState, 'feedback/joint_states', self.joint_state_cb, 10)
         if _ArucoMsg is not None:
             self.create_subscription(
                 _ArucoMsg, '/aruco_detections', self.aruco_cb, 10)
@@ -206,6 +219,7 @@ class YoloGraspNode(Node):
             Float32, 'yolo/table_height', 10)
 
         self.create_timer(0.5, self.process)
+        self.create_timer(0.2, self._joint_stability_update)
         self._rl = None
         if self.rl_enable:
             self._rl = GraspRLRefiner(self, {
@@ -270,6 +284,7 @@ class YoloGraspNode(Node):
     def depth_callback(self, msg):
         self.depth_img = self.bridge.imgmsg_to_cv2(msg, 'passthrough')
         self.depth_stamp = msg.header.stamp
+        self._last_depth_time = self.get_clock().now().nanoseconds * 1e-9
 
     def rgb_callback(self, msg):
         self.rgb_img = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
@@ -277,6 +292,40 @@ class YoloGraspNode(Node):
     def map_update_cb(self, msg):
         self._map_enabled = msg.data
         self._last_map_msg_time = self.get_clock().now().nanoseconds * 1e-9
+
+    def joint_state_cb(self, msg):
+        names = ['joint1', 'joint2', 'joint3', 'joint4',
+                 'joint5', 'joint6', 'joint7']
+        if self._joint_pos is None:
+            self._joint_pos = [0.0] * 7
+        for n, name in enumerate(names):
+            if name in msg.name:
+                idx = msg.name.index(name)
+                if idx < len(msg.position):
+                    self._joint_pos[n] = msg.position[idx]
+        self._joint_last_feedback = self.get_clock().now().nanoseconds * 1e-9
+
+    def _joint_stability_update(self):
+        """0.2s 采样关节：delta<0.01rad 连续 3 次判定稳定。"""
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if now - self._joint_last_feedback > 0.5:
+            self._joint_stable = False
+            self._joint_stable_ticks = 0
+            return
+        cur = self._joint_pos
+        if cur is None:
+            self._joint_stable = False
+            return
+        if self._joint_prev is None:
+            self._joint_prev = list(cur)
+            return
+        delta = max(abs(a - b) for a, b in zip(cur, self._joint_prev))
+        self._joint_prev = list(cur)
+        if delta < 0.01:
+            self._joint_stable_ticks += 1
+        else:
+            self._joint_stable_ticks = 0
+        self._joint_stable = (self._joint_stable_ticks >= 3)
 
     def _cloud_gate(self):
         return self._map_enabled
@@ -392,6 +441,23 @@ class YoloGraspNode(Node):
         if (self.depth_img is None or self.rgb_img is None
                 or self.camera_info is None):
             return
+        now = self.get_clock().now().nanoseconds * 1e-9
+        # 臂未稳定：丢弃动中/未停稳采的帧（会导致点云倾斜、目标浮空）
+        if not self._joint_stable:
+            if now - self._joint_moving_logged > 5.0:
+                self._joint_moving_logged = now
+                self.get_logger().info(
+                    '[ARM] not stable; skipping processing (arm moving)')
+            return
+        # 深度流停滞：不拿旧深度帧发云（旧帧 + 新 TF 会导致点云倾斜）
+        if self._last_depth_time > 0.0:
+            age = now - self._last_depth_time
+            if age > self.depth_stale_timeout:
+                if now - self._depth_stale_logged > 5.0:
+                    self._depth_stale_logged = now
+                    self.get_logger().warning(
+                        f'[DEPTH] stale: no frame for {age:.1f}s; skipping')
+                return
         self._cloud_ok = self._cloud_gate()
         depth = self._depth_meters(self.depth_img)
         rgb = self.rgb_img
@@ -1349,9 +1415,16 @@ class YoloGraspNode(Node):
 def main():
     rclpy.init()
     node = YoloGraspNode()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    # MultiThreadedExecutor：process() 慢推理时不饿死深度/彩色回调，
+    # 保证 depth_img 永远新鲜、帧时刻与 TF 一致（避免斜云/误报 stale）
+    executor = rclpy.executors.MultiThreadedExecutor(num_threads=3)
+    executor.add_node(node)
+    try:
+        executor.spin()
+    finally:
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':
