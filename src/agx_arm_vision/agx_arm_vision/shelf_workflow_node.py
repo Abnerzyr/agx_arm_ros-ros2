@@ -44,11 +44,12 @@ class ShelfWorkflowNode(Node):
     GRASPING = 5
     WAIT_RELEASE_CMD = 6
     PLACING = 7
+    RETURN_HOME = 8
 
     STATE_NAMES = {
         0: 'IDLE', 1: 'NOMINAL_POSE', 2: 'ALIGN',
         3: 'WAIT_DETECT', 4: 'TRIGGER_GRASP', 5: 'GRASPING',
-        6: 'WAIT_RELEASE_CMD', 7: 'PLACING',
+        6: 'WAIT_RELEASE_CMD', 7: 'PLACING', 8: 'RETURN_HOME',
     }
 
     EXECUTOR_STATE_NAMES = {
@@ -90,6 +91,12 @@ class ShelfWorkflowNode(Node):
         self.declare_parameter('grasp_give_up_timeout', 90.0)
         self.declare_parameter('place_give_up_timeout', 90.0)
         self.declare_parameter('detect_timeout', 5.0)
+        self.declare_parameter('detect_give_up_timeout', 15.0)
+        self.declare_parameter('grasp_max_retries', 2)
+        self.declare_parameter('target_z_min', 0.01)
+        self.declare_parameter('target_z_max', 0.35)
+        self.declare_parameter('ret_home_timeout', 90.0)
+        self.declare_parameter('ret_home_exec_wait', 60.0)
         self.declare_parameter('align_settle_time', 3.0)
         self.declare_parameter('box_stable_tol', 0.05)
         self.declare_parameter('align_max_iter', 2)
@@ -127,6 +134,16 @@ class ShelfWorkflowNode(Node):
         self.place_give_up_timeout = self.get_parameter(
             'place_give_up_timeout').value
         self.detect_timeout = self.get_parameter('detect_timeout').value
+        self.detect_give_up_timeout = self.get_parameter(
+            'detect_give_up_timeout').value
+        self.grasp_max_retries = int(self.get_parameter(
+            'grasp_max_retries').value)
+        self.target_z_min = float(self.get_parameter('target_z_min').value)
+        self.target_z_max = float(self.get_parameter('target_z_max').value)
+        self.ret_home_timeout = self.get_parameter(
+            'ret_home_timeout').value
+        self.ret_home_exec_wait = self.get_parameter(
+            'ret_home_exec_wait').value
         self.align_settle_time = float(
             self.get_parameter('align_settle_time').value)
         self.box_stable_tol = float(
@@ -161,6 +178,8 @@ class ShelfWorkflowNode(Node):
             Empty, 'manual_grasp_start', 10)
         self.release_pub = self.create_publisher(
             Empty, 'manual_release', 10)
+        self.release_force_pub = self.create_publisher(
+            Empty, 'manual_release_force', 10)
         self.align_target_pub = self.create_publisher(
             Marker, 'shelf/align_target', 10)
 
@@ -176,6 +195,8 @@ class ShelfWorkflowNode(Node):
             PoseStamped, 'grasp_pose', self.grasp_pose_cb, 10)
         self.create_subscription(
             Int32, 'grasp_executor_state', self.executor_state_cb, 10)
+        self.create_subscription(
+            Int32, 'grasp_result', self.grasp_result_cb, 10)
         self.create_subscription(
             Empty, 'shelf/skip_align', self.skip_align_cb, 10)
         self.create_subscription(
@@ -229,6 +250,16 @@ class ShelfWorkflowNode(Node):
         self._joint_last_feedback = 0.0
         self._joint_stable = False
         self._align_stable_logged = 0.0
+        self._latest_grasp_pt = None
+        self._table_z = None
+        self._plausible_ticks = 0
+        self._implausible_logged = False
+        self._grasp_retries = 0
+        self._last_grasp_result = None
+        self._last_grasp_result_time = 0.0
+        self._release_force_sent = False
+        self._ret_home_sent = False
+        self._ret_home_start = 0.0
         self._grasp_trigger_time = 0.0
         self._grasp_fail_start = None
         self._place_start = 0.0
@@ -319,7 +350,9 @@ class ShelfWorkflowNode(Node):
         self._stable_ticks = 1
 
     def grasp_pose_cb(self, msg):
-        del msg
+        self._latest_grasp_pt = (
+            float(msg.pose.position.x), float(msg.pose.position.y),
+            float(msg.pose.position.z))
         self._last_grasp_pose_time = self.get_clock().now().nanoseconds * 1e-9
 
     def depth_mon_cb(self, msg):
@@ -418,6 +451,11 @@ class ShelfWorkflowNode(Node):
         self._executor_state = int(msg.data)
         self._executor_state_time = self.get_clock().now().nanoseconds * 1e-9
 
+    def grasp_result_cb(self, msg):
+        self._last_grasp_result = int(msg.data)
+        self._last_grasp_result_time = (
+            self.get_clock().now().nanoseconds * 1e-9)
+
     def skip_align_cb(self, msg):
         del msg
         self._skip_align = True
@@ -445,6 +483,57 @@ class ShelfWorkflowNode(Node):
         elif state == self.IDLE:
             self._stop_depth_monitor()
 
+    def _target_plausible(self):
+        """抓取目标 z 合理性：相对点云桌面(aruco z) 在 [z_min, z_max] 上方。"""
+        if self._latest_grasp_pt is None:
+            return False
+        if self._table_z is None:
+            # 无桌面参考（如 skip_align 测试）时不按 z 过滤
+            return True
+        z = self._latest_grasp_pt[2]
+        return (self._table_z + self.target_z_min <= z
+                <= self._table_z + self.target_z_max)
+
+    def _enter_home_fail(self, reason):
+        """目标有效性不通过/抓取失败多次 → 回 home 位姿再回 IDLE。"""
+        self.get_logger().error(
+            f'{reason}; returning home (send /task_command to retry)')
+        self._ret_home_sent = False
+        self._ret_home_start = self.get_clock().now().nanoseconds * 1e-9
+        self._set_state(self.RETURN_HOME)
+
+    def _handle_grasp_failure(self, now):
+        """抓取失败（grasp_result=0）：若 executor 停在 WAIT_RELEASE（中途失败后
+        举着空爪回 home），先 release_force 让它回 IDLE；再等 IDLE 后重试或回 home。"""
+        if self._executor_state == self.EXECUTOR_WAIT_RELEASE:
+            if not self._release_force_sent:
+                self._release_force_sent = True
+                self.release_force_pub.publish(Empty())
+                self.get_logger().info(
+                    '[GRASP] failed grasp; release_force to idle')
+            return
+        if self._executor_state != self.EXECUTOR_IDLE:
+            # executor 还在回 home / 过渡中 → 等它回 IDLE
+            return
+        self._retry_detect(now, 'Grasp failed (no object / unreachable)')
+
+    def _retry_detect(self, now, reason):
+        """抓取尝试失败：若还有次数则回 WAIT_DETECT 等新目标，否则回 home。"""
+        self._grasp_retries += 1
+        if self._grasp_retries <= self.grasp_max_retries:
+            self.get_logger().warning(
+                f'{reason}; retry {self._grasp_retries}/'
+                f'{self.grasp_max_retries} — waiting for new target')
+            self._detect_start = now
+            self._settle_logged = False
+            self._detect_warn_logged = False
+            self._plausible_ticks = 0
+            self._implausible_logged = False
+            self._set_state(self.WAIT_DETECT)
+        else:
+            self._enter_home_fail(
+                '目标有效性不通过（多次抓取失败）')
+
     def _reset_cycle_vars(self):
         self._release_pending = False
         self._home_sent = False
@@ -463,6 +552,16 @@ class ShelfWorkflowNode(Node):
         self._grasp_fail_start = None
         self._state_log_time = 0.0
         self._busy_executor_logged = False
+        self._latest_grasp_pt = None
+        self._table_z = None
+        self._plausible_ticks = 0
+        self._implausible_logged = False
+        self._grasp_retries = 0
+        self._last_grasp_result = None
+        self._last_grasp_result_time = 0.0
+        self._release_force_sent = False
+        self._ret_home_sent = False
+        self._ret_home_start = 0.0
 
     def _layer_cfg(self, layer):
         for entry in self._cfg.get('layers', []):
@@ -632,6 +731,8 @@ class ShelfWorkflowNode(Node):
             1.0,
         ])
         a_base = (t_base_cam @ p_cam)[:3]
+        # aruco 平贴桌面 → 其 base z 即桌面参考高度（用于抓取目标 z 合理性校验）
+        self._table_z = float(a_base[2])
         cam0 = t_base_cam[:3, 3]
         d = a_base - cam0
         nd = float(np.linalg.norm(d))
@@ -897,24 +998,43 @@ class ShelfWorkflowNode(Node):
                 return
             fresh_box = now - self._last_box_time <= 6.0
             fresh_pose = now - self._last_grasp_pose_time <= 6.0
-            if fresh_box and fresh_pose and self._stable_ticks >= 2:
+            plausible = self._target_plausible()
+            if fresh_box and fresh_pose and plausible:
+                self._plausible_ticks += 1
+            else:
+                self._plausible_ticks = 0
+                if fresh_box and fresh_pose and not plausible \
+                        and not self._implausible_logged:
+                    self._implausible_logged = True
+                    self.get_logger().warning(
+                        f'[DETECT] implausible target z='
+                        f'{(self._latest_grasp_pt[2] if self._latest_grasp_pt else 0):.3f} '
+                        f'(table_z={self._table_z}); waiting for valid target')
+            if self._plausible_ticks >= 3:
                 self.get_logger().info(
-                    f'Target detected (stable x{self._stable_ticks}); '
+                    f'Target plausible (z within band, x{self._plausible_ticks}); '
                     'triggering grasp')
                 self._set_state(self.TRIGGER_GRASP)
-            elif (now - self._detect_start > self.detect_timeout
+                return
+            if (now - self._detect_start > self.detect_timeout
                     and not self._detect_warn_logged):
                 self.get_logger().warn(
                     f'No fresh yolo detection within '
                     f'{self.detect_timeout:.1f}s; object may be absent '
                     f'or out of view')
                 self._detect_warn_logged = True
+            if now - self._detect_start > self.detect_give_up_timeout:
+                self._enter_home_fail(
+                    '目标有效性不通过（等待超时）')
+                return
             return
 
         if self.state == self.TRIGGER_GRASP:
             self.grasp_start_pub.publish(Empty())
             self._grasp_trigger_time = now
             self._grasp_fail_start = None
+            self._last_grasp_result = None
+            self._release_force_sent = False
             self._state_log_time = 0.0
             self.get_logger().info('Published /manual_grasp_start')
             self._set_state(self.GRASPING)
@@ -922,24 +1042,24 @@ class ShelfWorkflowNode(Node):
 
         if self.state == self.GRASPING:
             if self._executor_state == self.EXECUTOR_WAIT_RELEASE:
+                # executor 到 WAIT_RELEASE：用 grasp_result 区分成功/失败
+                if (self._last_grasp_result is not None
+                        and self._last_grasp_result <= 0):
+                    # 0 = 未执行/中途失败（失败也会回 home 到 WAIT_RELEASE）→ 失败处理
+                    self._handle_grasp_failure(now)
+                    return
                 self.get_logger().info(
                     'Grasp complete; arm returned to initial position, '
                     'waiting for /release_command')
                 self._set_state(self.WAIT_RELEASE_CMD)
                 return
             self._log_executor_state(now)
-            if self._executor_state == self.EXECUTOR_IDLE:
-                if self._grasp_fail_start is None:
-                    self._grasp_fail_start = now
-                elif now - self._grasp_fail_start > self.grasp_fail_timeout:
-                    self.get_logger().error(
-                        'Grasp failed (executor back to IDLE); aborting '
-                        'task (send /task_command to retry)')
-                    self._reset_cycle_vars()
-                    self._set_state(self.IDLE)
-                    return
-            else:
-                self._grasp_fail_start = None
+            # grasp_result 0（校验不可达/前段失败）→ 失败处理
+            if (self._last_grasp_result is not None
+                    and self._last_grasp_result <= 0):
+                self._handle_grasp_failure(now)
+                return
+            # 未收到 grasp_result：executor 在校验(state 0)/执行中 → 继续等
             if now - self._grasp_trigger_time > self.grasp_give_up_timeout:
                 self.get_logger().error(
                     f'Grasp not finished within '
@@ -969,6 +1089,33 @@ class ShelfWorkflowNode(Node):
                     f'(send /task_command to retry)')
                 self._reset_cycle_vars()
                 self._set_state(self.IDLE)
+            return
+
+        if self.state == self.RETURN_HOME:
+            if self._executor_state != self.EXECUTOR_IDLE:
+                if now - self._ret_home_start > self.ret_home_exec_wait:
+                    self.get_logger().warning(
+                        'executor busy too long; forcing IDLE')
+                    self._reset_cycle_vars()
+                    self._set_state(self.IDLE)
+                return
+            if not self._ret_home_sent:
+                self.get_logger().info(
+                    'Returning home before entering IDLE')
+                self.arm.move_to_joints(
+                    self.home_joints,
+                    velocity_scaling=self.velocity_scaling)
+                self._ret_home_sent = True
+                return
+            if not self.arm.is_done():
+                if now - self._ret_home_start > self.ret_home_timeout:
+                    self.get_logger().warning(
+                        'home return timeout; forcing IDLE')
+                    self._reset_cycle_vars()
+                    self._set_state(self.IDLE)
+                return
+            self._reset_cycle_vars()
+            self._set_state(self.IDLE)
             return
 
     def _fire_release(self):
