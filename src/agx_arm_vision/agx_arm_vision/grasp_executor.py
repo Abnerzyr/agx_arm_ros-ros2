@@ -46,7 +46,7 @@ class GraspExecutor(Node):
         self.declare_parameter('require_target_box', True)
         self.declare_parameter('box_wait_timeout', 1.0)
         self.declare_parameter('force_threshold', 0.5)
-        self.declare_parameter('reach_tolerance', 0.03)
+        self.declare_parameter('reach_tolerance', 0.01)
         self.declare_parameter('reach_timeout', 45.0)
         self.declare_parameter('pre_approach_distance', 0.10)
         self.declare_parameter('velocity_scaling', 0.1)
@@ -176,6 +176,8 @@ class GraspExecutor(Node):
         self.home_start_time = 0.0
         self.stored_pose = None
         self.stored_frame = None
+        self._grasp_cmd = None
+        self._grasp_cmd_time = 0.0
         self._latest_box = None
         self._table_height = None
         self._table_height_time = 0.0
@@ -229,6 +231,8 @@ class GraspExecutor(Node):
             Bool, 'place_update_enable', 10)
         self.grasp_result_pub = self.create_publisher(
             Int32, 'grasp_result', 10)
+        self.grasp_display_pub = self.create_publisher(
+            PoseStamped, 'grasp_pose_display', 10)
         self._grasp_result_published = False
         self._grasp_only_drop = False
 
@@ -247,6 +251,8 @@ class GraspExecutor(Node):
             QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT))
         self.create_subscription(
             EmptyMsg, 'manual_grasp_start', self.manual_start_cb, 10)
+        self.create_subscription(
+            PoseStamped, 'grasp_target_cmd', self._grasp_cmd_cb, 10)
         self.create_subscription(
             EmptyMsg, 'manual_release', self.manual_release_cb, 10)
         self.create_subscription(
@@ -392,11 +398,27 @@ class GraspExecutor(Node):
             orientation=Quaternion(x=q.x, y=q.y, z=q.z, w=q.w),
         )
 
+    def _grasp_cmd_cb(self, msg):
+        """workflow 确认下发的抓取位姿（Fix A：消除触发时锁到漂移 pose）。"""
+        self._grasp_cmd = msg
+        self._grasp_cmd_time = self.get_clock().now().nanoseconds * 1e-9
+
     def manual_start_cb(self, msg):
         del msg
-        if self.state != self.IDLE or self.stored_pose is None:
+        if self.state != self.IDLE:
             self.get_logger().warning(
                 'Not ready for manual grasp start')
+            return
+        # Fix A: 用 workflow 确认下发的抓取位姿（若新鲜），消除触发时锁到漂移 pose
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if (self._grasp_cmd is not None
+                and self._grasp_cmd_time > 0.0
+                and now - self._grasp_cmd_time <= 2.0):
+            self._store_pose(
+                self._grasp_cmd.pose, self._grasp_cmd.header.frame_id)
+        if self.stored_pose is None:
+            self.get_logger().warning(
+                'Not ready for manual grasp start (no pose)')
             return
         self.target_pose = self.stored_pose
         self.target_frame = self.stored_frame
@@ -516,6 +538,12 @@ class GraspExecutor(Node):
             and not self._place_rebuild_done
             and not self._place_validation_sent)
         self.place_update_pub.publish(place_update)
+        if self.stored_pose is not None:
+            display = PoseStamped()
+            display.header.frame_id = self.stored_frame
+            display.header.stamp = self.get_clock().now().to_msg()
+            display.pose = self.stored_pose
+            self.grasp_display_pub.publish(display)
 
         if self.state == self.IDLE and self.validating_target:
             if not self._box_applied:

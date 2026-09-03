@@ -11,7 +11,7 @@ class GraspTargetMarker(Node):
     def __init__(self):
         super().__init__('grasp_target_marker')
         self.create_subscription(
-            PoseStamped, 'grasp_pose', self.pose_callback, 10)
+            PoseStamped, 'grasp_pose_display', self.pose_callback, 10)
         self.marker_pub = self.create_publisher(
             Marker, 'grasp_target_marker', 10)
         self.get_logger().info('Grasp target marker ready')

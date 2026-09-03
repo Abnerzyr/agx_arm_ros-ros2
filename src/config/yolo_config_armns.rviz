@@ -246,7 +246,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: grasp_pose
+        Value: grasp_pose_display
       Value: true
     - Class: rviz_default_plugins/Marker
       Enabled: true

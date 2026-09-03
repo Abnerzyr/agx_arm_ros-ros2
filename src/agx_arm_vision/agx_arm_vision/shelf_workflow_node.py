@@ -176,6 +176,8 @@ class ShelfWorkflowNode(Node):
 
         self.grasp_start_pub = self.create_publisher(
             Empty, 'manual_grasp_start', 10)
+        self.grasp_cmd_pub = self.create_publisher(
+            PoseStamped, 'grasp_target_cmd', 10)
         self.release_pub = self.create_publisher(
             Empty, 'manual_release', 10)
         self.release_force_pub = self.create_publisher(
@@ -251,6 +253,7 @@ class ShelfWorkflowNode(Node):
         self._joint_stable = False
         self._align_stable_logged = 0.0
         self._latest_grasp_pt = None
+        self._latest_grasp_pose = None
         self._table_z = None
         self._plausible_ticks = 0
         self._implausible_logged = False
@@ -353,6 +356,7 @@ class ShelfWorkflowNode(Node):
         self._latest_grasp_pt = (
             float(msg.pose.position.x), float(msg.pose.position.y),
             float(msg.pose.position.z))
+        self._latest_grasp_pose = msg
         self._last_grasp_pose_time = self.get_clock().now().nanoseconds * 1e-9
 
     def depth_mon_cb(self, msg):
@@ -553,6 +557,7 @@ class ShelfWorkflowNode(Node):
         self._state_log_time = 0.0
         self._busy_executor_logged = False
         self._latest_grasp_pt = None
+        self._latest_grasp_pose = None
         self._table_z = None
         self._plausible_ticks = 0
         self._implausible_logged = False
@@ -1030,6 +1035,9 @@ class ShelfWorkflowNode(Node):
             return
 
         if self.state == self.TRIGGER_GRASP:
+            # Fix A: 先把"确认的抓取位姿"发给 executor（防触发时锁到漂移 pose），再触发
+            if self._latest_grasp_pose is not None:
+                self.grasp_cmd_pub.publish(self._latest_grasp_pose)
             self.grasp_start_pub.publish(Empty())
             self._grasp_trigger_time = now
             self._grasp_fail_start = None
