@@ -60,7 +60,7 @@ class GraspExecutor(Node):
         self.declare_parameter(
             'place_filtered_cloud_topic', 'place_filtered_cloud')
         self.declare_parameter('place_z_clearance', 0.05)
-        self.declare_parameter('place_z_margin', 0.02)
+        self.declare_parameter('place_z_margin', 0.015)
         self.declare_parameter('place_pose_timeout', 30.0)
         self.declare_parameter('place_lower_timeout', 20.0)
         self.declare_parameter('place_max_retries', 5)
@@ -78,6 +78,11 @@ class GraspExecutor(Node):
         self.declare_parameter('lift_hold_time', 2.0)
         self.declare_parameter('slip_width_tol', 0.008)
         self.declare_parameter('lift_slip_ticks', 3)
+        # 进场/抬升/放置策略: 1=一次到位(OMPL 直达), 0=旧 two-hop/cartesian 两步
+        self.declare_parameter('grasp_approach', 1)
+        self.declare_parameter('lift_approach', 1)
+        # place_approach: 1=放置下降一步直达 home->target、回升直接回 home
+        self.declare_parameter('place_approach', 1)
 
         self.base_link = self.get_parameter('base_link').value
         self.end_effector = self.get_parameter('end_effector_link').value
@@ -132,6 +137,12 @@ class GraspExecutor(Node):
             self.get_parameter('slip_width_tol').value)
         self.lift_slip_ticks = int(
             self.get_parameter('lift_slip_ticks').value)
+        self.grasp_approach = int(self.get_parameter(
+            'grasp_approach').value)
+        self.lift_approach = int(self.get_parameter(
+            'lift_approach').value)
+        self.place_approach = int(self.get_parameter(
+            'place_approach').value)
         self.arm = MoveIt2(
             node=self,
             base_link=self.base_link,
@@ -704,23 +715,32 @@ class GraspExecutor(Node):
                     return
                 self._approach_phase = 0
                 self._mark('plan_sent')
-                self.arm.move_to_pose(
-                    self.target_hover_pose, self.target_frame,
-                    velocity_scaling=self.velocity_scaling)
+                if self.grasp_approach == 1:
+                    # 一次到位: OMPL 直接规划到最终抓取位姿（保留盒，validation 已证明可达）
+                    self._approach_phase = 2
+                    self.arm.move_to_pose(
+                        self.target_pose, self.target_frame,
+                        velocity_scaling=self.velocity_scaling)
+                else:
+                    # 旧两步: 先到 hover 上方，再 cartesian 直线下降
+                    self.arm.move_to_pose(
+                        self.target_hover_pose, self.target_frame,
+                        velocity_scaling=self.velocity_scaling)
                 self.triggered = True
             elif self.arm.is_done():
                 if not self.arm.success:
                     self._mark('plan_failed')
                     self._publish_grasp_result(0)
-                    self.get_logger().error('Arm motion to hover failed')
-                    self._enter_home()
+                    self._abort_grasp_in_place(
+                        'Arm motion to target failed (approach='
+                        f'{self.grasp_approach})')
                     return
                 if self._approach_phase == 0:
                     self._approach_phase = 1
                     self._mark('cartesian_sent')
                     self.arm.move_cartesian_to(
                         [self.target_pose], self.target_frame)
-                elif self._approach_phase == 1:
+                elif self._approach_phase in (1, 2):
                     if self.arm.success:
                         self._mark('plan_done')
                         self.state = self.WAIT_REACH
@@ -730,9 +750,7 @@ class GraspExecutor(Node):
                     else:
                         self._mark('plan_failed')
                         self._publish_grasp_result(0)
-                        self.get_logger().error(
-                            'Cartesian descent failed; going home')
-                        self._enter_home()
+                        self._abort_grasp_in_place('Approach failed')
             return
         if self.state == self.WAIT_REACH:
             elapsed = (
@@ -754,10 +772,9 @@ class GraspExecutor(Node):
                 return
             if elapsed > self.reach_timeout:
                 self._publish_grasp_result(0)
-                self.get_logger().warning(
+                self._abort_grasp_in_place(
                     f'TCP reach timeout ({self.reach_timeout:.1f}s), '
                     f'error={error}')
-                self._enter_home()
             return
         if self.state == self.CLOSE_GRIPPER:
             if not self.triggered:
@@ -819,11 +836,18 @@ class GraspExecutor(Node):
                     orientation=self.target_pose.orientation)
                 self._lift_phase = 1
                 self._mark('lift_sent')
-                self.arm.move_cartesian_to(
-                    [lift_pose], self.target_frame)
+                if self.lift_approach == 1:
+                    # 一次到位抬升: OMPL 直接规划到目标上方 lift_pose
+                    self.arm.move_to_pose(
+                        lift_pose, self.target_frame,
+                        velocity_scaling=self.velocity_scaling)
+                else:
+                    self.arm.move_cartesian_to(
+                        [lift_pose], self.target_frame)
                 self.get_logger().info(
                     f'Lift-verify: moving up '
-                    f'{self.lift_distance:.2f} m')
+                    f'{self.lift_distance:.2f} m (approach='
+                    f'{self.lift_approach})')
                 return
             if self._lift_phase == 1:
                 if self._lift_slip():
@@ -991,8 +1015,13 @@ class GraspExecutor(Node):
                 if self.arm.success:
                     self._mark('place_validate_done')
                     self.get_logger().info(
-                        'Place point reachable; starting place sequence')
-                    self.state = self.MOVE_TO_PLACE_ABOVE
+                        'Place point reachable; starting place sequence '
+                        f'(place_approach={self.place_approach})')
+                    if self.place_approach == 1:
+                        # 一步直达：跳过 place_above，直接下降到放置点
+                        self.state = self.LOWER_TO_PLACE
+                    else:
+                        self.state = self.MOVE_TO_PLACE_ABOVE
                     self.triggered = False
                 else:
                     self._mark('place_validate_failed')
@@ -1023,6 +1052,10 @@ class GraspExecutor(Node):
                     self._log_stable_wait()
                     return
                 self._mark('place_lower_sent')
+                if self.place_approach == 1:
+                    self.get_logger().info(
+                        'Lowering to place point directly '
+                        f'(place_approach=1)')
                 self.arm.move_to_pose(
                     self._place_target_pose, self._place_frame,
                     velocity_scaling=self.velocity_scaling,
@@ -1071,6 +1104,14 @@ class GraspExecutor(Node):
             return
         if self.state == self.PLACE_LIFT:
             if not self.triggered:
+                if self.place_approach == 1:
+                    # 回升一步直达：不抬到 place_above，直接规划回 home
+                    self.get_logger().info(
+                        'Lift after place (place_approach=1): '
+                        'returning home directly')
+                    self._place_cycle_home = True
+                    self._enter_home()
+                    return
                 self.arm.move_to_pose(
                     self._place_above_pose, self._place_frame,
                     velocity_scaling=self.velocity_scaling)
@@ -1112,6 +1153,19 @@ class GraspExecutor(Node):
         self.triggered = False
         self._home_clear_waited = False
         self._home_clear_start = 0.0
+
+    def _abort_grasp_in_place(self, reason):
+        """还没夹到就失败（接近规划失败/到位超时）：不强制回 home，
+        清盒后原地 IDLE，由 workflow 依据 aruco 决定原地重对准或回 home 重试。"""
+        self.get_logger().warning(
+            f'{reason}; staying in place for re-align')
+        self.target_pose = None
+        self.target_frame = None
+        self.target_hover_pose = None
+        self.validating_target = False
+        self.triggered = False
+        self._fire_box_remove()
+        self.state = self.IDLE
 
     def _place_fail_retry(self, failed_state):
         """放回某步失败：重试（清 octomap→重建→重发该步）或用尽后回家等人工。"""

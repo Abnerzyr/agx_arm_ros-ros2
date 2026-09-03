@@ -263,6 +263,7 @@ class ShelfWorkflowNode(Node):
         self._release_force_sent = False
         self._ret_home_sent = False
         self._ret_home_start = 0.0
+        self._auto_retry_home = False
         self._grasp_trigger_time = 0.0
         self._grasp_fail_start = None
         self._place_start = 0.0
@@ -506,6 +507,26 @@ class ShelfWorkflowNode(Node):
         self._ret_home_start = self.get_clock().now().nanoseconds * 1e-9
         self._set_state(self.RETURN_HOME)
 
+    def _no_aruco_fallback(self, now):
+        """对准找不到 aruco：预算内 → 回 home 后自动重跑完整流程；否则停。"""
+        self._grasp_retries += 1
+        if self._grasp_retries <= self.grasp_max_retries:
+            self.get_logger().warning(
+                f'No aruco marker for {self.align_give_up_timeout:.0f}s; '
+                f'retry {self._grasp_retries}/{self.grasp_max_retries} — '
+                f'returning home, then re-running the full task flow')
+            self._auto_retry_home = True
+            self._ret_home_sent = False
+            self._ret_home_start = now
+            self._set_state(self.RETURN_HOME)
+        else:
+            self.get_logger().error(
+                f'No aruco marker after '
+                f'{self.grasp_max_retries} retries; aborting task '
+                f'(back to IDLE, send /task_command to retry)')
+            self._reset_cycle_vars()
+            self._set_state(self.IDLE)
+
     def _handle_grasp_failure(self, now):
         """抓取失败（grasp_result=0）：若 executor 停在 WAIT_RELEASE（中途失败后
         举着空爪回 home），先 release_force 让它回 IDLE；再等 IDLE 后重试或回 home。"""
@@ -522,13 +543,13 @@ class ShelfWorkflowNode(Node):
         self._retry_detect(now, 'Grasp failed (no object / unreachable)')
 
     def _retry_detect(self, now, reason):
-        """抓取尝试失败：若还有次数则回 home(executor 已回初始位)后重跑完整流程
-        （重新对准 ALIGN → 再尝试夹取）；否则放弃回 home。"""
+        """一轮失败（抓取失败/检测超时）：若还有次数则回 home(executor 已回初始位)
+        后重跑完整流程（重新对准 ALIGN → 再检测/尝试夹取）；否则放弃回 home。"""
         self._grasp_retries += 1
         if self._grasp_retries <= self.grasp_max_retries:
             self.get_logger().warning(
                 f'{reason}; retry {self._grasp_retries}/'
-                f'{self.grasp_max_retries} — re-aligning, then retrying grasp')
+                f'{self.grasp_max_retries} — re-aligning, then retrying the cycle')
             self._detect_start = now
             self._detect_warn_logged = False
             self._plausible_ticks = 0
@@ -540,7 +561,7 @@ class ShelfWorkflowNode(Node):
             self._set_state(self.ALIGN)
         else:
             self._enter_home_fail(
-                '目标有效性不通过（多次抓取失败）')
+                '目标有效性不通过（多次失败）')
 
     def _reset_cycle_vars(self):
         self._release_pending = False
@@ -571,6 +592,7 @@ class ShelfWorkflowNode(Node):
         self._release_force_sent = False
         self._ret_home_sent = False
         self._ret_home_start = 0.0
+        self._auto_retry_home = False
 
     def _layer_cfg(self, layer):
         for entry in self._cfg.get('layers', []):
@@ -930,12 +952,7 @@ class ShelfWorkflowNode(Node):
                         f'pose (check shelf_x/standoff or intervene)')
                     self._align_no_marker_logged = True
                 if now - self._align_start > self.align_give_up_timeout:
-                    self.get_logger().error(
-                        f'No aruco marker for '
-                        f'{self.align_give_up_timeout:.0f}s; aborting task '
-                        f'(back to IDLE, send /task_command to retry)')
-                    self._reset_cycle_vars()
-                    self._set_state(self.IDLE)
+                    self._no_aruco_fallback(now)
                 return
             self._align_no_marker_logged = False
             self._align_start = now
@@ -1033,8 +1050,7 @@ class ShelfWorkflowNode(Node):
                     f'or out of view')
                 self._detect_warn_logged = True
             if now - self._detect_start > self.detect_give_up_timeout:
-                self._enter_home_fail(
-                    '目标有效性不通过（等待超时）')
+                self._retry_detect(now, '目标有效性不通过（等待超时）')
                 return
             return
 
@@ -1126,8 +1142,34 @@ class ShelfWorkflowNode(Node):
                     self._reset_cycle_vars()
                     self._set_state(self.IDLE)
                 return
+            retry_home = self._auto_retry_home
+            self._auto_retry_home = False
+            saved_retries = self._grasp_retries
             self._reset_cycle_vars()
-            self._set_state(self.IDLE)
+            if retry_home:
+                # 无 aruco 回退：回 home 后自动重跑完整流程（保留重试计数）
+                self._grasp_retries = saved_retries
+                now_s = self.get_clock().now().nanoseconds * 1e-9
+                if self._skip_align:
+                    self._detect_start = now_s
+                    self._detect_warn_logged = False
+                    self.get_logger().info(
+                        '[TEST] skip_align: entering WAIT_DETECT (auto-retry)')
+                    self._set_state(self.WAIT_DETECT)
+                elif self.skip_nominal:
+                    self._align_start = now_s
+                    self._align_iter = 0
+                    self._align_sent = False
+                    self._align_no_marker_logged = False
+                    self.get_logger().info(
+                        '[TEST] skip_nominal: entering ALIGN (auto-retry)')
+                    self._set_state(self.ALIGN)
+                else:
+                    self.get_logger().info(
+                        'Auto-retry: moving to nominal pose')
+                    self._set_state(self.NOMINAL_POSE)
+            else:
+                self._set_state(self.IDLE)
             return
 
     def _fire_release(self):
