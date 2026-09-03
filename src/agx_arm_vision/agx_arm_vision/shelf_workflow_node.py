@@ -92,7 +92,7 @@ class ShelfWorkflowNode(Node):
         self.declare_parameter('place_give_up_timeout', 90.0)
         self.declare_parameter('detect_timeout', 5.0)
         self.declare_parameter('detect_give_up_timeout', 15.0)
-        self.declare_parameter('grasp_max_retries', 2)
+        self.declare_parameter('grasp_max_retries', 3)
         self.declare_parameter('target_z_min', 0.01)
         self.declare_parameter('target_z_max', 0.35)
         self.declare_parameter('ret_home_timeout', 90.0)
@@ -522,18 +522,22 @@ class ShelfWorkflowNode(Node):
         self._retry_detect(now, 'Grasp failed (no object / unreachable)')
 
     def _retry_detect(self, now, reason):
-        """抓取尝试失败：若还有次数则回 WAIT_DETECT 等新目标，否则回 home。"""
+        """抓取尝试失败：若还有次数则回 home(executor 已回初始位)后重跑完整流程
+        （重新对准 ALIGN → 再尝试夹取）；否则放弃回 home。"""
         self._grasp_retries += 1
         if self._grasp_retries <= self.grasp_max_retries:
             self.get_logger().warning(
                 f'{reason}; retry {self._grasp_retries}/'
-                f'{self.grasp_max_retries} — waiting for new target')
+                f'{self.grasp_max_retries} — re-aligning, then retrying grasp')
             self._detect_start = now
-            self._settle_logged = False
             self._detect_warn_logged = False
             self._plausible_ticks = 0
             self._implausible_logged = False
-            self._set_state(self.WAIT_DETECT)
+            self._align_start = now
+            self._align_iter = 0
+            self._align_sent = False
+            self._align_no_marker_logged = False
+            self._set_state(self.ALIGN)
         else:
             self._enter_home_fail(
                 '目标有效性不通过（多次抓取失败）')

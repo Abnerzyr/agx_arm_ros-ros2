@@ -60,7 +60,7 @@ class GraspExecutor(Node):
         self.declare_parameter(
             'place_filtered_cloud_topic', 'place_filtered_cloud')
         self.declare_parameter('place_z_clearance', 0.05)
-        self.declare_parameter('place_z_margin', 0.01)
+        self.declare_parameter('place_z_margin', 0.02)
         self.declare_parameter('place_pose_timeout', 30.0)
         self.declare_parameter('place_lower_timeout', 20.0)
         self.declare_parameter('place_max_retries', 5)
@@ -179,9 +179,11 @@ class GraspExecutor(Node):
         self._grasp_cmd = None
         self._grasp_cmd_time = 0.0
         self._latest_box = None
+        self._latest_box_msg = None
         self._table_height = None
         self._table_height_time = 0.0
         self._latched_box = None
+        self._latched_box_msg = None
         self._pending_pose = None
         self._pending_time = 0.0
         self._clear_client = self.create_client(EmptySrv, 'clear_octomap')
@@ -233,6 +235,8 @@ class GraspExecutor(Node):
             Int32, 'grasp_result', 10)
         self.grasp_display_pub = self.create_publisher(
             PoseStamped, 'grasp_pose_display', 10)
+        self.box_display_pub = self.create_publisher(
+            Marker, 'target_box_display', 10)
         self._grasp_result_published = False
         self._grasp_only_drop = False
 
@@ -305,6 +309,7 @@ class GraspExecutor(Node):
         }
         self._latest_box = (
             self.get_clock().now().nanoseconds * 1e-9, box)
+        self._latest_box_msg = msg
 
     def table_height_cb(self, msg):
         self._table_height = float(msg.data)
@@ -343,6 +348,7 @@ class GraspExecutor(Node):
             self._pending_time = now
             return
         self._latched_box = box
+        self._latched_box_msg = self._latest_box_msg
         self._store_pose(msg.pose, msg.header.frame_id)
 
     def _store_pose(self, pose, frame_id):
@@ -544,6 +550,8 @@ class GraspExecutor(Node):
             display.header.stamp = self.get_clock().now().to_msg()
             display.pose = self.stored_pose
             self.grasp_display_pub.publish(display)
+        if self._latched_box_msg is not None:
+            self.box_display_pub.publish(self._latched_box_msg)
 
         if self.state == self.IDLE and self.validating_target:
             if not self._box_applied:
@@ -660,6 +668,7 @@ class GraspExecutor(Node):
                         and now_pending - self._latest_box[0]
                         <= self.BOX_PAIR_WINDOW):
                     self._latched_box = self._latest_box[1]
+                    self._latched_box_msg = self._latest_box_msg
                     self._store_pose(
                         self._pending_pose.pose,
                         self._pending_pose.header.frame_id)
@@ -783,6 +792,7 @@ class GraspExecutor(Node):
                             'Grasp sequence completed '
                             '(object held)')
                         self._latched_box = None
+                        self._latched_box_msg = None
                     else:
                         self._publish_grasp_result(1)
                         self.get_logger().info(
@@ -842,6 +852,7 @@ class GraspExecutor(Node):
                 self._mark('lift_done')
                 self._publish_grasp_result(2)
                 self._latched_box = None
+                self._latched_box_msg = None
                 self.get_logger().info(
                     'Grasp sequence completed '
                     '(object held, lift-verify)')
