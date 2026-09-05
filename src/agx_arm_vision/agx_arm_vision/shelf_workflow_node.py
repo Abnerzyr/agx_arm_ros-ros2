@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import json
 import os
 
 import numpy as np
@@ -10,7 +11,7 @@ from geometry_msgs.msg import Pose, PoseStamped
 from rclpy.node import Node
 from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import Image, JointState
-from std_msgs.msg import ColorRGBA, Empty, Header, Int32
+from std_msgs.msg import ColorRGBA, Empty, Header, Int32, String
 from tf2_ros import Buffer, TransformException, TransformListener
 from visualization_msgs.msg import Marker
 
@@ -62,6 +63,10 @@ class ShelfWorkflowNode(Node):
     EXECUTOR_IDLE = 0
     EXECUTOR_WAIT_RELEASE = 6
 
+    # grasp_result 语义（grasp_executor 发布）：
+    #   0 = 未执行/抓前失败, 1 = 执行但空抓, 2 = 已握持
+    GRASP_RESULT_HELD = 2
+
     ALIGN_DIST_EPS = 0.02#for test remember to change it back to 0.02!!!!在rviz测试时临时使用！！！
 
     # 精对准目标：aruco 距相机 align_dist 米、其中心投影到画面中心即成功。
@@ -109,6 +114,12 @@ class ShelfWorkflowNode(Node):
         self.declare_parameter(
             'home_joints',
             [-0.0259, -0.4025, -0.0575, 2.0, 0.0604, 0.0722, 0.9141])
+
+        # 车-臂上报协议（见仓库根目录 机械臂接口确认(1).md）
+        self.declare_parameter('report_topic', '/arm_task_report')
+        self.declare_parameter('report_interval', 3.0)     # STOW 周期上报 (s)
+        self.declare_parameter('stow_joint_tol', 0.12)     # STOW 关节 home 容差 (rad)
+        self.declare_parameter('task_watchdog', 75.0)      # 任务总时长上限 (s)
 
         config_file = self.get_parameter('config_file').value
         if not os.path.exists(config_file):
@@ -161,6 +172,14 @@ class ShelfWorkflowNode(Node):
             'marker_fresh_timeout').value
         self.home_joints = list(self.get_parameter('home_joints').value)
 
+        self.report_topic = self.get_parameter('report_topic').value
+        self._report_interval = float(
+            self.get_parameter('report_interval').value)
+        self._stow_joint_tol = float(
+            self.get_parameter('stow_joint_tol').value)
+        self._task_timeout = float(
+            self.get_parameter('task_watchdog').value)
+
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
@@ -184,6 +203,9 @@ class ShelfWorkflowNode(Node):
             Empty, 'manual_release_force', 10)
         self.align_target_pub = self.create_publisher(
             Marker, 'shelf/align_target', 10)
+        # 车-臂协议：完成/失败上报（绝对话题，勿加 /arm 前缀）
+        self.report_pub = self.create_publisher(
+            String, self.report_topic, 10)
 
         self.create_subscription(
             Int32, 'task_command', self.task_cmd_cb, 10)
@@ -271,7 +293,14 @@ class ShelfWorkflowNode(Node):
         self._busy_executor_logged = False
         self._home_quat = None
 
+        # 上报/任务 watchdog 状态
+        self._pending_report = None
+        self._task_active = False
+        self._task_kind = None
+        self._task_start = 0.0
+
         self.create_timer(0.1, self.tick)
+        self.create_timer(self._report_interval, self._stow_report_tick)
         self.get_logger().info(
             'Shelf workflow ready; waiting for /task_command (layer 1-3)')
 
@@ -297,6 +326,7 @@ class ShelfWorkflowNode(Node):
             f'Task received: layer={layer} aruco_id={cfg.get("aruco_id")} '
             f'layer_height={cfg.get("layer_height")} m')
         now = self.get_clock().now().nanoseconds * 1e-9
+        self._task_started('PICK')
         if self._skip_align:
             self._detect_start = now
             self._detect_warn_logged = False
@@ -499,14 +529,6 @@ class ShelfWorkflowNode(Node):
         return (self._table_z + self.target_z_min <= z
                 <= self._table_z + self.target_z_max)
 
-    def _enter_home_fail(self, reason):
-        """目标有效性不通过/抓取失败多次 → 回 home 位姿再回 IDLE。"""
-        self.get_logger().error(
-            f'{reason}; returning home (send /task_command to retry)')
-        self._ret_home_sent = False
-        self._ret_home_start = self.get_clock().now().nanoseconds * 1e-9
-        self._set_state(self.RETURN_HOME)
-
     def _no_aruco_fallback(self, now):
         """对准找不到 aruco：预算内 → 回 home 后自动重跑完整流程；否则停。"""
         self._grasp_retries += 1
@@ -523,9 +545,8 @@ class ShelfWorkflowNode(Node):
             self.get_logger().error(
                 f'No aruco marker after '
                 f'{self.grasp_max_retries} retries; aborting task '
-                f'(back to IDLE, send /task_command to retry)')
-            self._reset_cycle_vars()
-            self._set_state(self.IDLE)
+                f'(returning home)')
+            self._abort_task(3, 'no aruco marker found after retries')
 
     def _handle_grasp_failure(self, now):
         """抓取失败（grasp_result=0）：若 executor 停在 WAIT_RELEASE（中途失败后
@@ -540,9 +561,11 @@ class ShelfWorkflowNode(Node):
         if self._executor_state != self.EXECUTOR_IDLE:
             # executor 还在回 home / 过渡中 → 等它回 IDLE
             return
-        self._retry_detect(now, 'Grasp failed (no object / unreachable)')
+        self._retry_detect(
+            now, 'Grasp failed (no object / unreachable)',
+            5, 'grasp failed (empty or unreachable)')
 
-    def _retry_detect(self, now, reason):
+    def _retry_detect(self, now, reason, error_code, message):
         """一轮失败（抓取失败/检测超时）：若还有次数则回 home(executor 已回初始位)
         后重跑完整流程（重新对准 ALIGN → 再检测/尝试夹取）；否则放弃回 home。"""
         self._grasp_retries += 1
@@ -560,8 +583,7 @@ class ShelfWorkflowNode(Node):
             self._align_no_marker_logged = False
             self._set_state(self.ALIGN)
         else:
-            self._enter_home_fail(
-                '目标有效性不通过（多次失败）')
+            self._abort_task(error_code, message)
 
     def _reset_cycle_vars(self):
         self._release_pending = False
@@ -593,6 +615,79 @@ class ShelfWorkflowNode(Node):
         self._ret_home_sent = False
         self._ret_home_start = 0.0
         self._auto_retry_home = False
+
+    # ------------------------------------------------------------------
+    # 车-臂协议上报（/arm_task_report）
+    # ------------------------------------------------------------------
+    def _report(self, command, success, error_code, message):
+        """立即发布一条上报（绝对话题 /arm_task_report，std_msgs/String JSON）。"""
+        data = json.dumps({
+            'command': str(command),
+            'success': bool(success),
+            'error_code': int(error_code),
+            'message': str(message),
+        }, ensure_ascii=True)
+        msg = String()
+        msg.data = data
+        self.report_pub.publish(msg)
+        self.get_logger().info('[REPORT] %s' % data)
+
+    def _queue_report(self, command, success, error_code, message):
+        """缓存一条任务终态上报，等臂确认收回后再 flush（避免误报）。"""
+        self._pending_report = (str(command), bool(success),
+                                int(error_code), str(message))
+
+    def _flush_pending_report(self):
+        if self._pending_report is None:
+            return
+        command, success, error_code, message = self._pending_report
+        self._pending_report = None
+        self._report(command, success, error_code, message)
+
+    def _task_started(self, kind):
+        """标记活动任务开始（watchdog 计时起点），并丢弃陈旧终态。"""
+        self._task_kind = kind
+        self._task_active = True
+        self._task_start = self.get_clock().now().nanoseconds * 1e-9
+        self._pending_report = None
+
+    def _task_finished(self):
+        self._task_active = False
+        self._task_kind = None
+
+    def _arm_at_home(self):
+        """STOW 门控：executor IDLE 且关节实际停在 home 附近才算"可动"。"""
+        if self._executor_state is None \
+                or self._executor_state != self.EXECUTOR_IDLE:
+            return False
+        if self._joint_pos is None:
+            return False
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if now - self._joint_last_feedback > 1.0:
+            return False
+        err = max(abs(a - b) for a, b in
+                  zip(self._joint_pos, self.home_joints))
+        return err <= self._stow_joint_tol
+
+    def _stow_report_tick(self):
+        """周期上报 STOW（臂已收回、底盘可动），仅当 workflow IDLE 且臂在 home。"""
+        if self.state != self.IDLE:
+            return
+        if not self._arm_at_home():
+            return
+        self._report('STOW', True, 0, 'stowed (arm at home, chassis movable)')
+
+    def _abort_task(self, error_code, message, reason=''):
+        """任务失败收尾：记录终态上报，回到 home 后在 IDLE 出口 flush。"""
+        kind = self._task_kind if self._task_kind else 'PICK'
+        self.get_logger().error(
+            '%s%s; aborting task, returning home'
+            % (('%s; ' % reason) if reason else '', message))
+        self._queue_report(kind, False, error_code, message)
+        self._task_finished()
+        self._ret_home_sent = False
+        self._ret_home_start = self.get_clock().now().nanoseconds * 1e-9
+        self._set_state(self.RETURN_HOME)
 
     def _layer_cfg(self, layer):
         for entry in self._cfg.get('layers', []):
@@ -864,6 +959,21 @@ class ShelfWorkflowNode(Node):
 
         self._depth_monitor_tick(now)
 
+        # C: 任务总时长 watchdog —— 接近桥接 90s 上限前主动失败收臂，
+        #     避免臂还在跑、桥接已先判 TIMEOUT 的两侧失步。
+        #     例外：抓取结果已是"已握持"（仅剩回 home）时，让 GRASPING 正常收尾。
+        already_held = (
+            self.state == self.GRASPING
+            and self._last_grasp_result == self.GRASP_RESULT_HELD)
+        if (self._task_active
+                and self.state != self.RETURN_HOME
+                and not already_held
+                and now - self._task_start > self._task_timeout):
+            self._abort_task(
+                7, 'task total-time watchdog expired (%.0fs)'
+                % self._task_timeout)
+            return
+
         if self.state == self.NOMINAL_POSE:
             if self._executor_state != self.EXECUTOR_IDLE:
                 if not self._busy_executor_logged:
@@ -923,8 +1033,7 @@ class ShelfWorkflowNode(Node):
                     self.get_logger().error(
                         'Nominal move failed (nominal=home); '
                         'check home reachability')
-                self._reset_cycle_vars()
-                self._set_state(self.IDLE)
+                self._abort_task(9, 'nominal pose move failed')
             return
 
         if self.state == self.ALIGN:
@@ -1010,8 +1119,7 @@ class ShelfWorkflowNode(Node):
                     f'Align move failed; target tcp='
                     f'({p.x:.3f},{p.y:.3f},{p.z:.3f}). Send '
                     f'/task_command to retry')
-                self._reset_cycle_vars()
-                self._set_state(self.IDLE)
+                self._abort_task(9, 'align move failed')
             return
 
         if self.state == self.WAIT_DETECT:
@@ -1050,7 +1158,9 @@ class ShelfWorkflowNode(Node):
                     f'or out of view')
                 self._detect_warn_logged = True
             if now - self._detect_start > self.detect_give_up_timeout:
-                self._retry_detect(now, '目标有效性不通过（等待超时）')
+                self._retry_detect(
+                    now, '目标有效性不通过（等待超时）',
+                    3, 'no valid object detected')
                 return
             return
 
@@ -1070,31 +1180,32 @@ class ShelfWorkflowNode(Node):
 
         if self.state == self.GRASPING:
             if self._executor_state == self.EXECUTOR_WAIT_RELEASE:
-                # executor 到 WAIT_RELEASE：用 grasp_result 区分成功/失败
+                # executor 到 WAIT_RELEASE（已回 home）：仅 grasp_result==2 算成功
                 if (self._last_grasp_result is not None
-                        and self._last_grasp_result <= 0):
-                    # 0 = 未执行/中途失败（失败也会回 home 到 WAIT_RELEASE）→ 失败处理
+                        and self._last_grasp_result == self.GRASP_RESULT_HELD):
+                    self.get_logger().info(
+                        'Grasp complete (object held); arm returned home, '
+                        'waiting for /release_command')
+                    self._report('PICK', True, 0, 'grasped and stowed')
+                    self._task_finished()
+                    self._set_state(self.WAIT_RELEASE_CMD)
+                    return
+                if (self._last_grasp_result is not None
+                        and self._last_grasp_result < self.GRASP_RESULT_HELD):
+                    # 0 = 未执行/中途失败, 1 = 空抓 → 均按失败处理（重试）
                     self._handle_grasp_failure(now)
                     return
-                self.get_logger().info(
-                    'Grasp complete; arm returned to initial position, '
-                    'waiting for /release_command')
-                self._set_state(self.WAIT_RELEASE_CMD)
                 return
             self._log_executor_state(now)
-            # grasp_result 0（校验不可达/前段失败）→ 失败处理
+            # grasp_result 0/1（空抓或前段失败）→ 失败处理
             if (self._last_grasp_result is not None
-                    and self._last_grasp_result <= 0):
+                    and self._last_grasp_result < self.GRASP_RESULT_HELD):
                 self._handle_grasp_failure(now)
                 return
-            # 未收到 grasp_result：executor 在校验(state 0)/执行中 → 继续等
+            # 未收到成功结果：executor 在校验/执行/回 home → 继续等
             if now - self._grasp_trigger_time > self.grasp_give_up_timeout:
-                self.get_logger().error(
-                    f'Grasp not finished within '
-                    f'{self.grasp_give_up_timeout:.0f}s; aborting task '
-                    f'(send /task_command to retry)')
-                self._reset_cycle_vars()
-                self._set_state(self.IDLE)
+                self._abort_task(
+                    7, 'grasp not finished within give-up timeout')
             return
 
         if self.state == self.WAIT_RELEASE_CMD:
@@ -1104,19 +1215,26 @@ class ShelfWorkflowNode(Node):
 
         if self.state == self.PLACING:
             if self._executor_state == self.EXECUTOR_IDLE:
+                # executor 回 IDLE = 已放下且臂已回 home
                 self.get_logger().info(
                     'Place sequence finished; task complete, back to IDLE')
+                self._report('PLACE', True, 0, 'placed and stowed')
+                self._task_finished()
                 self._layer = None
                 self._set_state(self.IDLE)
                 return
             self._log_executor_state(now)
             if now - self._place_start > self.place_give_up_timeout:
-                self.get_logger().error(
-                    f'Place not finished within '
-                    f'{self.place_give_up_timeout:.0f}s; aborting task '
-                    f'(send /task_command to retry)')
-                self._reset_cycle_vars()
-                self._set_state(self.IDLE)
+                # 放置超时：先原地松爪让 executor 回 IDLE，再收臂上报失败
+                if not self._release_force_sent:
+                    self._release_force_sent = True
+                    self.release_force_pub.publish(Empty())
+                    self.get_logger().warning(
+                        'Place give-up: force-opening gripper before home')
+                if self._executor_state != self.EXECUTOR_IDLE:
+                    return
+                self._abort_task(
+                    7, 'place not finished within give-up timeout')
             return
 
         if self.state == self.RETURN_HOME:
@@ -1126,6 +1244,7 @@ class ShelfWorkflowNode(Node):
                         'executor busy too long; forcing IDLE')
                     self._reset_cycle_vars()
                     self._set_state(self.IDLE)
+                    self._flush_pending_report()
                 return
             if not self._ret_home_sent:
                 self.get_logger().info(
@@ -1141,6 +1260,7 @@ class ShelfWorkflowNode(Node):
                         'home return timeout; forcing IDLE')
                     self._reset_cycle_vars()
                     self._set_state(self.IDLE)
+                    self._flush_pending_report()
                 return
             retry_home = self._auto_retry_home
             self._auto_retry_home = False
@@ -1170,10 +1290,13 @@ class ShelfWorkflowNode(Node):
                     self._set_state(self.NOMINAL_POSE)
             else:
                 self._set_state(self.IDLE)
+                # 终态失败上报在此 flush（RETURN_HOME 已确认臂收回）
+                self._flush_pending_report()
             return
 
     def _fire_release(self):
         self._release_pending = False
+        self._task_started('PLACE')
         self.release_pub.publish(Empty())
         self._place_start = self.get_clock().now().nanoseconds * 1e-9
         self._state_log_time = 0.0
