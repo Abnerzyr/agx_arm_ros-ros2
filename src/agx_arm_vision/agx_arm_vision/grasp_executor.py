@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 
+import math
+
 import rclpy
 from geometry_msgs.msg import Point, Pose, PoseStamped, Quaternion
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import JointState, PointCloud2
-from std_msgs.msg import Bool, Float32, Int32
+from std_msgs.msg import Bool, Float32, Float64MultiArray, Int32
 from std_msgs.msg import Empty as EmptyMsg
 from std_srvs.srv import Empty as EmptySrv
 from tf2_ros import Buffer, TransformException, TransformListener
@@ -29,6 +31,7 @@ class GraspExecutor(Node):
     PLACE_OPEN = 9
     PLACE_LIFT = 10
     LIFT_VERIFY = 11
+    CARTESIAN_APPROACH = 12
 
     BOX_PAIR_WINDOW = 2.0
 
@@ -70,7 +73,7 @@ class GraspExecutor(Node):
             'constrain_orientation', True)
         self.declare_parameter(
             'home_joints',
-            [-0.0259, -0.4025, -0.0575, 2.0, 0.0604, 0.0722, 0.9141])
+            [1.5446, -0.4858, -0.006, 2.103, 0.004, 0.0208, 0.9801])
         self.declare_parameter('grasp_only', False)
         self.declare_parameter('test_flow', False)
         self.declare_parameter('lift_verify', True)
@@ -83,6 +86,12 @@ class GraspExecutor(Node):
         self.declare_parameter('lift_approach', 1)
         # place_approach: 1=放置下降一步直达 home->target、回升直接回 home
         self.declare_parameter('place_approach', 1)
+        # 直线接近(硬编码精对准模式): 收到 grasp 指令后按笛卡尔直线水平移到目标 x/y，
+        # z 与姿态取当前(精对准位)；avoid_collisions=False；只校验 base_link 下 x/y。
+        self.declare_parameter('direct_line_approach', True)
+        self.declare_parameter('direct_xy_tol', 0.02)
+        self.declare_parameter('direct_line_max_step', 0.005)
+        self.declare_parameter('direct_reach_timeout', 30.0)
 
         self.base_link = self.get_parameter('base_link').value
         self.end_effector = self.get_parameter('end_effector_link').value
@@ -143,6 +152,14 @@ class GraspExecutor(Node):
             'lift_approach').value)
         self.place_approach = int(self.get_parameter(
             'place_approach').value)
+        self.direct_line_approach = bool(
+            self.get_parameter('direct_line_approach').value)
+        self.direct_xy_tol = float(
+            self.get_parameter('direct_xy_tol').value)
+        self.direct_line_max_step = float(
+            self.get_parameter('direct_line_max_step').value)
+        self.direct_reach_timeout = float(
+            self.get_parameter('direct_reach_timeout').value)
         self.arm = MoveIt2(
             node=self,
             base_link=self.base_link,
@@ -250,6 +267,17 @@ class GraspExecutor(Node):
             Marker, 'target_box_display', 10)
         self._grasp_result_published = False
         self._grasp_only_drop = False
+        self._direct_phase = 0
+        self._direct_xy_ok = 0
+        self._direct_move_sent = False
+        self._direct_ompl_sent = False
+        self._direct_clear_waited = False
+        self._direct_end_pose = None
+        self._direct_start = 0.0
+        self._retract_joints = []      # 分级回退关节组：精对准位→粗对准位（由 workflow 下发）
+        self._home_targets = None
+        self._home_step = 0
+        self._approach_z_raise = 0.0   # 直线接近终点 z 抬升量（workflow 按层下发）
 
         self.create_subscription(
             PoseStamped, 'grasp_pose', self.grasp_callback, 10)
@@ -273,6 +301,12 @@ class GraspExecutor(Node):
         self.create_subscription(
             EmptyMsg, 'manual_release_force',
             self.manual_release_force_cb, 10)
+        self.create_subscription(
+            Float64MultiArray, 'grasp_retract_path',
+            self.retract_path_cb, 10)
+        self.create_subscription(
+            Float32, 'grasp_approach_z_raise',
+            self.approach_z_raise_cb, 10)
         self.create_subscription(
             PoseStamped, self.place_pose_topic,
             self.place_pose_callback, 10)
@@ -420,6 +454,22 @@ class GraspExecutor(Node):
         self._grasp_cmd = msg
         self._grasp_cmd_time = self.get_clock().now().nanoseconds * 1e-9
 
+    def approach_z_raise_cb(self, msg):
+        self._approach_z_raise = float(msg.data)
+        self.get_logger().info(
+            'Approach z raise updated: %.3f m' % self._approach_z_raise)
+
+    def retract_path_cb(self, msg):
+        """接收分级回退关节组（workflow 下发：精对准位→粗对准位）。"""
+        data = list(msg.data)
+        joints = []
+        n = len(data) - (len(data) % 7)
+        for i in range(0, n, 7):
+            joints.append([float(x) for x in data[i:i + 7]])
+        self._retract_joints = joints
+        self.get_logger().info(
+            'Retract path updated: %d staged joint set(s)' % len(joints))
+
     def manual_start_cb(self, msg):
         del msg
         if self.state != self.IDLE:
@@ -461,11 +511,31 @@ class GraspExecutor(Node):
         self._grasp_result_published = False
         self._grasp_only_drop = False
         self._auto_release_sent = False
+        self._home_targets = None
+        self._home_step = 0
         p = self.target_pose.position
         self._t_trigger = self.get_clock().now().nanoseconds * 1e-9
         self._last_mark = self._t_trigger
         self._timing = {}
         self._mark('trigger')
+        if self.direct_line_approach:
+            # 直线接近模式：跳过 OMPL 验证/两步接近，改走笛卡尔水平直线。
+            self.validating_target = False
+            self._direct_phase = 0
+            self._direct_xy_ok = 0
+            self._direct_move_sent = False
+            self._direct_ompl_sent = False
+            self._direct_clear_waited = False
+            self._approach_z_raise = 0.0
+            self._direct_end_pose = None
+            self._direct_start = self._t_trigger
+            self.state = self.CARTESIAN_APPROACH
+            self.triggered = False
+            self.get_logger().info(
+                f'Direct-line grasp triggered: target xy='
+                f'({p.x:.3f},{p.y:.3f}), z/pose taken from current '
+                f'(fine-align) pose')
+            return
         self.get_logger().info(
             f'Manual grasp triggered, validating: '
             f'({p.x:.3f}, {p.y:.3f}, {p.z:.3f})')
@@ -882,7 +952,148 @@ class GraspExecutor(Node):
                     '(object held, lift-verify)')
                 self._finish_lift_verify()
             return
+
+        if self.state == self.CARTESIAN_APPROACH:
+            now_a = self.get_clock().now().nanoseconds * 1e-9
+            if self._direct_phase == 0:
+                # 张开夹爪
+                if not self.triggered:
+                    self.gripper.open()
+                    self.triggered = True
+                    return
+                if not self.gripper.done:
+                    return
+                self.triggered = False
+                self._direct_phase = 1
+                self._direct_start = now_a
+                self._call_clear(verbose=False)
+                return
+            if self._direct_phase == 1:
+                # 等 octomap clear 完成（更新图，不阻塞太久）
+                if self._clear_pending:
+                    if now_a - self._direct_start > 5.0:
+                        self._clear_pending = False
+                    else:
+                        return
+                self._direct_phase = 2
+                self._direct_start = now_a
+                return
+            if self._direct_phase == 2:
+                # 读取当前 tcp（=精对准位）姿态与 z；终点仅替换 x/y 为目标中心
+                if not self._joints_stable():
+                    if now_a - self._direct_start > 5.0:
+                        self.get_logger().warn(
+                            'direct-line: joints not stable; proceeding')
+                    else:
+                        return
+                try:
+                    t = self.tf_buffer.lookup_transform(
+                        self.base_link, self.end_effector,
+                        rclpy.time.Time(),
+                        timeout=rclpy.duration.Duration(seconds=1.0))
+                except TransformException:
+                    self.get_logger().error(
+                        'TCP pose lookup failed (direct line)')
+                    self._publish_grasp_result(0)
+                    self._enter_home()
+                    return
+                cur = t.transform
+                end = Pose()
+                end.position.x = self.target_pose.position.x
+                end.position.y = self.target_pose.position.y
+                end.position.z = cur.translation.z + self._approach_z_raise
+                end.orientation = cur.rotation
+                self._direct_end_pose = end
+                self.target_frame = self.base_link
+                self._direct_phase = 3
+                self._direct_start = now_a
+                self._direct_xy_ok = 0
+                return
+            if self._direct_phase == 3:
+                # 笛卡尔水平直线接近（z=精对准位 z，仅位置到目标 x/y）
+                if not self._direct_move_sent:
+                    ep = self._direct_end_pose
+                    self.get_logger().info(
+                        f'Cartesian direct-line approach: target xy='
+                        f'({ep.position.x:.3f},{ep.position.y:.3f}) '
+                        f'z={ep.position.z:.3f} (keep)')
+                    self.arm.move_cartesian_to(
+                        [ep], self.base_link,
+                        max_step=self.direct_line_max_step,
+                        avoid_collisions=False)
+                    self._direct_move_sent = True
+                    return
+                if not self.arm.is_done():
+                    if now_a - self._direct_start > self.direct_reach_timeout:
+                        self.get_logger().warning(
+                            'Direct-line move timeout; aborting')
+                        self._publish_grasp_result(0)
+                        self._direct_move_sent = False
+                        self._enter_home()
+                    return
+                self._direct_move_sent = False
+                if not self.arm.success and not self._direct_ompl_sent:
+                    # B: 直线不可达时降级为 OMPL 一次到位（目标在工作空间内时仍可到达）
+                    self._direct_ompl_sent = True
+                    self.get_logger().warn(
+                        'Direct-line cartesian failed; falling back to '
+                        'OMPL move to target')
+                    self.arm.move_to_pose(
+                        self._direct_end_pose, self.base_link,
+                        velocity_scaling=self.velocity_scaling)
+                    self._direct_start = now_a
+                    return
+                if not self.arm.success:
+                    self.get_logger().error(
+                        'OMPL fallback also failed; aborting direct grasp')
+                    self._publish_grasp_result(0)
+                    self._direct_ompl_sent = False
+                    self._enter_home()
+                    return
+                self._direct_ompl_sent = False
+                self._direct_phase = 4
+                self._direct_start = now_a
+                self._direct_xy_ok = 0
+                return
+            if self._direct_phase == 4:
+                # 到位校验：只比对 base 系 x/y（z/朝向不看）
+                err = self._tcp_xy_error()
+                if err is not None and err <= self.direct_xy_tol:
+                    self._direct_xy_ok += 1
+                else:
+                    self._direct_xy_ok = 0
+                if self._direct_xy_ok >= 3:
+                    self.get_logger().info(
+                        f'Direct-line xy aligned (err={err:.4f} m); '
+                        'closing gripper')
+                    self.state = self.CLOSE_GRIPPER
+                    self.triggered = False
+                    return
+                if now_a - self._direct_start > self.direct_reach_timeout:
+                    self.get_logger().warning(
+                        'Direct-line xy not reached in time; closing anyway')
+                    self.state = self.CLOSE_GRIPPER
+                    self.triggered = False
+                return
+            return
+
         if self.state == self.MOVE_HOME:
+            # 分级回退：若 workflow 下发了 retract 路径（精对准位→粗对准位），
+            # 则先逐级退回，最后一步再回 home（防止直接从抓取点/异常位直冲 home）。
+            if self._home_targets is None:
+                tgts = [list(j[:7]) for j in self._retract_joints if len(j) >= 7]
+                tgts.append(list(self.home_joints))
+                self._home_targets = tgts
+                self._home_step = 0
+            n_steps = len(self._home_targets)
+            if not self.triggered and self._home_near():
+                # 短路：臂已在 home，无需再逐级回退，直接收尾
+                self.get_logger().info(
+                    'MOVE_HOME: already at home; finalizing directly')
+                if not self._ensure_box_removed():
+                    return
+                self._finalize_home_reached()
+                return
             if not self.triggered:
                 if not self._ensure_box_removed():
                     return
@@ -905,37 +1116,34 @@ class GraspExecutor(Node):
                         self._clear_pending = False
                     else:
                         return
-                self._mark('home_sent')
+                idx = self._home_step
+                target = self._home_targets[idx]
+                if idx == n_steps - 1:
+                    self._mark('home_sent')
+                    self.get_logger().info('Moving to home position')
+                else:
+                    self.get_logger().info(
+                        f'Retract step {idx + 1}/{n_steps - 1}: moving '
+                        'back toward a safe staged pose')
                 self.arm.move_to_joints(
-                    self.home_joints,
-                    velocity_scaling=self.velocity_scaling)
+                    target, velocity_scaling=self.velocity_scaling)
                 self.home_start_time = (
                     self.get_clock().now().nanoseconds * 1e-9)
-                self.get_logger().info('Moving to home position')
                 self.triggered = True
             elif self.arm.is_done():
                 if self.arm.success:
+                    idx = self._home_step
+                    target = self._home_targets[idx]
+                    if idx < n_steps - 1:
+                        # 中间级（精对准→粗对准）到位后继续下一级
+                        self._home_step += 1
+                        self.triggered = False
+                        return
                     home = self.home_joints
                     errors = [abs(self.current_joints[i] - home[i])
                               for i in range(7)]
                     if max(errors) < 0.05:
-                        self._mark('home_done')
-                        self.get_logger().info(
-                            'Reached home position')
-                        if self._place_abort_open:
-                            self._place_abort_open = False
-                            self.get_logger().warning(
-                                'Place aborted; holding at home. Retry '
-                                '/manual_release or use '
-                                '/manual_release_force')
-                            self.state = self.WAIT_RELEASE
-                        elif self._place_cycle_home:
-                            self._place_cycle_home = False
-                            self.state = self.IDLE
-                        else:
-                            self.state = self.WAIT_RELEASE
-                        self.triggered = False
-                        self._cycle_summary()
+                        self._finalize_home_reached()
                     else:
                         elapsed = (self.get_clock().now().nanoseconds * 1e-9
                                    - self.home_start_time)
@@ -1153,6 +1361,32 @@ class GraspExecutor(Node):
         self.triggered = False
         self._home_clear_waited = False
         self._home_clear_start = 0.0
+
+    def _home_near(self):
+        """关节是否已停在 home 附近（用于跳过分级回退直接收尾）。"""
+        err = max(abs(self.current_joints[i] - self.home_joints[i])
+                  for i in range(7))
+        return err < 0.05
+
+    def _finalize_home_reached(self):
+        """到家后的统一收尾（分级回退最后一步 / 已在 home 短路共用）。"""
+        self._mark('home_done')
+        self.get_logger().info('Reached home position')
+        self._home_targets = None
+        self._retract_joints = []
+        if self._place_abort_open:
+            self._place_abort_open = False
+            self.get_logger().warning(
+                'Place aborted; holding at home. Retry '
+                '/manual_release or use /manual_release_force')
+            self.state = self.WAIT_RELEASE
+        elif self._place_cycle_home:
+            self._place_cycle_home = False
+            self.state = self.IDLE
+        else:
+            self.state = self.WAIT_RELEASE
+        self.triggered = False
+        self._cycle_summary()
 
     def _abort_grasp_in_place(self, reason):
         """还没夹到就失败（接近规划失败/到位超时）：不强制回 home，
@@ -1389,6 +1623,42 @@ class GraspExecutor(Node):
 
     def _tcp_error(self):
         return self._tcp_error_to(self.target_pose, self.target_frame)
+
+    def _tcp_xy_error(self):
+        """base_link 系下当前 tcp 与目标在 x/y 上的误差（只比 x/y）。"""
+        if self.target_pose is None or self.target_frame != self.base_link:
+            try:
+                return self._tcp_xy_error_in(self.target_frame)
+            except Exception:
+                return None
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.base_link,
+                self.end_effector,
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.5),
+            )
+        except TransformException:
+            return None
+        actual = transform.transform.translation
+        target = self.target_pose.position
+        return math.hypot(actual.x - target.x, actual.y - target.y)
+
+    def _tcp_xy_error_in(self, frame_id):
+        if self.target_pose is None:
+            return None
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                frame_id,
+                self.end_effector,
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.5),
+            )
+        except TransformException:
+            return None
+        actual = transform.transform.translation
+        target = self.target_pose.position
+        return math.hypot(actual.x - target.x, actual.y - target.y)
 
     def report_position_error(self):
         try:

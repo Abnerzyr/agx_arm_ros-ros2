@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import json
+import math
 import os
 
 import numpy as np
@@ -11,7 +12,9 @@ from geometry_msgs.msg import Pose, PoseStamped
 from rclpy.node import Node
 from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import Image, JointState
-from std_msgs.msg import ColorRGBA, Empty, Header, Int32, String
+from moveit_msgs.srv import GetPositionFK
+from std_msgs.msg import ColorRGBA, Empty, Float32, Float64MultiArray, Header, Int32, String
+from std_srvs.srv import Empty as ClearSrv
 from tf2_ros import Buffer, TransformException, TransformListener
 from visualization_msgs.msg import Marker
 
@@ -58,6 +61,7 @@ class ShelfWorkflowNode(Node):
         3: 'WAIT_REACH', 4: 'CLOSE_GRIPPER', 5: 'MOVE_HOME',
         6: 'WAIT_RELEASE', 7: 'MOVE_TO_PLACE_ABOVE',
         8: 'LOWER_TO_PLACE', 9: 'PLACE_OPEN', 10: 'PLACE_LIFT',
+        11: 'LIFT_VERIFY', 12: 'CARTESIAN_APPROACH',
     }
 
     EXECUTOR_IDLE = 0
@@ -66,6 +70,18 @@ class ShelfWorkflowNode(Node):
     # grasp_result 语义（grasp_executor 发布）：
     #   0 = 未执行/抓前失败, 1 = 执行但空抓, 2 = 已握持
     GRASP_RESULT_HELD = 2
+
+    # 粗对准(NOMINAL_POSE) 硬编码关节位（7 轴, rad）——观察/定位位。
+    # 精对准(ALIGN) 硬编码关节位——抓取预备位（LAYER_FINE_JOINTS）。
+    # 高层(3) 不抓；其它未配置层兜底 home（见 _layer_coarse_joints/_layer_fine_joints）。
+    LAYER_COARSE_JOINTS = {
+        1: [-0.0179, -0.5276, 0.0221, 2.1155, 0.0034, 0.0208, 0.9635],
+        2: [0.0062, -0.4337, -0.0134, 1.6032, -0.0776, 0.027, 1.0928],
+    }
+    LAYER_FINE_JOINTS = {
+        1: [-0.0092, 0.703, 0.0147, 2.0302, 0.0034, -0.0134, -1.1184],
+        2: [0.0156, -0.2493, 0.0262, 1.8614, -0.0051, 0.0542, 0.0241],
+    }
 
     ALIGN_DIST_EPS = 0.02#for test remember to change it back to 0.02!!!!在rviz测试时临时使用！！！
 
@@ -105,7 +121,8 @@ class ShelfWorkflowNode(Node):
         self.declare_parameter('align_settle_time', 3.0)
         self.declare_parameter('box_stable_tol', 0.05)
         self.declare_parameter('align_max_iter', 2)
-        self.declare_parameter('skip_nominal', True)
+        self.declare_parameter('skip_nominal', False)
+        self.declare_parameter('skip_align', True)
         self.declare_parameter('align_dist', 0.4)
         self.declare_parameter('align_dist_tol', 0.05)
         self.declare_parameter('align_center_tol', 0.05)
@@ -113,13 +130,20 @@ class ShelfWorkflowNode(Node):
         self.declare_parameter('marker_fresh_timeout', 1.0)
         self.declare_parameter(
             'home_joints',
-            [-0.0259, -0.4025, -0.0575, 2.0, 0.0604, 0.0722, 0.9141])
+            [1.5446, -0.4858, -0.006, 2.103, 0.004, 0.0208, 0.9801])
 
         # 车-臂上报协议（见仓库根目录 机械臂接口确认(1).md）
         self.declare_parameter('report_topic', '/arm_task_report')
         self.declare_parameter('report_interval', 3.0)     # STOW 周期上报 (s)
         self.declare_parameter('stow_joint_tol', 0.12)     # STOW 关节 home 容差 (rad)
         self.declare_parameter('task_watchdog', 75.0)      # 任务总时长上限 (s)
+        # 目标合理性过滤（skip_align 无 aruco 时替代桌面 z 参考）
+        self.declare_parameter('grasp_max_reach', 0.85)    # base 系水平可达上限 (m)
+        self.declare_parameter('grasp_z_tol', 0.03)        # 相对 z 参考的容差 (m)
+        # 真目标中心比精对准位 tcp z 低约 4cm：z 带中心 = fine_z + 此偏移
+        self.declare_parameter('grasp_z_center_offset', -0.04)
+        # 直线接近终点 z 的抬升量（低层防碰桌面）：终点z = 精对准位z + 该值
+        self.declare_parameter('low_layer_approach_z_raise', 0.04)
 
         config_file = self.get_parameter('config_file').value
         if not os.path.exists(config_file):
@@ -161,6 +185,7 @@ class ShelfWorkflowNode(Node):
             self.get_parameter('box_stable_tol').value)
         self.align_max_iter = self.get_parameter('align_max_iter').value
         self.skip_nominal = bool(self.get_parameter('skip_nominal').value)
+        self.skip_align = bool(self.get_parameter('skip_align').value)
         self.align_dist = float(self.get_parameter('align_dist').value)
         self.align_dist_tol = float(
             self.get_parameter('align_dist_tol').value)
@@ -179,6 +204,14 @@ class ShelfWorkflowNode(Node):
             self.get_parameter('stow_joint_tol').value)
         self._task_timeout = float(
             self.get_parameter('task_watchdog').value)
+        self.grasp_max_reach = float(
+            self.get_parameter('grasp_max_reach').value)
+        self.grasp_z_tol = float(
+            self.get_parameter('grasp_z_tol').value)
+        self.grasp_z_center_offset = float(
+            self.get_parameter('grasp_z_center_offset').value)
+        self.low_layer_approach_z_raise = float(
+            self.get_parameter('low_layer_approach_z_raise').value)
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -197,6 +230,8 @@ class ShelfWorkflowNode(Node):
             Empty, 'manual_grasp_start', 10)
         self.grasp_cmd_pub = self.create_publisher(
             PoseStamped, 'grasp_target_cmd', 10)
+        self._clear_client = self.create_client(ClearSrv, 'clear_octomap')
+        self._fk_client = self.create_client(GetPositionFK, 'compute_fk')
         self.release_pub = self.create_publisher(
             Empty, 'manual_release', 10)
         self.release_force_pub = self.create_publisher(
@@ -206,6 +241,12 @@ class ShelfWorkflowNode(Node):
         # 车-臂协议：完成/失败上报（绝对话题，勿加 /arm 前缀）
         self.report_pub = self.create_publisher(
             String, self.report_topic, 10)
+        # 分级回退路径（给 grasp_executor：精对准位→粗对准位）
+        self._retract_path_pub = self.create_publisher(
+            Float64MultiArray, 'grasp_retract_path', 10)
+        # 直线接近终点 z 抬升量（按层下发给 grasp_executor）
+        self._approach_z_pub = self.create_publisher(
+            Float32, 'grasp_approach_z_raise', 10)
 
         self.create_subscription(
             Int32, 'task_command', self.task_cmd_cb, 10)
@@ -245,14 +286,13 @@ class ShelfWorkflowNode(Node):
         self._executor_state = None
         self._executor_state_time = 0.0
         self._release_pending = False
-        self._skip_align = False
+        self._skip_align = self.skip_align
         self._preset_home = False
         self._startup_home_sent = False
         self._home_sent = False
         self._home_done = False
         self._home_done_time = 0.0
         self._nominal_sent = False
-        self._nominal_target_pose = None
         self._align_start = 0.0
         self._align_iter = 0
         self._align_sent = False
@@ -276,6 +316,10 @@ class ShelfWorkflowNode(Node):
         self._align_stable_logged = 0.0
         self._latest_grasp_pt = None
         self._latest_grasp_pose = None
+        self._confirmed_grasp_pose = None
+        self._confirmed_grasp_pt = None
+        self._fine_z_ref = None
+        self._fk_seq = 0
         self._table_z = None
         self._plausible_ticks = 0
         self._implausible_logged = False
@@ -285,6 +329,8 @@ class ShelfWorkflowNode(Node):
         self._release_force_sent = False
         self._ret_home_sent = False
         self._ret_home_start = 0.0
+        self._ret_home_queue = None
+        self._ret_home_idx = 0
         self._auto_retry_home = False
         self._grasp_trigger_time = 0.0
         self._grasp_fail_start = None
@@ -320,6 +366,15 @@ class ShelfWorkflowNode(Node):
                 f'Unknown layer {layer}; configured layers: '
                 f'{[l.get("layer") for l in self._cfg.get("layers", [])]}')
             return
+        if layer not in self.LAYER_COARSE_JOINTS \
+                or layer not in self.LAYER_FINE_JOINTS:
+            # 高层(3)不抓：直接上报失败，不启动抓取流程
+            self.get_logger().error(
+                f'Layer {layer} not graspable (high shelf skipped); '
+                f'reporting failure')
+            self._report('PICK', False, 3,
+                         f'layer {layer} not supported (high shelf, skip)')
+            return
         self._layer = cfg
         self._reset_cycle_vars()
         self.get_logger().info(
@@ -328,22 +383,28 @@ class ShelfWorkflowNode(Node):
         now = self.get_clock().now().nanoseconds * 1e-9
         self._task_started('PICK')
         if self._skip_align:
-            self._detect_start = now
-            self._detect_warn_logged = False
-            self.get_logger().info(
-                '[TEST] skip_align: entering WAIT_DETECT directly '
-                '(skip nominal/align)')
-            self._set_state(self.WAIT_DETECT)
-        elif self.skip_nominal:
-            self._align_start = now
-            self._align_iter = 0
-            self._align_sent = False
-            self._align_no_marker_logged = False
-            self.get_logger().info(
-                '[TEST] skip_nominal: assuming coarse alignment done; '
-                'entering ALIGN (aruco search)')
-            self._set_state(self.ALIGN)
+            self._lookup_fine_z()
+        if self.skip_nominal:
+            # 跳过粗对准：直接进入精对准(aruco)；若同时跳过精对准则直接检测
+            if self._skip_align:
+                self._detect_start = now
+                self._detect_warn_logged = False
+                self.get_logger().info(
+                    'skip_nominal + skip_align: entering WAIT_DETECT')
+                self._set_state(self.WAIT_DETECT)
+            else:
+                self._align_start = now
+                self._align_iter = 0
+                self._align_sent = False
+                self._align_no_marker_logged = False
+                self.get_logger().info(
+                    'skip_nominal=True: coarse skipped, entering ALIGN '
+                    '(aruco fine align)')
+                self._set_state(self.ALIGN)
         else:
+            self.get_logger().info(
+                f'Entering NOMINAL_POSE (coarse align to fixed joints, '
+                f'layer={layer})')
             self._set_state(self.NOMINAL_POSE)
 
     def release_cmd_cb(self, msg):
@@ -519,15 +580,27 @@ class ShelfWorkflowNode(Node):
             self._stop_depth_monitor()
 
     def _target_plausible(self):
-        """抓取目标 z 合理性：相对点云桌面(aruco z) 在 [z_min, z_max] 上方。"""
+        """目标合理性校验（A）：
+        1) base 系水平距离必须在可达半径内（防误检远点）；
+        2) skip_align 无 aruco 时，z 须落在精对准位 tcp z ± grasp_z_tol（防假目标）；
+           有 aruco 桌面参考(_table_z) 时仍按原桌面带校验。
+        """
         if self._latest_grasp_pt is None:
             return False
-        if self._table_z is None:
-            # 无桌面参考（如 skip_align 测试）时不按 z 过滤
-            return True
-        z = self._latest_grasp_pt[2]
-        return (self._table_z + self.target_z_min <= z
-                <= self._table_z + self.target_z_max)
+        x, y, z = self._latest_grasp_pt
+        if math.hypot(x, y) > self.grasp_max_reach:
+            return False
+        if self._fine_z_ref is not None:
+            center = self._fine_z_ref + self.grasp_z_center_offset
+            lo = center - self.grasp_z_tol
+            hi = center + self.grasp_z_tol
+            if not (lo <= z <= hi):
+                return False
+        elif self._table_z is not None:
+            if not (self._table_z + self.target_z_min <= z
+                    <= self._table_z + self.target_z_max):
+                return False
+        return True
 
     def _no_aruco_fallback(self, now):
         """对准找不到 aruco：预算内 → 回 home 后自动重跑完整流程；否则停。"""
@@ -572,16 +645,22 @@ class ShelfWorkflowNode(Node):
         if self._grasp_retries <= self.grasp_max_retries:
             self.get_logger().warning(
                 f'{reason}; retry {self._grasp_retries}/'
-                f'{self.grasp_max_retries} — re-aligning, then retrying the cycle')
+                f'{self.grasp_max_retries} — re-running the cycle')
             self._detect_start = now
             self._detect_warn_logged = False
             self._plausible_ticks = 0
             self._implausible_logged = False
-            self._align_start = now
-            self._align_iter = 0
-            self._align_sent = False
-            self._align_no_marker_logged = False
-            self._set_state(self.ALIGN)
+            if self._skip_align:
+                # skip_align：重跑 粗对准→检测→(硬编码精对准)
+                self.get_logger().info(
+                    'retry: re-entering coarse align (NOMINAL_POSE)')
+                self._set_state(self.NOMINAL_POSE)
+            else:
+                self._align_start = now
+                self._align_iter = 0
+                self._align_sent = False
+                self._align_no_marker_logged = False
+                self._set_state(self.ALIGN)
         else:
             self._abort_task(error_code, message)
 
@@ -591,7 +670,6 @@ class ShelfWorkflowNode(Node):
         self._home_done = False
         self._home_done_time = 0.0
         self._nominal_sent = False
-        self._nominal_target_pose = None
         self._align_start = 0.0
         self._align_iter = 0
         self._align_sent = False
@@ -605,6 +683,9 @@ class ShelfWorkflowNode(Node):
         self._busy_executor_logged = False
         self._latest_grasp_pt = None
         self._latest_grasp_pose = None
+        self._confirmed_grasp_pose = None
+        self._confirmed_grasp_pt = None
+        self._fine_z_ref = None
         self._table_z = None
         self._plausible_ticks = 0
         self._implausible_logged = False
@@ -614,6 +695,8 @@ class ShelfWorkflowNode(Node):
         self._release_force_sent = False
         self._ret_home_sent = False
         self._ret_home_start = 0.0
+        self._ret_home_queue = None
+        self._ret_home_idx = 0
         self._auto_retry_home = False
 
     # ------------------------------------------------------------------
@@ -694,6 +777,100 @@ class ShelfWorkflowNode(Node):
             if int(entry.get('layer')) == int(layer):
                 return entry
         return None
+
+    def _layer_joints(self, table):
+        if self._layer is None:
+            return list(self.home_joints)
+        joints = table.get(int(self._layer.get('layer')))
+        if joints is not None:
+            return list(joints)
+        return list(self.home_joints)
+
+    def _layer_coarse_joints(self):
+        """粗对准用的硬编码关节位（观察/定位位）。"""
+        return self._layer_joints(self.LAYER_COARSE_JOINTS)
+
+    def _layer_fine_joints(self):
+        """精对准用的硬编码关节位（抓取预备位）。"""
+        return self._layer_joints(self.LAYER_FINE_JOINTS)
+
+    def _publish_retract_path(self):
+        """下发分级回退路径：精对准位 → 粗对准位（executor 抓完/失败按此逐级回退后再回 home）。"""
+        data = []
+        if self._layer is not None:
+            data += self._layer_fine_joints()
+            data += self._layer_coarse_joints()
+        msg = Float64MultiArray()
+        msg.data = [float(x) for x in data]
+        self._retract_path_pub.publish(msg)
+        self.get_logger().info(
+            'Retract path published: fine->coarse (%d joints)' % len(data))
+
+    def _lookup_fine_z(self):
+        """用 FK 求精对准位下 tcp_link 的 z，作为 skip_align 的目标 z 参考（±grasp_z_tol）。"""
+        if self._layer is None:
+            return
+        if not self._fk_client.service_is_ready():
+            self._fine_z_ref = None
+            self.get_logger().warn(
+                'compute_fk not ready; z gate disabled for this task')
+            return
+        req = GetPositionFK.Request()
+        req.header.frame_id = self.base_frame
+        req.fk_link_names = [self.end_effector]
+        st = req.robot_state.joint_state
+        st.header.frame_id = self.base_frame
+        st.name = ['joint%d' % (i + 1) for i in range(7)]
+        st.position = [float(j) for j in self._layer_fine_joints()]
+        self._fk_seq += 1
+        seq = self._fk_seq
+        future = self._fk_client.call_async(req)
+
+        def _cb(fut, s=seq):
+            if s != self._fk_seq:
+                return
+            try:
+                res = fut.result()
+            except Exception as exc:  # noqa: BLE001
+                self._fine_z_ref = None
+                self.get_logger().warn('FK lookup failed: %s' % exc)
+                return
+            poses = getattr(res, 'pose_stamped', None) or []
+            if poses:
+                self._fine_z_ref = float(poses[0].pose.position.z)
+                self.get_logger().info(
+                    'Fine-pose tcp z reference=%.3f (layer %s)'
+                    % (self._fine_z_ref, self._layer.get('layer')))
+            else:
+                self._fine_z_ref = None
+                self.get_logger().warn(
+                    'FK returned no pose; z gate disabled')
+
+        future.add_done_callback(_cb)
+
+    def _publish_approach_z_raise(self):
+        """按层下发直线接近终点 z 的抬升量（目前仅低层 +0.04m 防碰桌面）。"""
+        raise_z = 0.0
+        if self._layer is not None \
+                and int(self._layer.get('layer')) == 1:
+            raise_z = self.low_layer_approach_z_raise
+        msg = Float32()
+        msg.data = float(raise_z)
+        self._approach_z_pub.publish(msg)
+        self.get_logger().info(
+            'Approach z raise published: %.3f m' % msg.data)
+
+    def _refresh_scene(self):
+        """粗对准到位后清一次规划场景(octomap)，防止旧物体点云挡直线接近。"""
+        if not self._clear_client.service_is_ready():
+            self.get_logger().warn(
+                'clear_octomap service not ready; scene refresh skipped')
+            return
+        try:
+            self._clear_client.call_async(ClearSrv.Request())
+            self.get_logger().info('Scene refresh requested (clear_octomap)')
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn('clear_octomap request failed: %s' % exc)
 
     def _cfg_num(self, key, default):
         value = self._cfg.get(key, default)
@@ -983,24 +1160,18 @@ class ShelfWorkflowNode(Node):
                 return
             if not self._nominal_sent:
                 if self._preset_home:
-                    self._nominal_target_pose = None
+                    joints = list(self.home_joints)
                     self.get_logger().info(
                         '[TEST] preset_home: moving to home joints '
                         '(preset position)')
-                    self.arm.move_to_joints(
-                        self.home_joints,
-                        velocity_scaling=self.velocity_scaling)
                 else:
-                    pose = self._nominal_tcp_pose()
-                    if pose is None:
-                        return
-                    self._nominal_target_pose = pose
+                    joints = self._layer_coarse_joints()
+                    layer = self._layer.get('layer') if self._layer else '?'
                     self.get_logger().info(
-                        'Moving to nominal shelf-view pose...')
-                    self._publish_align_target(pose)
-                    self.arm.move_to_pose(
-                        pose, self.base_frame,
-                        velocity_scaling=self.velocity_scaling)
+                        f'Coarse align: moving to fixed joints '
+                        f'(layer={layer}) ...')
+                self.arm.move_to_joints(
+                    joints, velocity_scaling=self.velocity_scaling)
                 self._nominal_sent = True
                 return
             if not self.arm.is_done():
@@ -1008,10 +1179,13 @@ class ShelfWorkflowNode(Node):
             self._nominal_sent = False
             if self.arm.success:
                 if self._skip_align:
+                    # 粗对准到位：更新规划场景，然后在此位做目标检测并记录坐标
+                    self._refresh_scene()
                     self._detect_start = now
                     self._detect_warn_logged = False
                     self.get_logger().info(
-                        '[TEST] Skipping ALIGN; entering WAIT_DETECT')
+                        'Coarse pose reached; refresh scene + WAIT_DETECT '
+                        '(hardcoded fine-align follows)')
                     self._set_state(self.WAIT_DETECT)
                     return
                 self._align_start = now
@@ -1019,30 +1193,46 @@ class ShelfWorkflowNode(Node):
                 self._align_sent = False
                 self._align_no_marker_logged = False
                 self.get_logger().info(
-                    'Nominal pose reached; searching aruco marker')
+                    'Coarse pose reached; searching aruco marker')
                 self._set_state(self.ALIGN)
             else:
-                if self._nominal_target_pose is not None:
-                    p = self._nominal_target_pose.position
-                    self.get_logger().error(
-                        f'Nominal pose move failed; target tcp='
-                        f'({p.x:.3f},{p.y:.3f},{p.z:.3f}). Adjust shelf_x/'
-                        f'shelf_y/layer_height/standoff, then send '
-                        f'/task_command to retry')
-                else:
-                    self.get_logger().error(
-                        'Nominal move failed (nominal=home); '
-                        'check home reachability')
-                self._abort_task(9, 'nominal pose move failed')
+                layer = self._layer.get('layer') if self._layer else '?'
+                self.get_logger().error(
+                    f'Coarse align move failed (layer={layer}); '
+                    f'send /task_command to retry')
+                self._abort_task(9, 'coarse pose move failed')
             return
 
         if self.state == self.ALIGN:
             if self._skip_align:
-                self._detect_start = now
-                self._detect_warn_logged = False
-                self.get_logger().info(
-                    '[TEST] Skipping ALIGN (in ALIGN); entering WAIT_DETECT')
-                self._set_state(self.WAIT_DETECT)
+                # 硬编码精对准：粗对准检测完目标后，移到该层抓取预备位，
+                # 之后由 executor 用"粗对准锁定的目标"做笛卡尔直线接近。
+                if self._executor_state != self.EXECUTOR_IDLE:
+                    if not self._busy_executor_logged:
+                        self.get_logger().warn(
+                            'grasp_executor not IDLE; waiting before '
+                            'fine-align move')
+                        self._busy_executor_logged = True
+                    return
+                if not self._align_sent:
+                    joints = self._layer_fine_joints()
+                    layer = self._layer.get('layer') if self._layer else '?'
+                    self.get_logger().info(
+                        f'Fine-align (hardcoded): moving to joints '
+                        f'(layer={layer})')
+                    self.arm.move_to_joints(
+                        joints, velocity_scaling=self.velocity_scaling)
+                    self._align_sent = True
+                    return
+                if not self.arm.is_done():
+                    return
+                self._align_sent = False
+                if self.arm.success:
+                    self.get_logger().info(
+                        'Fine-align reached; triggering direct-line grasp')
+                    self._set_state(self.TRIGGER_GRASP)
+                else:
+                    self._abort_task(9, 'fine align move failed')
                 return
             if self._executor_state != self.EXECUTOR_IDLE:
                 if not self._busy_executor_logged:
@@ -1140,15 +1330,38 @@ class ShelfWorkflowNode(Node):
                 if fresh_box and fresh_pose and not plausible \
                         and not self._implausible_logged:
                     self._implausible_logged = True
+                    pt = self._latest_grasp_pt
+                    if pt is None:
+                        dbg = 'no target yet'
+                    else:
+                        zc = (self._fine_z_ref + self.grasp_z_center_offset
+                              if self._fine_z_ref is not None else None)
+                        dbg = ('r=%.3f z=%.3f '
+                               '(z_center=%s, tol=%.3f, reach=%.3f)'
+                               % (math.hypot(pt[0], pt[1]), pt[2],
+                                  ('%.3f' % zc)
+                                  if zc is not None else 'None',
+                                  self.grasp_z_tol, self.grasp_max_reach))
                     self.get_logger().warning(
-                        f'[DETECT] implausible target z='
-                        f'{(self._latest_grasp_pt[2] if self._latest_grasp_pt else 0):.3f} '
-                        f'(table_z={self._table_z}); waiting for valid target')
+                        f'[DETECT] implausible target ({dbg}); '
+                        'waiting for valid target')
             if self._plausible_ticks >= 3:
+                # 锁定"粗对准阶段测得的目标"，精对准/直线接近都用它，不再重测
+                self._confirmed_grasp_pose = self._latest_grasp_pose
+                self._confirmed_grasp_pt = self._latest_grasp_pt
                 self.get_logger().info(
                     f'Target plausible (z within band, x{self._plausible_ticks}); '
-                    'triggering grasp')
-                self._set_state(self.TRIGGER_GRASP)
+                    'confirmed grasp target recorded')
+                if self._skip_align:
+                    self._align_start = now
+                    self._align_iter = 0
+                    self._align_sent = False
+                    self._align_no_marker_logged = False
+                    self.get_logger().info(
+                        'Moving to hardcoded fine-align pose (LAYER_FINE_JOINTS)')
+                    self._set_state(self.ALIGN)
+                else:
+                    self._set_state(self.TRIGGER_GRASP)
                 return
             if (now - self._detect_start > self.detect_timeout
                     and not self._detect_warn_logged):
@@ -1165,9 +1378,14 @@ class ShelfWorkflowNode(Node):
             return
 
         if self.state == self.TRIGGER_GRASP:
-            # Fix A: 先把"确认的抓取位姿"发给 executor（防触发时锁到漂移 pose），再触发
-            if self._latest_grasp_pose is not None:
-                self.grasp_cmd_pub.publish(self._latest_grasp_pose)
+            # Fix A: 先把"确认的抓取位姿"发给 executor（防触发时锁到漂移 pose），再触发。
+            # skip_align 模式用粗对准阶段锁定的目标（_confirmed_grasp_pose），不重测。
+            send = self._confirmed_grasp_pose or self._latest_grasp_pose
+            if send is not None:
+                self.grasp_cmd_pub.publish(send)
+            if self._skip_align:
+                self._publish_retract_path()
+                self._publish_approach_z_raise()
             self.grasp_start_pub.publish(Empty())
             self._grasp_trigger_time = now
             self._grasp_fail_start = None
@@ -1246,13 +1464,40 @@ class ShelfWorkflowNode(Node):
                     self._set_state(self.IDLE)
                     self._flush_pending_report()
                 return
-            if not self._ret_home_sent:
+            if self._joints_near_home():
+                # 短路：臂已在 home，不必再绕 精对准→粗对准，直接收尾
                 self.get_logger().info(
-                    'Returning home before entering IDLE')
+                    'RETURN_HOME: already at home; finalizing directly')
+                self._finish_return_home()
+                return
+            if self._ret_home_queue is None:
+                # 分级回退保护：skip_align 下失败收臂也按 精对准位→粗对准位→home 退回
+                q = []
+                if self._skip_align and self._layer is not None:
+                    f = self._layer_fine_joints()
+                    c = self._layer_coarse_joints()
+                    if len(f) >= 7 and len(c) >= 7:
+                        q.append(list(f))
+                        q.append(list(c))
+                q.append(list(self.home_joints))
+                self._ret_home_queue = q
+                self._ret_home_idx = 0
+                self._ret_home_start = now
+            if not self._ret_home_sent:
+                idx = self._ret_home_idx
+                target = self._ret_home_queue[idx]
+                if idx == len(self._ret_home_queue) - 1:
+                    self.get_logger().info(
+                        'Returning home (final step) before entering IDLE')
+                else:
+                    self.get_logger().info(
+                        f'RETURN_HOME stage {idx + 1}/'
+                        f'{len(self._ret_home_queue) - 1}: '
+                        'safe staged pose (fine/coarse)')
                 self.arm.move_to_joints(
-                    self.home_joints,
-                    velocity_scaling=self.velocity_scaling)
+                    target, velocity_scaling=self.velocity_scaling)
                 self._ret_home_sent = True
+                self._ret_home_start = now
                 return
             if not self.arm.is_done():
                 if now - self._ret_home_start > self.ret_home_timeout:
@@ -1262,37 +1507,68 @@ class ShelfWorkflowNode(Node):
                     self._set_state(self.IDLE)
                     self._flush_pending_report()
                 return
-            retry_home = self._auto_retry_home
-            self._auto_retry_home = False
-            saved_retries = self._grasp_retries
-            self._reset_cycle_vars()
-            if retry_home:
-                # 无 aruco 回退：回 home 后自动重跑完整流程（保留重试计数）
-                self._grasp_retries = saved_retries
-                now_s = self.get_clock().now().nanoseconds * 1e-9
+            self._ret_home_sent = False
+            if not self.arm.success:
+                self.get_logger().error('home step move failed; forcing IDLE')
+                self._reset_cycle_vars()
+                self._set_state(self.IDLE)
+                self._flush_pending_report()
+                return
+            if self._ret_home_idx < len(self._ret_home_queue) - 1:
+                # 中间级（精对准→粗对准）到位后继续下一级
+                self._ret_home_idx += 1
+                self._ret_home_start = now
+                return
+            self._finish_return_home()
+            return
+
+    def _joints_near_home(self):
+        """关节是否已停在 home 附近（home 容差按 stow_joint_tol 取一半的保守值）。"""
+        if self._joint_pos is None:
+            return False
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if now - self._joint_last_feedback > 1.0:
+            return False
+        tol = max(0.05, self._stow_joint_tol / 2.0)
+        err = max(abs(a - b) for a, b in
+                  zip(self._joint_pos, self.home_joints))
+        return err <= tol
+
+    def _finish_return_home(self):
+        """到家(或分级回退到家)后的统一收尾：有 auto-retry 则重跑，否则 IDLE+flush 上报。"""
+        retry_home = self._auto_retry_home
+        self._auto_retry_home = False
+        saved_retries = self._grasp_retries
+        self._reset_cycle_vars()
+        if retry_home:
+            # 无 aruco 回退：回 home 后自动重跑完整流程（保留重试计数）
+            self._grasp_retries = saved_retries
+            now_s = self.get_clock().now().nanoseconds * 1e-9
+            if self.skip_nominal:
                 if self._skip_align:
                     self._detect_start = now_s
                     self._detect_warn_logged = False
                     self.get_logger().info(
-                        '[TEST] skip_align: entering WAIT_DETECT (auto-retry)')
+                        '[retry] skip_nominal+skip_align: '
+                        'entering WAIT_DETECT')
                     self._set_state(self.WAIT_DETECT)
-                elif self.skip_nominal:
+                else:
                     self._align_start = now_s
                     self._align_iter = 0
                     self._align_sent = False
                     self._align_no_marker_logged = False
                     self.get_logger().info(
-                        '[TEST] skip_nominal: entering ALIGN (auto-retry)')
+                        '[retry] skip_nominal: entering ALIGN')
                     self._set_state(self.ALIGN)
-                else:
-                    self.get_logger().info(
-                        'Auto-retry: moving to nominal pose')
-                    self._set_state(self.NOMINAL_POSE)
             else:
-                self._set_state(self.IDLE)
-                # 终态失败上报在此 flush（RETURN_HOME 已确认臂收回）
-                self._flush_pending_report()
-            return
+                self.get_logger().info(
+                    'Auto-retry: moving to coarse joints '
+                    '(NOMINAL_POSE)')
+                self._set_state(self.NOMINAL_POSE)
+        else:
+            self._set_state(self.IDLE)
+            # 终态失败上报在此 flush（RETURN_HOME 已确认臂收回）
+            self._flush_pending_report()
 
     def _fire_release(self):
         self._release_pending = False
