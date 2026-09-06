@@ -72,13 +72,13 @@ class ShelfWorkflowNode(Node):
     GRASP_RESULT_HELD = 2
 
     # 粗对准(NOMINAL_POSE) 硬编码关节位（7 轴, rad）——观察/定位位。
-    # 精对准(ALIGN) 硬编码关节位——抓取预备位（LAYER_FINE_JOINTS）。
-    # 高层(3) 不抓；其它未配置层兜底 home（见 _layer_coarse_joints/_layer_fine_joints）。
+    # 抓取预备位(硬编码第二固定位, 与 aruco 精对准无关)（LAYER_PRE_GRASP_JOINTS）。
+    # 高层(3) 不抓；其它未配置层兜底 home（见 _layer_coarse_joints/_layer_pre_grasp_joints）。
     LAYER_COARSE_JOINTS = {
         1: [-0.0179, -0.5276, 0.0221, 2.1155, 0.0034, 0.0208, 0.9635],
         2: [0.0062, -0.4337, -0.0134, 1.6032, -0.0776, 0.027, 1.0928],
     }
-    LAYER_FINE_JOINTS = {
+    LAYER_PRE_GRASP_JOINTS = {
         1: [-0.0092, 0.703, 0.0147, 2.0302, 0.0034, -0.0134, -1.1184],
         2: [0.0156, -0.2493, 0.0262, 1.8614, -0.0051, 0.0542, 0.0241],
     }
@@ -140,9 +140,9 @@ class ShelfWorkflowNode(Node):
         # 目标合理性过滤（skip_align 无 aruco 时替代桌面 z 参考）
         self.declare_parameter('grasp_max_reach', 0.85)    # base 系水平可达上限 (m)
         self.declare_parameter('grasp_z_tol', 0.03)        # 相对 z 参考的容差 (m)
-        # 真目标中心比精对准位 tcp z 低约 4cm：z 带中心 = fine_z + 此偏移
+        # 真目标中心比抓取预备位 tcp z 低约 4cm：z 带中心 = pre_grasp_z + 此偏移
         self.declare_parameter('grasp_z_center_offset', -0.04)
-        # 直线接近终点 z 的抬升量（低层防碰桌面）：终点z = 精对准位z + 该值
+        # 直线接近终点 z 的抬升量（低层防碰桌面）：终点z = 抓取预备位z + 该值
         self.declare_parameter('low_layer_approach_z_raise', 0.04)
 
         config_file = self.get_parameter('config_file').value
@@ -241,7 +241,7 @@ class ShelfWorkflowNode(Node):
         # 车-臂协议：完成/失败上报（绝对话题，勿加 /arm 前缀）
         self.report_pub = self.create_publisher(
             String, self.report_topic, 10)
-        # 分级回退路径（给 grasp_executor：精对准位→粗对准位）
+        # 分级回退路径（给 grasp_executor：抓取预备位→粗对准位）
         self._retract_path_pub = self.create_publisher(
             Float64MultiArray, 'grasp_retract_path', 10)
         # 直线接近终点 z 抬升量（按层下发给 grasp_executor）
@@ -318,7 +318,7 @@ class ShelfWorkflowNode(Node):
         self._latest_grasp_pose = None
         self._confirmed_grasp_pose = None
         self._confirmed_grasp_pt = None
-        self._fine_z_ref = None
+        self._pre_grasp_z_ref = None
         self._fk_seq = 0
         self._table_z = None
         self._plausible_ticks = 0
@@ -367,7 +367,7 @@ class ShelfWorkflowNode(Node):
                 f'{[l.get("layer") for l in self._cfg.get("layers", [])]}')
             return
         if layer not in self.LAYER_COARSE_JOINTS \
-                or layer not in self.LAYER_FINE_JOINTS:
+                or layer not in self.LAYER_PRE_GRASP_JOINTS:
             # 高层(3)不抓：直接上报失败，不启动抓取流程
             self.get_logger().error(
                 f'Layer {layer} not graspable (high shelf skipped); '
@@ -383,7 +383,7 @@ class ShelfWorkflowNode(Node):
         now = self.get_clock().now().nanoseconds * 1e-9
         self._task_started('PICK')
         if self._skip_align:
-            self._lookup_fine_z()
+            self._lookup_pre_grasp_z()
         if self.skip_nominal:
             # 跳过粗对准：直接进入精对准(aruco)；若同时跳过精对准则直接检测
             if self._skip_align:
@@ -582,7 +582,7 @@ class ShelfWorkflowNode(Node):
     def _target_plausible(self):
         """目标合理性校验（A）：
         1) base 系水平距离必须在可达半径内（防误检远点）；
-        2) skip_align 无 aruco 时，z 须落在精对准位 tcp z ± grasp_z_tol（防假目标）；
+        2) skip_align 无 aruco 时，z 须落在抓取预备位 tcp z ± grasp_z_tol（防假目标）；
            有 aruco 桌面参考(_table_z) 时仍按原桌面带校验。
         """
         if self._latest_grasp_pt is None:
@@ -590,8 +590,8 @@ class ShelfWorkflowNode(Node):
         x, y, z = self._latest_grasp_pt
         if math.hypot(x, y) > self.grasp_max_reach:
             return False
-        if self._fine_z_ref is not None:
-            center = self._fine_z_ref + self.grasp_z_center_offset
+        if self._pre_grasp_z_ref is not None:
+            center = self._pre_grasp_z_ref + self.grasp_z_center_offset
             lo = center - self.grasp_z_tol
             hi = center + self.grasp_z_tol
             if not (lo <= z <= hi):
@@ -651,7 +651,7 @@ class ShelfWorkflowNode(Node):
             self._plausible_ticks = 0
             self._implausible_logged = False
             if self._skip_align:
-                # skip_align：重跑 粗对准→检测→(硬编码精对准)
+                # skip_align：重跑 粗对准→检测→(抓取预备位)
                 self.get_logger().info(
                     'retry: re-entering coarse align (NOMINAL_POSE)')
                 self._set_state(self.NOMINAL_POSE)
@@ -685,7 +685,7 @@ class ShelfWorkflowNode(Node):
         self._latest_grasp_pose = None
         self._confirmed_grasp_pose = None
         self._confirmed_grasp_pt = None
-        self._fine_z_ref = None
+        self._pre_grasp_z_ref = None
         self._table_z = None
         self._plausible_ticks = 0
         self._implausible_logged = False
@@ -790,15 +790,15 @@ class ShelfWorkflowNode(Node):
         """粗对准用的硬编码关节位（观察/定位位）。"""
         return self._layer_joints(self.LAYER_COARSE_JOINTS)
 
-    def _layer_fine_joints(self):
-        """精对准用的硬编码关节位（抓取预备位）。"""
-        return self._layer_joints(self.LAYER_FINE_JOINTS)
+    def _layer_pre_grasp_joints(self):
+        """抓取预备位用的硬编码关节位（与 aruco 精对准无关）。"""
+        return self._layer_joints(self.LAYER_PRE_GRASP_JOINTS)
 
     def _publish_retract_path(self):
-        """下发分级回退路径：精对准位 → 粗对准位（executor 抓完/失败按此逐级回退后再回 home）。"""
+        """下发分级回退路径：抓取预备位 → 粗对准位（executor 抓完/失败按此逐级回退后再回 home）。"""
         data = []
         if self._layer is not None:
-            data += self._layer_fine_joints()
+            data += self._layer_pre_grasp_joints()
             data += self._layer_coarse_joints()
         msg = Float64MultiArray()
         msg.data = [float(x) for x in data]
@@ -806,12 +806,12 @@ class ShelfWorkflowNode(Node):
         self.get_logger().info(
             'Retract path published: fine->coarse (%d joints)' % len(data))
 
-    def _lookup_fine_z(self):
-        """用 FK 求精对准位下 tcp_link 的 z，作为 skip_align 的目标 z 参考（±grasp_z_tol）。"""
+    def _lookup_pre_grasp_z(self):
+        """用 FK 求抓取预备位下 tcp_link 的 z，作为 skip_align 的目标 z 参考（±grasp_z_tol）。"""
         if self._layer is None:
             return
         if not self._fk_client.service_is_ready():
-            self._fine_z_ref = None
+            self._pre_grasp_z_ref = None
             self.get_logger().warn(
                 'compute_fk not ready; z gate disabled for this task')
             return
@@ -821,7 +821,7 @@ class ShelfWorkflowNode(Node):
         st = req.robot_state.joint_state
         st.header.frame_id = self.base_frame
         st.name = ['joint%d' % (i + 1) for i in range(7)]
-        st.position = [float(j) for j in self._layer_fine_joints()]
+        st.position = [float(j) for j in self._layer_pre_grasp_joints()]
         self._fk_seq += 1
         seq = self._fk_seq
         future = self._fk_client.call_async(req)
@@ -832,17 +832,17 @@ class ShelfWorkflowNode(Node):
             try:
                 res = fut.result()
             except Exception as exc:  # noqa: BLE001
-                self._fine_z_ref = None
+                self._pre_grasp_z_ref = None
                 self.get_logger().warn('FK lookup failed: %s' % exc)
                 return
             poses = getattr(res, 'pose_stamped', None) or []
             if poses:
-                self._fine_z_ref = float(poses[0].pose.position.z)
+                self._pre_grasp_z_ref = float(poses[0].pose.position.z)
                 self.get_logger().info(
                     'Fine-pose tcp z reference=%.3f (layer %s)'
-                    % (self._fine_z_ref, self._layer.get('layer')))
+                    % (self._pre_grasp_z_ref, self._layer.get('layer')))
             else:
-                self._fine_z_ref = None
+                self._pre_grasp_z_ref = None
                 self.get_logger().warn(
                     'FK returned no pose; z gate disabled')
 
@@ -1185,7 +1185,7 @@ class ShelfWorkflowNode(Node):
                     self._detect_warn_logged = False
                     self.get_logger().info(
                         'Coarse pose reached; refresh scene + WAIT_DETECT '
-                        '(hardcoded fine-align follows)')
+                        '(pre-grasp pose follows)')
                     self._set_state(self.WAIT_DETECT)
                     return
                 self._align_start = now
@@ -1205,20 +1205,20 @@ class ShelfWorkflowNode(Node):
 
         if self.state == self.ALIGN:
             if self._skip_align:
-                # 硬编码精对准：粗对准检测完目标后，移到该层抓取预备位，
+                # 抓取预备位：粗对准检测完目标后，移到该层抓取预备位，
                 # 之后由 executor 用"粗对准锁定的目标"做笛卡尔直线接近。
                 if self._executor_state != self.EXECUTOR_IDLE:
                     if not self._busy_executor_logged:
                         self.get_logger().warn(
                             'grasp_executor not IDLE; waiting before '
-                            'fine-align move')
+                            'pre-grasp move')
                         self._busy_executor_logged = True
                     return
                 if not self._align_sent:
-                    joints = self._layer_fine_joints()
+                    joints = self._layer_pre_grasp_joints()
                     layer = self._layer.get('layer') if self._layer else '?'
                     self.get_logger().info(
-                        f'Fine-align (hardcoded): moving to joints '
+                        f'Pre-grasp (hardcoded): moving to joints '
                         f'(layer={layer})')
                     self.arm.move_to_joints(
                         joints, velocity_scaling=self.velocity_scaling)
@@ -1229,10 +1229,10 @@ class ShelfWorkflowNode(Node):
                 self._align_sent = False
                 if self.arm.success:
                     self.get_logger().info(
-                        'Fine-align reached; triggering direct-line grasp')
+                        'Pre-grasp reached; triggering direct-line grasp')
                     self._set_state(self.TRIGGER_GRASP)
                 else:
-                    self._abort_task(9, 'fine align move failed')
+                    self._abort_task(9, 'pre-grasp move failed')
                 return
             if self._executor_state != self.EXECUTOR_IDLE:
                 if not self._busy_executor_logged:
@@ -1334,8 +1334,8 @@ class ShelfWorkflowNode(Node):
                     if pt is None:
                         dbg = 'no target yet'
                     else:
-                        zc = (self._fine_z_ref + self.grasp_z_center_offset
-                              if self._fine_z_ref is not None else None)
+                        zc = (self._pre_grasp_z_ref + self.grasp_z_center_offset
+                              if self._pre_grasp_z_ref is not None else None)
                         dbg = ('r=%.3f z=%.3f '
                                '(z_center=%s, tol=%.3f, reach=%.3f)'
                                % (math.hypot(pt[0], pt[1]), pt[2],
@@ -1346,7 +1346,7 @@ class ShelfWorkflowNode(Node):
                         f'[DETECT] implausible target ({dbg}); '
                         'waiting for valid target')
             if self._plausible_ticks >= 3:
-                # 锁定"粗对准阶段测得的目标"，精对准/直线接近都用它，不再重测
+                # 锁定"粗对准阶段测得的目标"，预备位/直线接近都用它，不再重测
                 self._confirmed_grasp_pose = self._latest_grasp_pose
                 self._confirmed_grasp_pt = self._latest_grasp_pt
                 self.get_logger().info(
@@ -1358,7 +1358,7 @@ class ShelfWorkflowNode(Node):
                     self._align_sent = False
                     self._align_no_marker_logged = False
                     self.get_logger().info(
-                        'Moving to hardcoded fine-align pose (LAYER_FINE_JOINTS)')
+                        'Moving to pre-grasp pose (LAYER_PRE_GRASP_JOINTS)')
                     self._set_state(self.ALIGN)
                 else:
                     self._set_state(self.TRIGGER_GRASP)
@@ -1465,16 +1465,16 @@ class ShelfWorkflowNode(Node):
                     self._flush_pending_report()
                 return
             if self._joints_near_home():
-                # 短路：臂已在 home，不必再绕 精对准→粗对准，直接收尾
+                # 短路：臂已在 home，不必再绕 抓取预备位→粗对准位，直接收尾
                 self.get_logger().info(
                     'RETURN_HOME: already at home; finalizing directly')
                 self._finish_return_home()
                 return
             if self._ret_home_queue is None:
-                # 分级回退保护：skip_align 下失败收臂也按 精对准位→粗对准位→home 退回
+                # 分级回退保护：skip_align 下失败收臂也按 抓取预备位→粗对准位→home 退回
                 q = []
                 if self._skip_align and self._layer is not None:
-                    f = self._layer_fine_joints()
+                    f = self._layer_pre_grasp_joints()
                     c = self._layer_coarse_joints()
                     if len(f) >= 7 and len(c) >= 7:
                         q.append(list(f))
@@ -1515,7 +1515,7 @@ class ShelfWorkflowNode(Node):
                 self._flush_pending_report()
                 return
             if self._ret_home_idx < len(self._ret_home_queue) - 1:
-                # 中间级（精对准→粗对准）到位后继续下一级
+                # 中间级（抓取预备位→粗对准位）到位后继续下一级
                 self._ret_home_idx += 1
                 self._ret_home_start = now
                 return
