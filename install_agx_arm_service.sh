@@ -15,10 +15,10 @@ set -e
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "== 1/3 安装 unit =="
+echo "== 1/4 安装 unit =="
 sudo install -m 644 "$DIR/agx-arm.service" /etc/systemd/system/agx-arm.service
 
-echo "== 2/3 安装 sudoers 白名单 (NOPASSWD CAN) =="
+echo "== 2/4 安装 sudoers 白名单 (NOPASSWD CAN) =="
 sudo tee /etc/sudoers.d/arm-can >/dev/null <<'EOF'
 # 仅供 agx-arm.service(s1) 启动臂时配置 CAN 接口免密
 # 同时放行 /sbin/ip 与 /usr/sbin/ip（不同发行版路径可能不同）
@@ -33,12 +33,18 @@ s1 ALL=(root) NOPASSWD: /sbin/ip link set can0 down, \
 EOF
 sudo chmod 440 /etc/sudoers.d/arm-can
 
-echo "== 3/3 reload =="
+echo "== 3/4 reload =="
 sudo systemctl daemon-reload
 
+echo "== 4/4 重置失败状态并按需重启 =="
+sudo systemctl reset-failed agx-arm 2>/dev/null || true
+if systemctl is-enabled agx-arm >/dev/null 2>&1; then
+    sudo systemctl restart agx-arm || \
+        echo "（agx-arm 尚未 enable，未自动启动；可执行 sudo systemctl enable --now agx-arm）"
+else
+    echo "（agx-arm 未 enable；如需开机自启: sudo systemctl enable --now agx-arm）"
+fi
+
 echo ""
-echo "OK. 后续操作（任选）："
-echo "  开机自启:      sudo systemctl enable --now agx-arm"
-echo "  仅手动启动:    sudo systemctl start agx-arm"
-echo "  查看日志:      journalctl -u agx-arm -f"
-echo "  说明: 比赛日请先让 agx-arm 就绪(周期 STOW) 再启动车侧调度器下单"
+echo "OK. 查看日志: journalctl -u agx-arm -f"
+echo "说明: 比赛日请先让 agx-arm 就绪(周期 STOW) 再启动车侧调度器下单"

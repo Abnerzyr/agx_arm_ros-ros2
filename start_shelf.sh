@@ -8,7 +8,6 @@
 #
 # 与 start_arm_yolo.sh 的差异: 额外启动 aruco_tracker 与 shelf_workflow 编排节点。
 cd /home/s1/tiaozhanbei/agx_arm_ros-ros2
-rm -f /dev/shm/fastrtps* 2>/dev/null
 source install/setup.bash
 
 echo "=== Activating CAN ==="
@@ -18,16 +17,29 @@ for iface in can0 can1; do
 done
 sleep 0.5
 
-echo "=== Auto-detecting arm CAN port ==="
+echo "=== Waiting for CAN interfaces (USB-CAN may enumerate late) ==="
+for i in $(seq 1 20); do
+    [ -e /sys/class/net/can0 ] && break
+    [ -e /sys/class/net/can1 ] && break
+    sleep 1
+done
+
+echo "=== Auto-detecting arm CAN port (retry up to 6 x 10s) ==="
 CAN_PORT=""
-for iface in can0 can1; do
-    HAS_ERR=$(ip -details link show $iface 2>/dev/null | grep -c 'BUS-OFF\|NO-CARRIER' || true)
-    if [ "$HAS_ERR" -gt 0 ]; then
-        echo "  $iface: BUS-OFF/NO-CARRIER, skip"
-        continue
-    fi
-    echo "  $iface: probing..."
-    RESULT=$(timeout 8 python3 -c "
+for attempt in $(seq 1 6); do
+    for iface in can0 can1; do
+        sudo ip link set $iface down 2>/dev/null || true
+        sudo ip link set $iface up type can bitrate 1000000 2>/dev/null || true
+    done
+    sleep 0.5
+    for iface in can0 can1; do
+        HAS_ERR=$(ip -details link show $iface 2>/dev/null | grep -c 'BUS-OFF\|NO-CARRIER' || true)
+        if [ "$HAS_ERR" -gt 0 ]; then
+            echo "  $iface: BUS-OFF/NO-CARRIER, skip"
+            continue
+        fi
+        echo "  $iface: probing..."
+        RESULT=$(timeout 8 python3 -c "
 import time, sys
 from pyAgxArm import create_agx_arm_config, AgxArmFactory, ArmModel
 cfg = create_agx_arm_config(robot=ArmModel.NERO, comm='can', channel='$iface')
@@ -47,17 +59,21 @@ while time.time() - start < 3:
     time.sleep(0.01)
 arm.disconnect()
 " 2>/dev/null || echo 'FAIL')
-    if [ "$RESULT" = "OK" ]; then
-        CAN_PORT=$iface
-        echo "  $iface: arm found!"
-        break
-    else
-        echo "  $iface: no arm (result=$RESULT)"
-    fi
+        if [ "$RESULT" = "OK" ]; then
+            CAN_PORT=$iface
+            echo "  $iface: arm found!"
+            break
+        else
+            echo "  $iface: no arm (result=$RESULT)"
+        fi
+    done
+    [ -n "$CAN_PORT" ] && break
+    echo "  no arm yet (attempt $attempt/6); waiting 10s..."
+    sleep 10
 done
 
 if [ -z "$CAN_PORT" ]; then
-    echo "ERROR: cannot find arm on any CAN port"
+    echo "ERROR: cannot find arm after 6 retries"
     exit 1
 fi
 
@@ -78,7 +94,7 @@ pkill -9 -f aruco_tracker 2>/dev/null || true
 pkill -9 -f yolo_grasp 2>/dev/null || true
 pkill -9 -f place_planner 2>/dev/null || true
 pkill -9 -f grasp_target_marker 2>/dev/null || true
-pkill -9 -f robot_state_publisher 2>/dev/null || true
+pkill -9 -f 'robot_state_publisher.*__ns:=/arm' 2>/dev/null || true
 pkill -9 -f shelf_workflow 2>/dev/null || true
 sleep 1
 pkill -9 -f grasp_executor 2>/dev/null || true
