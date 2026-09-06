@@ -1,0 +1,18 @@
+[Unit]
+Description=AGX Arm stack (production, no rviz)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=s1
+ExecStart=/bin/bash /home/s1/tiaozhanbei/agx_arm_ros-ros2/start_arm_auto.sh
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target
