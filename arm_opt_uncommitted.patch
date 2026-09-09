@@ -1,0 +1,254 @@
+diff --git a/src/agx_arm_vision/agx_arm_vision/shelf_workflow_node.py b/src/agx_arm_vision/agx_arm_vision/shelf_workflow_node.py
+index 7e9afb0..5f2b5e3 100644
+--- a/src/agx_arm_vision/agx_arm_vision/shelf_workflow_node.py
++++ b/src/agx_arm_vision/agx_arm_vision/shelf_workflow_node.py
+@@ -112,13 +112,13 @@ class ShelfWorkflowNode(Node):
+         self.declare_parameter('grasp_give_up_timeout', 90.0)
+         self.declare_parameter('place_give_up_timeout', 90.0)
+         self.declare_parameter('detect_timeout', 5.0)
+-        self.declare_parameter('detect_give_up_timeout', 15.0)
++        self.declare_parameter('detect_give_up_timeout', 10.0)
+         self.declare_parameter('grasp_max_retries', 3)
+         self.declare_parameter('target_z_min', 0.01)
+         self.declare_parameter('target_z_max', 0.35)
+         self.declare_parameter('ret_home_timeout', 90.0)
+         self.declare_parameter('ret_home_exec_wait', 60.0)
+-        self.declare_parameter('align_settle_time', 3.0)
++        self.declare_parameter('align_settle_time', 1.5)
+         self.declare_parameter('box_stable_tol', 0.05)
+         self.declare_parameter('align_max_iter', 2)
+         self.declare_parameter('skip_nominal', False)
+@@ -136,12 +136,12 @@ class ShelfWorkflowNode(Node):
+         self.declare_parameter('report_topic', '/arm_task_report')
+         self.declare_parameter('report_interval', 3.0)     # STOW 周期上报 (s)
+         self.declare_parameter('stow_joint_tol', 0.12)     # STOW 关节 home 容差 (rad)
+-        self.declare_parameter('task_watchdog', 75.0)      # 任务总时长上限 (s)
++        self.declare_parameter('task_watchdog', 120.0)     # 任务总时长上限 (s)
+         # 目标合理性过滤（skip_align 无 aruco 时替代桌面 z 参考）
+         self.declare_parameter('grasp_max_reach', 0.85)    # base 系水平可达上限 (m)
+-        self.declare_parameter('grasp_z_tol', 0.03)        # 相对 z 参考的容差 (m)
+-        # 真目标中心比抓取预备位 tcp z 低约 4cm：z 带中心 = pre_grasp_z + 此偏移
+-        self.declare_parameter('grasp_z_center_offset', -0.04)
++        self.declare_parameter('grasp_z_tol', 0.07)        # 相对 z 参考的容差 (m)
++        # 真目标中心比抓取预备位 tcp z 低约 7cm：z 带中心 = pre_grasp_z + 此偏移
++        self.declare_parameter('grasp_z_center_offset', -0.07)
+         # 直线接近终点 z 的抬升量（低层防碰桌面）：终点z = 抓取预备位z + 该值
+         self.declare_parameter('low_layer_approach_z_raise', 0.04)
+ 
+@@ -283,6 +283,7 @@ class ShelfWorkflowNode(Node):
+         self._stable_ticks = 0
+         self._last_box_key = None
+         self._settle_logged = False
++        self._detect_stall_rounds = 0
+         self._executor_state = None
+         self._executor_state_time = 0.0
+         self._release_pending = False
+@@ -1325,6 +1326,7 @@ class ShelfWorkflowNode(Node):
+             plausible = self._target_plausible()
+             if fresh_box and fresh_pose and plausible:
+                 self._plausible_ticks += 1
++                self._detect_stall_rounds = 0
+             else:
+                 self._plausible_ticks = 0
+                 if fresh_box and fresh_pose and not plausible \
+@@ -1371,9 +1373,21 @@ class ShelfWorkflowNode(Node):
+                     f'or out of view')
+                 self._detect_warn_logged = True
+             if now - self._detect_start > self.detect_give_up_timeout:
+-                self._retry_detect(
+-                    now, '目标有效性不通过（等待超时）',
+-                    3, 'no valid object detected')
++                # 车/物体未动，整轮回退粗对齐纯浪费时间：先原地续采样。
++                # 连续多轮无任何有效检测，才回退粗对齐兜底（防极端假死）。
++                self._detect_stall_rounds += 1
++                if self._detect_stall_rounds >= 3:
++                    self._detect_stall_rounds = 0
++                    self._retry_detect(
++                        now, '目标有效性不通过（等待超时）',
++                        3, 'no valid object detected')
++                else:
++                    self.get_logger().warning(
++                        f'No valid detection for {int(self._detect_stall_rounds)}'
++                        f' round(s); continuing to sample in place '
++                        f'(give_up={self.detect_give_up_timeout:.0f}s/round)')
++                    self._detect_start = now
++                    self._detect_warn_logged = False
+                 return
+             return
+ 
+diff --git a/src/agx_arm_vision/agx_arm_vision/yolo_grasp_node.py b/src/agx_arm_vision/agx_arm_vision/yolo_grasp_node.py
+index cf8ac84..64b9252 100644
+--- a/src/agx_arm_vision/agx_arm_vision/yolo_grasp_node.py
++++ b/src/agx_arm_vision/agx_arm_vision/yolo_grasp_node.py
+@@ -308,7 +308,7 @@ class YoloGraspNode(Node):
+     def _joint_stability_update(self):
+         """0.2s 采样关节：delta<0.01rad 连续 3 次判定稳定。"""
+         now = self.get_clock().now().nanoseconds * 1e-9
+-        if now - self._joint_last_feedback > 0.5:
++        if now - self._joint_last_feedback > 2.0:
+             self._joint_stable = False
+             self._joint_stable_ticks = 0
+             return
+diff --git a/start_arm_prod.sh b/start_arm_prod.sh
+index 774477f..bb87c9b 100755
+--- a/start_arm_prod.sh
++++ b/start_arm_prod.sh
+@@ -14,73 +14,101 @@
+ cd /home/s1/tiaozhanbei/agx_arm_ros-ros2
+ source install/setup.bash
+ 
+-echo "=== Activating CAN ==="
+-for iface in can0 can1; do
+-    sudo ip link set $iface down 2>/dev/null || true
+-    sudo ip link set $iface up type can bitrate 1000000 2>/dev/null || true
+-done
+-sleep 0.5
+-
+-echo "=== Waiting for CAN interfaces (USB-CAN may enumerate late) ==="
+-for i in $(seq 1 20); do
+-    [ -e /sys/class/net/can0 ] && break
+-    [ -e /sys/class/net/can1 ] && break
+-    sleep 1
+-done
++# 动态发现所有 can 接口（USB-CAN 枚举顺序会变，can0/can1/can2 都可能）
++can_ifaces() {
++    ls /sys/class/net 2>/dev/null | grep -E '^can[0-9]+$' | sort
++}
++
++# gs_usb USB-CAN 复位：固件偶发 USB 超时/bitrate 失败死锁，unbind/bind 重启驱动恢复
++reset_gs_usb() {
++    local id
++    for id in $(ls /sys/bus/usb/drivers/gs_usb/ 2>/dev/null | grep ':1\.0$'); do
++        echo "  [gs_usb] resetting $id"
++        sudo sh -c "echo '$id' > /sys/bus/usb/drivers/gs_usb/unbind" 2>/dev/null || true
++        sleep 1
++        sudo sh -c "echo '$id' > /sys/bus/usb/drivers/gs_usb/bind" 2>/dev/null || true
++        sleep 2
++    done
++}
++
++# 将单个 can 接口 up 到可探测状态；已 UP 则不动（避免频繁 down/up 触发 gs_usb 固件死锁）
++iface_up_ok() {
++    local iface=$1
++    local st
++    st=$(ip -br link show "$iface" 2>/dev/null | awk '{print $2}')
++    if [ "$st" != "UP" ]; then
++        # 接口未 up：重置（清 BUS-OFF）后重新 up
++        sudo ip link set "$iface" down 2>/dev/null || true
++        sleep 0.3
++        sudo ip link set "$iface" up type can bitrate 1000000 restart-ms 100 2>/dev/null || true
++        sleep 0.8
++        st=$(ip -br link show "$iface" 2>/dev/null | awk '{print $2}')
++    fi
++    [ "$st" = "UP" ] || return 1
++    if ip -details link show "$iface" 2>/dev/null | grep -q 'BUS-OFF\|NO-CARRIER'; then
++        return 1
++    fi
++    return 0
++}
+ 
+-echo "=== Auto-detecting arm CAN port (retry up to 6 x 10s) ==="
++echo "=== Auto-detecting arm CAN port (常驻等待，上电自动接管) ==="
+ CAN_PORT=""
+-for attempt in $(seq 1 6); do
+-    for iface in can0 can1; do
+-        sudo ip link set $iface down 2>/dev/null || true
+-        sudo ip link set $iface up type can bitrate 1000000 2>/dev/null || true
+-    done
+-    sleep 0.5
+-    for iface in can0 can1; do
+-        HAS_ERR=$(ip -details link show $iface 2>/dev/null | grep -c 'BUS-OFF\|NO-CARRIER' || true)
+-        if [ "$HAS_ERR" -gt 0 ]; then
+-            echo "  $iface: BUS-OFF/NO-CARRIER, skip"
++cycle=0
++while [ -z "$CAN_PORT" ]; do
++    cycle=$((cycle + 1))
++    if [ -n "${ARM_CAN_PORT:-}" ]; then
++        IFACES="$ARM_CAN_PORT"
++    else
++        IFACES=$(can_ifaces)
++    fi
++    if [ -z "$IFACES" ]; then
++        echo "  no can interface yet; waiting for USB-CAN..."
++        sleep 5
++        continue
++    fi
++    for iface in $IFACES; do
++        if ! iface_up_ok "$iface"; then
++            echo "  $iface: cannot bring UP; skip"
+             continue
+         fi
+         echo "  $iface: probing..."
+         RESULT=$(timeout 8 python3 -c "
+-import time, sys
++import sys
+ from pyAgxArm import create_agx_arm_config, AgxArmFactory, ArmModel
+-cfg = create_agx_arm_config(robot=ArmModel.NERO, comm='can', channel='$iface')
+-arm = AgxArmFactory.create_arm(cfg)
+-arm.connect()
+-start = time.time()
+-while time.time() - start < 3:
+-    if hasattr(arm, 'set_normal_mode'):
+-        arm.set_normal_mode()
+-    if arm.enable():
+-        a = arm.get_joint_angles()
+-        if a and a.msg:
+-            arm.disconnect()
++for ver in ('default', 'v112'):
++    try:
++        cfg = create_agx_arm_config(robot=ArmModel.NERO, comm='can',
++                                    channel='$iface', firmeware_version=ver)
++        arm = AgxArmFactory.create_arm(cfg)
++        arm.connect()
++        s = arm.get_joints_enable_status_list()
++        arm.disconnect()
++        if isinstance(s, list) and len(s) >= 7:
+             print('OK')
+             sys.exit(0)
+-        break
+-    time.sleep(0.01)
+-arm.disconnect()
++    except Exception:
++        continue
++print('FAIL')
+ " 2>/dev/null || echo 'FAIL')
+         if [ "$RESULT" = "OK" ]; then
+             CAN_PORT=$iface
+             echo "  $iface: arm found!"
+             break
+-        else
+-            echo "  $iface: no arm (result=$RESULT)"
+         fi
++        echo "  $iface: no arm (result=$RESULT)"
+     done
+     [ -n "$CAN_PORT" ] && break
+-    echo "  no arm yet (attempt $attempt/6); waiting 10s..."
+-    sleep 10
++    # 低频 gs_usb 复位（防 candleLight 固件死锁），每 5 轮(~100s)一次
++    if (( cycle % 5 == 0 )); then
++        echo "[wait] no arm after ${cycle} cycles; resetting gs_usb..."
++        reset_gs_usb
++    else
++        WAIT_MIN=$((cycle * 20 / 60))
++        echo "[wait] no arm yet (cycle $cycle, ~${WAIT_MIN} min); waiting 20s..."
++    fi
++    sleep 20
+ done
+ 
+-if [ -z "$CAN_PORT" ]; then
+-    echo "ERROR: cannot find arm after 6 retries"
+-    exit 1
+-fi
+-
+ echo "=== Resetting CAN port state ==="
+ sudo ip link set $CAN_PORT down 2>/dev/null || true
+ sleep 1
+@@ -111,7 +139,7 @@ ros2 launch agx_arm_ctrl start_single_agx_arm_moveit.launch.py \
+   effector_type:=agx_gripper \
+   auto_enable:=true \
+   auto_control_gate:=true \
+-  speed_percent:=10 \
++  speed_percent:=20 \
+   fw_version:=v111 \
+   auto_home:=true \
+   use_rviz:=false \

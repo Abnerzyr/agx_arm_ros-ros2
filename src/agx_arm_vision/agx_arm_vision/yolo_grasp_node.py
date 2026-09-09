@@ -152,6 +152,7 @@ class YoloGraspNode(Node):
         self._joint_stable_ticks = 0
         self._joint_last_feedback = 0.0
         self._joint_prev = None
+        self._vision_gate = True
         self._joint_pos = None
         self._joint_moving_logged = 0.0
         self._map_enabled = True
@@ -197,6 +198,8 @@ class YoloGraspNode(Node):
             Bool, 'map_update_enable', self.map_update_cb, 10)
         self.create_subscription(
             JointState, 'feedback/joint_states', self.joint_state_cb, 10)
+        self.create_subscription(
+            Bool, 'vision_gate', self.vision_gate_cb, 10)
         if _ArucoMsg is not None:
             self.create_subscription(
                 _ArucoMsg, '/aruco_detections', self.aruco_cb, 10)
@@ -437,9 +440,17 @@ class YoloGraspNode(Node):
             out.append((x1, y1, x2, y2))
         return out
 
+    def vision_gate_cb(self, msg):
+        """shelf_workflow 门控：False 时跳过 YOLO 推理省 CPU。"""
+        self._vision_gate = bool(msg.data)
+
     def process(self):
         if (self.depth_img is None or self.rgb_img is None
                 or self.camera_info is None):
+            return
+        # 视觉门控：shelf_workflow 仅 WAIT_DETECT 需要检测；
+        # 其余状态(握物/IDLE 等)跳过推理，省 CPU（导航时机械臂待命的关键）
+        if not self._vision_gate:
             return
         now = self.get_clock().now().nanoseconds * 1e-9
         # 臂未稳定：丢弃动中/未停稳采的帧（会导致点云倾斜、目标浮空）

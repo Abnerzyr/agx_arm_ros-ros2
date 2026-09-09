@@ -77,6 +77,9 @@ class AgxArmRosNode(Node):
         self._log_parameters()
 
         ### AgxArmFactory
+        self._reconnect_since = None
+        self._reconnecting = False
+        self._arm_driver = None
         self._init_agx_arm()
 
         ### effector
@@ -286,6 +289,10 @@ class AgxArmRosNode(Node):
         if 0 < self.speed_percent <= 100:
             self.agx_arm.set_speed_percent(self.speed_percent)
         self.agx_arm.set_tcp_offset(self.tcp_offset)
+        # 记录当前 driver 版本，供失连后自动重连复用
+        self._arm_driver = (
+            None if firmeware_version == PiperFW.DEFAULT
+            else firmeware_version)
 
     def _init_effector(self):
         self.gripper: Optional[AgxGripperWrapper] = None
@@ -500,12 +507,59 @@ class AgxArmRosNode(Node):
         return True
 
     ### publisher thread
+    def _reconnect_arm(self):
+        """失连自愈：断开重建 pyAgxArm 连接并重新使能电机。"""
+        if self._reconnecting:
+            return
+        self._reconnecting = True
+        self.get_logger().warn('Arm feedback lost; reconnecting arm connection...')
+        try:
+            try:
+                self.agx_arm.disconnect()
+            except Exception:
+                pass
+            cfg_kwargs = dict(
+                robot=self.arm_type, comm='can', channel=self.can_port)
+            if self._arm_driver:
+                cfg_kwargs['firmeware_version'] = self._arm_driver
+            cfg = create_agx_arm_config(**cfg_kwargs)
+            self.agx_arm = AgxArmFactory.create_arm(cfg)
+            self.agx_arm.connect()
+            ok = False
+            start = time.time()
+            while time.time() - start < self.enable_timeout:
+                try:
+                    if hasattr(self.agx_arm, 'set_normal_mode'):
+                        self.agx_arm.set_normal_mode()
+                    if self.agx_arm.enable():
+                        ok = True
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.01)
+            if ok:
+                if 0 < self.speed_percent <= 100:
+                    self.agx_arm.set_speed_percent(self.speed_percent)
+                self.agx_arm.set_tcp_offset(self.tcp_offset)
+                self.enable_flag = True
+                self.control_ready = False
+                self._control_ready_logged = False
+                self.get_logger().info('Arm reconnected and enabled OK')
+            else:
+                self.get_logger().error('Reconnect: arm enable failed')
+        except Exception as exc:
+            self.get_logger().error(f'Reconnect failed: {exc}')
+        finally:
+            self._reconnecting = False
+            self._reconnect_since = None
+
     def _publish_thread(self):
         rate = self.create_rate(self.pub_rate)
 
         # publishing loop
         while rclpy.ok():
             if self.agx_arm.is_ok():
+                self._reconnect_since = None
                 if not self.control_ready and self._check_arm_ready():
                     self.control_ready = True
                     if not self._control_ready_logged:
@@ -516,6 +570,14 @@ class AgxArmRosNode(Node):
                 self._publish_arm_status()
                 self._publish_effector_status()
                 self._publish_leader_joint_states()
+            else:
+                # 失连自愈：持续收不到反馈则重连+重新使能，避免永久空转
+                now = time.time()
+                if self._reconnect_since is None:
+                    self._reconnect_since = now
+                elif (now - self._reconnect_since > 5.0
+                        and not self._reconnecting):
+                    self._reconnect_arm()
             rate.sleep()
     
     ### publish methods

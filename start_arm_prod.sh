@@ -46,24 +46,22 @@ while [ -z "$CAN_PORT" ]; do
         fi
         echo "  $iface: probing..."
         RESULT=$(timeout 8 python3 -c "
-import time, sys
+import sys
 from pyAgxArm import create_agx_arm_config, AgxArmFactory, ArmModel
-cfg = create_agx_arm_config(robot=ArmModel.NERO, comm='can', channel='$iface')
-arm = AgxArmFactory.create_arm(cfg)
-arm.connect()
-start = time.time()
-while time.time() - start < 3:
-    if hasattr(arm, 'set_normal_mode'):
-        arm.set_normal_mode()
-    if arm.enable():
-        a = arm.get_joint_angles()
-        if a and a.msg:
-            arm.disconnect()
+for ver in ('default', 'v112'):
+    try:
+        cfg = create_agx_arm_config(robot=ArmModel.NERO, comm='can',
+                                    channel='$iface', firmeware_version=ver)
+        arm = AgxArmFactory.create_arm(cfg)
+        arm.connect()
+        s = arm.get_joints_enable_status_list()
+        arm.disconnect()
+        if isinstance(s, list) and len(s) >= 7:
             print('OK')
             sys.exit(0)
-        break
-    time.sleep(0.01)
-arm.disconnect()
+    except Exception:
+        continue
+print('FAIL')
 " 2>/dev/null || echo 'FAIL')
         if [ "$RESULT" = "OK" ]; then
             CAN_PORT=$iface
@@ -116,6 +114,7 @@ ros2 launch agx_arm_ctrl start_single_agx_arm_moveit.launch.py \
   speed_percent:=20 \
   fw_version:=v111 \
   auto_home:=true \
+  pub_rate:=50 \
   use_rviz:=false \
   follow:=true \
   namespace:=arm &
@@ -202,4 +201,9 @@ echo "Manual commands (注意 /arm/ 前缀):"
 echo "  ros2 topic pub --once -w 1 /arm/task_command std_msgs/msg/Int32 '{data: 1}'"
 echo "  ros2 topic pub --once -w 1 /arm/release_command std_msgs/msg/Empty '{}'"
 echo "  ros2 topic pub --once -w 1 /arm/manual_release_force std_msgs/msg/Empty '{}'  # 原地松爪（手动兜底）"
+
+echo "=== Starting arm watchdog (运行中掉电自动重启触发 auto-home) ==="
+nohup python3 /home/s1/tiaozhanbei/agx_arm_ros-ros2/arm_watchdog.py >/tmp/arm_watchdog.log 2>&1 &
+echo "  arm_watchdog PID=$!"
+
 wait

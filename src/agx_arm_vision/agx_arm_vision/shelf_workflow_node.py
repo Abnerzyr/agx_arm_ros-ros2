@@ -13,7 +13,7 @@ from rclpy.node import Node
 from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import Image, JointState
 from moveit_msgs.srv import GetPositionFK
-from std_msgs.msg import ColorRGBA, Empty, Float32, Float64MultiArray, Header, Int32, String
+from std_msgs.msg import Bool, ColorRGBA, Empty, Float32, Float64MultiArray, Header, Int32, String
 from std_srvs.srv import Empty as ClearSrv
 from tf2_ros import Buffer, TransformException, TransformListener
 from visualization_msgs.msg import Marker
@@ -241,6 +241,9 @@ class ShelfWorkflowNode(Node):
         # 车-臂协议：完成/失败上报（绝对话题，勿加 /arm 前缀）
         self.report_pub = self.create_publisher(
             String, self.report_topic, 10)
+        # 视觉门控：仅 WAIT_DETECT 需要 YOLO 满速推理；其余状态(含握物/IDLE)让 yolo 降载省 CPU
+        self._vision_gate_pub = self.create_publisher(Bool, 'vision_gate', 10)
+        self._vision_gate_pub.publish(Bool(data=False))
         # 分级回退路径（给 grasp_executor：抓取预备位→粗对准位）
         self._retract_path_pub = self.create_publisher(
             Float64MultiArray, 'grasp_retract_path', 10)
@@ -578,6 +581,8 @@ class ShelfWorkflowNode(Node):
             self._start_depth_monitor()
         elif state == self.IDLE:
             self._stop_depth_monitor()
+        # 视觉门控：仅 WAIT_DETECT 需要视觉检测，其余状态让 YOLO 降载
+        self._vision_gate_pub.publish(Bool(data=(state == self.WAIT_DETECT)))
 
     def _target_plausible(self):
         """目标合理性校验（A）：
