@@ -113,6 +113,7 @@ class ShelfWorkflowNode(Node):
         self.declare_parameter('grasp_fail_timeout', 20.0)
         self.declare_parameter('grasp_give_up_timeout', 90.0)
         self.declare_parameter('place_give_up_timeout', 90.0)
+        self.declare_parameter('place_pose_wait_timeout', 30.0)
         self.declare_parameter('detect_timeout', 5.0)
         self.declare_parameter('detect_give_up_timeout', 15.0)
         self.declare_parameter('grasp_max_retries', 3)
@@ -173,6 +174,8 @@ class ShelfWorkflowNode(Node):
             'grasp_give_up_timeout').value
         self.place_give_up_timeout = self.get_parameter(
             'place_give_up_timeout').value
+        self.place_pose_wait_timeout = float(
+            self.get_parameter('place_pose_wait_timeout').value)
         self.detect_timeout = self.get_parameter('detect_timeout').value
         self.detect_give_up_timeout = self.get_parameter(
             'detect_give_up_timeout').value
@@ -249,6 +252,10 @@ class ShelfWorkflowNode(Node):
         # 视觉门控：仅 WAIT_DETECT 需要 YOLO 满速推理；其余状态(含握物/IDLE)让 yolo 降载省 CPU
         self._vision_gate_pub = self.create_publisher(Bool, 'vision_gate', 10)
         self._vision_gate_pub.publish(Bool(data=False))
+        # 放置门控：仅"车已到位、即将放物"窗口(收到 release_command→回 IDLE)让 place_planner 计算省 CPU
+        self._place_gate_pub = self.create_publisher(
+            Bool, 'place_plan_enable', 10)
+        self._place_gate_pub.publish(Bool(data=False))
         # 分级回退路径（给 grasp_executor：抓取预备位→粗对准位）
         self._retract_path_pub = self.create_publisher(
             Float64MultiArray, 'grasp_retract_path', 10)
@@ -266,6 +273,8 @@ class ShelfWorkflowNode(Node):
             Marker, 'yolo/target_box', self.target_box_cb, 10)
         self.create_subscription(
             PoseStamped, 'grasp_pose', self.grasp_pose_cb, 10)
+        self.create_subscription(
+            PoseStamped, 'place_pose', self.place_pose_cb, 10)
         self.create_subscription(
             Int32, 'grasp_executor_state', self.executor_state_cb, 10)
         self.create_subscription(
@@ -296,6 +305,11 @@ class ShelfWorkflowNode(Node):
         self._executor_state = None
         self._executor_state_time = 0.0
         self._release_pending = False
+        self._place_enable = False
+        self._release_armed = False
+        self._release_wait_start = 0.0
+        self._place_enable_time = 0.0
+        self._last_place_pose_time = 0.0
         self._skip_align = self.skip_align
         self._preset_home = False
         self._startup_home_sent = False
@@ -356,6 +370,7 @@ class ShelfWorkflowNode(Node):
         self._task_start = 0.0
 
         self.create_timer(0.1, self.tick)
+        self.create_timer(1.0, self._gate_heartbeat)
         self.create_timer(self._report_interval, self._stow_report_tick)
         self.get_logger().info(
             'Shelf workflow ready; waiting for /task_command (layer 1-3)')
@@ -421,7 +436,7 @@ class ShelfWorkflowNode(Node):
         del msg
         self._release_pending = True
         if self.state == self.WAIT_RELEASE_CMD:
-            self._fire_release()
+            self._arm_place_release()
         else:
             self.get_logger().info(
                 'Release command stored; will be applied when ready')
@@ -460,6 +475,11 @@ class ShelfWorkflowNode(Node):
             float(msg.pose.position.z))
         self._latest_grasp_pose = msg
         self._last_grasp_pose_time = self.get_clock().now().nanoseconds * 1e-9
+
+    def place_pose_cb(self, msg):
+        del msg
+        self._last_place_pose_time = (
+            self.get_clock().now().nanoseconds * 1e-9)
 
     def depth_mon_cb(self, msg):
         del msg
@@ -577,6 +597,33 @@ class ShelfWorkflowNode(Node):
             '[TEST] preset_home set; NOMINAL_POSE will use home position')
 
     # ------------------------------------------------------------------
+    # 门控发布（视觉/放置），事件触发 + 1s 心跳
+    # ------------------------------------------------------------------
+    def _publish_gates(self):
+        """统一发布 vision_gate 与 place_plan_enable 当前值。"""
+        self._vision_gate_pub.publish(
+            Bool(data=(self.state == self.WAIT_DETECT)))
+        self._place_gate_pub.publish(Bool(data=self._place_enable))
+
+    def _gate_heartbeat(self):
+        self._publish_gates()
+
+    def _arm_place_release(self):
+        """收到 release_command 且已到 WAIT_RELEASE_CMD：先使能 place_planner，
+        等拿到新 /place_pose 后再真正触发放物（避免竞态空放/误判失败）。"""
+        if self._release_armed:
+            return
+        now = self.get_clock().now().nanoseconds * 1e-9
+        self._place_enable = True
+        self._place_enable_time = now
+        self._release_wait_start = now
+        self._release_armed = True
+        self._publish_gates()
+        self.get_logger().info(
+            'Release command: place_planner enabled; waiting for fresh '
+            '/place_pose before triggering release')
+
+    # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
     def _set_state(self, state):
@@ -590,8 +637,10 @@ class ShelfWorkflowNode(Node):
             self._start_depth_monitor()
         elif state == self.IDLE:
             self._stop_depth_monitor()
-        # 视觉门控：仅 WAIT_DETECT 需要视觉检测，其余状态让 YOLO 降载
-        self._vision_gate_pub.publish(Bool(data=(state == self.WAIT_DETECT)))
+            # 放置结束/收尾回到 IDLE → 关 place 计算（防重试期间保持开，见 release 流程）
+            self._place_enable = False
+            self._release_armed = False
+        self._publish_gates()
 
     def _target_plausible(self):
         """目标合理性校验（A）：
@@ -680,6 +729,10 @@ class ShelfWorkflowNode(Node):
 
     def _reset_cycle_vars(self):
         self._release_pending = False
+        self._release_armed = False
+        self._release_wait_start = 0.0
+        self._place_enable_time = 0.0
+        self._last_place_pose_time = 0.0
         self._home_sent = False
         self._home_done = False
         self._home_done_time = 0.0
@@ -1443,8 +1496,37 @@ class ShelfWorkflowNode(Node):
             return
 
         if self.state == self.WAIT_RELEASE_CMD:
-            if self._release_pending:
-                self._fire_release()
+            if self._release_pending and not self._release_armed:
+                self._arm_place_release()
+            if self._release_armed:
+                # 等到 place_planner 使能后产出新 pose，再真正触发放物
+                if (self._last_place_pose_time > 0.0
+                        and self._last_place_pose_time
+                        > self._place_enable_time):
+                    self._release_pending = False
+                    self._release_armed = False
+                    self._fire_release()
+                    return
+                if (now - self._release_wait_start
+                        > self.place_pose_wait_timeout):
+                    # 30s 仍无新 pose（识别/计算/相机延迟）→ 记为超时失败：
+                    # 原地松爪让 executor 回 IDLE，再收臂回 home 并上报失败
+                    if self._executor_state == self.EXECUTOR_WAIT_RELEASE \
+                            and not self._release_force_sent:
+                        self._release_force_sent = True
+                        self.release_force_pub.publish(Empty())
+                        self.get_logger().warning(
+                            'No place pose within %.0fs; force-opening '
+                            'gripper before abort'
+                            % self.place_pose_wait_timeout)
+                        return
+                    if self._executor_state == self.EXECUTOR_IDLE:
+                        self._release_pending = False
+                        self._release_armed = False
+                        self._abort_task(
+                            7, 'place planner produced no pose within '
+                               '%.0fs' % self.place_pose_wait_timeout)
+                    return
             return
 
         if self.state == self.PLACING:

@@ -62,6 +62,7 @@ class YoloGraspNode(Node):
         self.declare_parameter('box_padding', 0.005)
         self.declare_parameter('min_range', 0.15)
         self.declare_parameter('depth_stale_timeout', 3.0)
+        self.declare_parameter('gate_timeout', 5.0)
         self.declare_parameter('table_removal_tol', 0.01)
         self.declare_parameter('min_depth_span', 0.02)
         self.declare_parameter('min_grasp_height', 0.01)
@@ -115,6 +116,7 @@ class YoloGraspNode(Node):
         self.min_range = self.get_parameter('min_range').value
         self.depth_stale_timeout = float(
             self.get_parameter('depth_stale_timeout').value)
+        self.gate_timeout = float(self.get_parameter('gate_timeout').value)
         self.box_exclude_window = self.get_parameter(
             'box_exclude_window').value
         self.table_removal_tol = float(
@@ -155,6 +157,7 @@ class YoloGraspNode(Node):
         self._joint_last_feedback = 0.0
         self._joint_prev = None
         self._vision_gate = True
+        self._gate_last = 0.0
         self._joint_pos = None
         self._joint_moving_logged = 0.0
         self._map_enabled = True
@@ -445,16 +448,24 @@ class YoloGraspNode(Node):
     def vision_gate_cb(self, msg):
         """shelf_workflow 门控：False 时跳过 YOLO 推理省 CPU。"""
         self._vision_gate = bool(msg.data)
+        self._gate_last = self.get_clock().now().nanoseconds * 1e-9
 
     def process(self):
+        now = self.get_clock().now().nanoseconds * 1e-9
         if (self.depth_img is None or self.rgb_img is None
                 or self.camera_info is None):
             return
         # 视觉门控：shelf_workflow 仅 WAIT_DETECT 需要检测；
-        # 其余状态(握物/IDLE 等)跳过推理，省 CPU（导航时机械臂待命的关键）
-        if not self._vision_gate:
+        # 其余状态(握物/IDLE 等)跳过推理，省 CPU（导航时机械臂待命的关键）。
+        # 门控消息缺失/超时(gate_timeout)未再收到 → 自动回退使能，
+        # 避免 workflow 崩溃后停在 false 导致视觉永久停摆。
+        if self._gate_last > 0.0 \
+                and now - self._gate_last <= self.gate_timeout:
+            gate = self._vision_gate
+        else:
+            gate = True
+        if not gate:
             return
-        now = self.get_clock().now().nanoseconds * 1e-9
         # 臂未稳定：丢弃动中/未停稳采的帧（会导致点云倾斜、目标浮空）
         if not self._joint_stable:
             if now - self._joint_moving_logged > 5.0:

@@ -61,6 +61,10 @@ class PlacePlanner(Node):
         self._place_enabled = True
         self._last_place_msg_time = 0.0
         self._last_spot_idx = None
+        # 放置计算门控：shelf_workflow 在"即将放物"窗口置 true（place_plan_enable）。
+        # 兜底：从未收到过门控消息 → 视为使能，保持独立运行行为不变。
+        self._plan_gate = True
+        self._plan_gate_seen = False
 
         self.create_subscription(
             Image, self.get_parameter('depth_topic').value,
@@ -70,6 +74,8 @@ class PlacePlanner(Node):
             self.info_callback, 10)
         self.create_subscription(
             Bool, 'place_update_enable', self.place_update_cb, 10)
+        self.create_subscription(
+            Bool, 'place_plan_enable', self.plan_gate_cb, 10)
 
         self.place_pub = self.create_publisher(
             PoseStamped, 'place_pose', 10)
@@ -92,6 +98,11 @@ class PlacePlanner(Node):
     def place_update_cb(self, msg):
         self._place_enabled = msg.data
         self._last_place_msg_time = self.get_clock().now().nanoseconds * 1e-9
+
+    def plan_gate_cb(self, msg):
+        """shelf_workflow 放物门控：false 时跳过 RANSAC/选点/发布省 CPU。"""
+        self._plan_gate_seen = True
+        self._plan_gate = bool(msg.data)
 
     def _cloud_gate(self):
         return self._place_enabled
@@ -150,6 +161,8 @@ class PlacePlanner(Node):
         return best_n, best_d
 
     def process(self):
+        if self._plan_gate_seen and not self._plan_gate:
+            return
         if self.depth_img is None or self.camera_info is None:
             self.get_logger().info(
                 '[PLACE] skip: no depth/camera_info', throttle_duration_sec=5.0)
