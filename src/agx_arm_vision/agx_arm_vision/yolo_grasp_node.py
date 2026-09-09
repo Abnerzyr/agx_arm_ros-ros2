@@ -55,6 +55,7 @@ class YoloGraspNode(Node):
         self.declare_parameter(
             'info_topic', '/camera/camera/color/camera_info')
         self.declare_parameter('confidence_threshold', 0.15)
+        self.declare_parameter('publish_viz', True)
         self.declare_parameter('grasp_quality_threshold', 0.3)
         self.declare_parameter('max_grasp_depth', 2.0)
         self.declare_parameter('input_size', 224)
@@ -105,6 +106,7 @@ class YoloGraspNode(Node):
         self.camera_optical_frame = self.get_parameter(
             'camera_optical_frame').value
         self.conf_threshold = self.get_parameter('confidence_threshold').value
+        self.publish_viz = bool(self.get_parameter('publish_viz').value)
         self.grasp_quality = self.get_parameter('grasp_quality_threshold').value
         self.max_grasp_depth = float(
             self.get_parameter('max_grasp_depth').value)
@@ -480,9 +482,10 @@ class YoloGraspNode(Node):
             self._publish_cloud(depth)
             return
 
-        det_img = results[0].plot()
-        det_img = cv2.cvtColor(det_img, cv2.COLOR_RGB2BGR)
-        self._publish_image(self.det_img_pub, det_img)
+        if self.publish_viz:
+            det_img = results[0].plot()
+            det_img = cv2.cvtColor(det_img, cv2.COLOR_RGB2BGR)
+            self._publish_image(self.det_img_pub, det_img)
 
         valid_boxes = self._valid_boxes(boxes, depth, w, h)
 
@@ -575,7 +578,8 @@ class YoloGraspNode(Node):
             patch_d, 0, crop_side - ch, 0, crop_side - cw_real,
             cv2.BORDER_REPLICATE)
 
-        self._publish_image(self.crop_img_pub, crop_rgb)
+        if self.publish_viz:
+            self._publish_image(self.crop_img_pub, crop_rgb)
 
         d_valid = (crop_d > 0.05) & np.isfinite(crop_d)
         if d_valid.sum() < 100:
@@ -706,7 +710,8 @@ class YoloGraspNode(Node):
             quality, cos_ang, sin_ang, width = self.grconv(tensor)
 
         quality_np = gaussian(quality.squeeze().cpu().numpy(), 2.0, preserve_range=True)
-        self._publish_quality(quality_np)
+        if self.publish_viz:
+            self._publish_quality(quality_np)
         ang_np = (torch.atan2(sin_ang, cos_ang) / 2.0).squeeze().cpu().numpy()
         ang_np = gaussian(ang_np, 2.0, preserve_range=True)
         width_np = width.squeeze().cpu().numpy() * 150.0
@@ -1024,8 +1029,9 @@ class YoloGraspNode(Node):
         z = depth[vv, uu]
         valid = (z > self.min_range) & (z < 2.0) & np.isfinite(z)
 
-        self._publish_points(
-            self.cloud_pub, uu[valid], vv[valid], z[valid], t)
+        if self.publish_viz:
+            self._publish_points(
+                self.cloud_pub, uu[valid], vv[valid], z[valid], t)
 
         # obj_mask 优先：只挖物体真实轮廓（外圈桌面保留为真实点，避免 octomap
         # 物体周围"少一圈"）。无 obj_mask 时回退到矩形 exclude_box。

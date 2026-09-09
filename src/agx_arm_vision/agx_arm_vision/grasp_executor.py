@@ -76,6 +76,7 @@ class GraspExecutor(Node):
             [1.5446, -0.4858, -0.006, 2.103, 0.004, 0.0208, 0.9801])
         self.declare_parameter('grasp_only', False)
         self.declare_parameter('test_flow', False)
+        self.declare_parameter('publish_viz', True)
         self.declare_parameter('lift_verify', True)
         self.declare_parameter('lift_distance', 0.03)
         self.declare_parameter('lift_hold_time', 2.0)
@@ -136,6 +137,7 @@ class GraspExecutor(Node):
         self.home_joints = self.get_parameter('home_joints').value
         self.grasp_only = bool(self.get_parameter('grasp_only').value)
         self.test_flow = bool(self.get_parameter('test_flow').value)
+        self.publish_viz = bool(self.get_parameter('publish_viz').value)
         self._auto_release_sent = False
         self.lift_verify = bool(self.get_parameter('lift_verify').value)
         self.lift_distance = float(
@@ -251,8 +253,6 @@ class GraspExecutor(Node):
         self._place_abort_open = False
         self._place_attempt = 0
         self._place_retry_state = None
-        self.move_j_pub = self.create_publisher(
-            JointState, 'control/move_j', 10)
         self.state_pub = self.create_publisher(
             Int32, 'grasp_executor_state', 10)
         self.map_update_pub = self.create_publisher(
@@ -625,14 +625,15 @@ class GraspExecutor(Node):
             and not self._place_rebuild_done
             and not self._place_validation_sent)
         self.place_update_pub.publish(place_update)
-        if self.stored_pose is not None:
-            display = PoseStamped()
-            display.header.frame_id = self.stored_frame
-            display.header.stamp = self.get_clock().now().to_msg()
-            display.pose = self.stored_pose
-            self.grasp_display_pub.publish(display)
-        if self._latched_box_msg is not None:
-            self.box_display_pub.publish(self._latched_box_msg)
+        if self.publish_viz:
+            if self.stored_pose is not None:
+                display = PoseStamped()
+                display.header.frame_id = self.stored_frame
+                display.header.stamp = self.get_clock().now().to_msg()
+                display.pose = self.stored_pose
+                self.grasp_display_pub.publish(display)
+            if self._latched_box_msg is not None:
+                self.box_display_pub.publish(self._latched_box_msg)
 
         if self.state == self.IDLE and self.validating_target:
             if not self._box_applied:

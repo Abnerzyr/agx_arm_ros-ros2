@@ -106,6 +106,8 @@ class ShelfWorkflowNode(Node):
         self.declare_parameter('camera_frame', 'camera_color_optical_frame')
         self.declare_parameter('arm_group', 'arm')
         self.declare_parameter('velocity_scaling', 0.1)
+        self.declare_parameter('publish_viz', True)
+        self.declare_parameter('depth_mon_enable', True)
         self.declare_parameter('aruco_timeout', 5.0)
         self.declare_parameter('align_give_up_timeout', 15.0)
         self.declare_parameter('grasp_fail_timeout', 20.0)
@@ -159,6 +161,9 @@ class ShelfWorkflowNode(Node):
         self.end_effector = self.get_parameter('end_effector_link').value
         self.camera_frame = self.get_parameter('camera_frame').value
         self.velocity_scaling = self.get_parameter('velocity_scaling').value
+        self.publish_viz = bool(self.get_parameter('publish_viz').value)
+        self.depth_mon_enable = bool(
+            self.get_parameter('depth_mon_enable').value)
         self.aruco_timeout = self.get_parameter('aruco_timeout').value
         self.align_give_up_timeout = self.get_parameter(
             'align_give_up_timeout').value
@@ -270,9 +275,11 @@ class ShelfWorkflowNode(Node):
         self.create_subscription(
             Empty, 'shelf/preset_home', self.preset_home_cb, 10)
         # 深度停滞监测（诊断用）：订阅对齐深度，只记到达时刻
-        self._depth_mon_sub = self.create_subscription(
-            Image, '/camera/camera/aligned_depth_to_color/image_raw',
-            self.depth_mon_cb, 1)
+        self._depth_mon_sub = None
+        if self.depth_mon_enable:
+            self._depth_mon_sub = self.create_subscription(
+                Image, '/camera/camera/aligned_depth_to_color/image_raw',
+                self.depth_mon_cb, 1)
         # 关节状态（用于"臂稳定才规划下一动"）
         self.create_subscription(
             JointState, 'feedback/joint_states', self.joint_state_cb, 10)
@@ -499,6 +506,8 @@ class ShelfWorkflowNode(Node):
         return self._joint_stable
 
     def _start_depth_monitor(self):
+        if not self.depth_mon_enable:
+            return
         self._depth_arrival = self.get_clock().now().nanoseconds * 1e-9
         self._depth_mon_on = True
         self._depth_mon_start = self._depth_arrival
@@ -1090,6 +1099,8 @@ class ShelfWorkflowNode(Node):
         return float(np.linalg.norm(actual - target))
 
     def _publish_align_target(self, pose):
+        if not self.publish_viz:
+            return
         header = Header()
         header.frame_id = self.base_frame
         header.stamp = self.get_clock().now().to_msg()

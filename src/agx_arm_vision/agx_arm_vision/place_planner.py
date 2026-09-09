@@ -34,6 +34,7 @@ class PlacePlanner(Node):
         self.declare_parameter('min_range', 0.15)
         self.declare_parameter('reach_radius', 0.35)
         self.declare_parameter('process_period', 0.5)
+        self.declare_parameter('publish_viz', True)
 
         self.base_frame = self.get_parameter('base_frame').value
         self.end_effector_link = self.get_parameter(
@@ -48,6 +49,7 @@ class PlacePlanner(Node):
         self.min_range = self.get_parameter('min_range').value
         self.reach_radius = self.get_parameter('reach_radius').value
         self.process_period = self.get_parameter('process_period').value
+        self.publish_viz = bool(self.get_parameter('publish_viz').value)
 
         self.bridge = CvBridge()
         self.model_cam = PinholeCameraModel()
@@ -280,7 +282,8 @@ class PlacePlanner(Node):
             x_spot, y_spot, z_spot, transform)
 
         self._publish_place_pose(base_pt, transform)
-        self._publish_marker(base_pt)
+        if self.publish_viz:
+            self._publish_marker(base_pt)
         self.get_logger().info(
             f'Place spot: ({base_pt[0]:.3f}, {base_pt[1]:.3f}, '
             f'{base_pt[2]:.3f}) clearance={clearance_m:.3f}m')

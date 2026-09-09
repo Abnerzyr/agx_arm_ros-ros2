@@ -161,7 +161,8 @@ echo "=== Starting YOLO+Grasp (in /arm) ==="
 OMP_NUM_THREADS=2 ros2 run agx_arm_vision yolo_grasp \
   --ros-args -r __ns:=/arm \
   -p base_frame:=arm/base_link \
-  -p camera_optical_frame:=arm/camera_color_optical_frame &>/tmp/yolo.log &
+  -p camera_optical_frame:=arm/camera_color_optical_frame \
+  -p publish_viz:=false &>/tmp/yolo.log &
 YOLO_PID=$!
 echo "  yolo_grasp PID=$YOLO_PID"
 
@@ -171,7 +172,8 @@ OPENBLAS_NUM_THREADS=2 ros2 run agx_arm_vision place_planner \
   -p base_frame:=arm/base_link \
   -p end_effector_link:=arm/tcp_link \
   -p camera_optical_frame:=arm/camera_color_optical_frame \
-  -p process_period:=1.0 &>/tmp/place.log &
+  -p process_period:=1.0 \
+  -p publish_viz:=false &>/tmp/place.log &
 PLACE_PID=$!
 echo "  place_planner PID=$PLACE_PID"
 
@@ -181,7 +183,8 @@ echo "=== Starting grasp executor (in /arm) ==="
 ros2 run agx_arm_vision grasp_executor \
   --ros-args -r __ns:=/arm \
   -p base_link:=arm/base_link \
-  -p end_effector_link:=arm/tcp_link &>/tmp/grasp.log &
+  -p end_effector_link:=arm/tcp_link \
+  -p publish_viz:=false &>/tmp/grasp.log &
 GRASP_PID=$!
 echo "  grasp_executor PID=$GRASP_PID"
 
@@ -190,7 +193,9 @@ ros2 run agx_arm_vision shelf_workflow \
   --ros-args -r __ns:=/arm \
   -p base_frame:=arm/base_link \
   -p end_effector_link:=arm/tcp_link \
-  -p camera_frame:=arm/camera_color_optical_frame &>/tmp/shelf.log &
+  -p camera_frame:=arm/camera_color_optical_frame \
+  -p publish_viz:=false \
+  -p depth_mon_enable:=false &>/tmp/shelf.log &
 SHELF_PID=$!
 echo "  shelf_workflow PID=$SHELF_PID"
 
