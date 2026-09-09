@@ -28,9 +28,11 @@ for i in $(seq 1 20); do
     sleep 1
 done
 
-echo "=== Auto-detecting arm CAN port (retry up to 6 x 10s) ==="
+echo "=== Auto-detecting arm CAN port (常驻等待，上电自动接管) ==="
 CAN_PORT=""
-for attempt in $(seq 1 6); do
+cycle=0
+while [ -z "$CAN_PORT" ]; do
+    cycle=$((cycle + 1))
     for iface in can0 can1; do
         sudo ip link set $iface down 2>/dev/null || true
         sudo ip link set $iface up type can bitrate 1000000 2>/dev/null || true
@@ -72,14 +74,14 @@ arm.disconnect()
         fi
     done
     [ -n "$CAN_PORT" ] && break
-    echo "  no arm yet (attempt $attempt/6); waiting 10s..."
-    sleep 10
+    WAIT_MIN=$((cycle * 20 / 60))
+    if (( cycle % 15 == 0 )); then
+        echo "[wait] arm not found after ~${WAIT_MIN} min; waiting for power/USB-CAN..."
+    else
+        echo "  no arm yet (cycle $cycle, ~${WAIT_MIN} min); waiting 20s..."
+    fi
+    sleep 20
 done
-
-if [ -z "$CAN_PORT" ]; then
-    echo "ERROR: cannot find arm after 6 retries"
-    exit 1
-fi
 
 echo "=== Resetting CAN port state ==="
 sudo ip link set $CAN_PORT down 2>/dev/null || true
@@ -111,7 +113,7 @@ ros2 launch agx_arm_ctrl start_single_agx_arm_moveit.launch.py \
   effector_type:=agx_gripper \
   auto_enable:=true \
   auto_control_gate:=true \
-  speed_percent:=10 \
+  speed_percent:=20 \
   fw_version:=v111 \
   auto_home:=true \
   use_rviz:=false \

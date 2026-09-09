@@ -108,7 +108,7 @@ ros2 launch agx_arm_ctrl start_single_agx_arm_moveit.launch.py \
   effector_type:=agx_gripper \
   auto_enable:=true \
   auto_control_gate:=true \
-  speed_percent:=10 \
+  speed_percent:=20 \
   fw_version:=v111 \
   auto_home:=true \
   use_rviz:=false \

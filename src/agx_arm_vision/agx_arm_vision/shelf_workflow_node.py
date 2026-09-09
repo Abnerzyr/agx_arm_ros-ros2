@@ -136,7 +136,7 @@ class ShelfWorkflowNode(Node):
         self.declare_parameter('report_topic', '/arm_task_report')
         self.declare_parameter('report_interval', 3.0)     # STOW 周期上报 (s)
         self.declare_parameter('stow_joint_tol', 0.12)     # STOW 关节 home 容差 (rad)
-        self.declare_parameter('task_watchdog', 75.0)      # 任务总时长上限 (s)
+        self.declare_parameter('task_watchdog', 85.0)      # 任务总时长上限 (s)
         # 目标合理性过滤（skip_align 无 aruco 时替代桌面 z 参考）
         self.declare_parameter('grasp_max_reach', 0.85)    # base 系水平可达上限 (m)
         self.declare_parameter('grasp_z_tol', 0.03)        # 相对 z 参考的容差 (m)
