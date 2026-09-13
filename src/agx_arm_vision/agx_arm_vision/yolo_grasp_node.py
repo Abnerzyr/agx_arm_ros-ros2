@@ -155,6 +155,7 @@ class YoloGraspNode(Node):
         self._joint_stable = False
         self._joint_stable_ticks = 0
         self._joint_last_feedback = 0.0
+        self._joint_cb_last = 0.0
         self._joint_prev = None
         self._vision_gate = True
         self._gate_last = 0.0
@@ -190,6 +191,8 @@ class YoloGraspNode(Node):
         self.grconv = self._load_grconv()
         self.get_logger().info('GR-ConvNet loaded')
 
+        # 常驻订阅：门控只在回调内提前 return，避免运行中 destroy_subscription
+        # 触发 rclpy InvalidHandle（执行器 ready 集合仍持有已销毁句柄）。
         self.create_subscription(
             Image, self.get_parameter('depth_topic').value,
             self.depth_callback, 10)
@@ -290,11 +293,17 @@ class YoloGraspNode(Node):
         self.camera_info = msg
 
     def depth_callback(self, msg):
+        # 视觉门控：非检测窗口不解码深度(省反序列化后的图像转换开销)
+        if not self._vision_gate:
+            return
         self.depth_img = self.bridge.imgmsg_to_cv2(msg, 'passthrough')
         self.depth_stamp = msg.header.stamp
         self._last_depth_time = self.get_clock().now().nanoseconds * 1e-9
 
     def rgb_callback(self, msg):
+        # 视觉门控：非检测窗口不解码 RGB
+        if not self._vision_gate:
+            return
         self.rgb_img = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
 
     def map_update_cb(self, msg):
@@ -302,6 +311,11 @@ class YoloGraspNode(Node):
         self._last_map_msg_time = self.get_clock().now().nanoseconds * 1e-9
 
     def joint_state_cb(self, msg):
+        # 高频反馈节流：≤20Hz 处理即可(关节稳定判定 0.2s 采样)
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if now - self._joint_cb_last < 0.05:
+            return
+        self._joint_cb_last = now
         names = ['joint1', 'joint2', 'joint3', 'joint4',
                  'joint5', 'joint6', 'joint7']
         if self._joint_pos is None:
@@ -311,7 +325,7 @@ class YoloGraspNode(Node):
                 idx = msg.name.index(name)
                 if idx < len(msg.position):
                     self._joint_pos[n] = msg.position[idx]
-        self._joint_last_feedback = self.get_clock().now().nanoseconds * 1e-9
+        self._joint_last_feedback = now
 
     def _joint_stability_update(self):
         """0.2s 采样关节：delta<0.01rad 连续 3 次判定稳定。"""
@@ -449,6 +463,8 @@ class YoloGraspNode(Node):
         """shelf_workflow 门控：False 时跳过 YOLO 推理省 CPU。"""
         self._vision_gate = bool(msg.data)
         self._gate_last = self.get_clock().now().nanoseconds * 1e-9
+        # 注：订阅保持常驻，仅靠 depth/rgb 回调内的 gate 判断省转换开销；
+        # 不再在回调中动态 destroy/create 订阅（会触发 rclpy InvalidHandle）。
 
     def process(self):
         now = self.get_clock().now().nanoseconds * 1e-9

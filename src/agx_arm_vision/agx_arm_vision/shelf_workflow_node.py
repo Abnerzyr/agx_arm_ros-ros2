@@ -111,21 +111,22 @@ class ShelfWorkflowNode(Node):
         self.declare_parameter('aruco_timeout', 5.0)
         self.declare_parameter('align_give_up_timeout', 15.0)
         self.declare_parameter('grasp_fail_timeout', 20.0)
-        self.declare_parameter('grasp_give_up_timeout', 90.0)
-        self.declare_parameter('place_give_up_timeout', 90.0)
-        self.declare_parameter('place_pose_wait_timeout', 30.0)
+        self.declare_parameter('grasp_give_up_timeout', 130.0)
+        self.declare_parameter('place_give_up_timeout', 130.0)
+        self.declare_parameter('place_pose_wait_timeout', 15.0)
         self.declare_parameter('detect_timeout', 5.0)
         self.declare_parameter('detect_give_up_timeout', 15.0)
         self.declare_parameter('grasp_max_retries', 3)
         self.declare_parameter('target_z_min', 0.01)
         self.declare_parameter('target_z_max', 0.35)
-        self.declare_parameter('ret_home_timeout', 90.0)
+        self.declare_parameter('ret_home_timeout', 130.0)
         self.declare_parameter('ret_home_exec_wait', 60.0)
         self.declare_parameter('align_settle_time', 3.0)
         self.declare_parameter('box_stable_tol', 0.05)
         self.declare_parameter('align_max_iter', 2)
         self.declare_parameter('skip_nominal', False)
         self.declare_parameter('skip_align', True)
+        self.declare_parameter('place_skip', False)
         self.declare_parameter('align_dist', 0.4)
         self.declare_parameter('align_dist_tol', 0.05)
         self.declare_parameter('align_center_tol', 0.05)
@@ -139,7 +140,7 @@ class ShelfWorkflowNode(Node):
         self.declare_parameter('report_topic', '/arm_task_report')
         self.declare_parameter('report_interval', 3.0)     # STOW 周期上报 (s)
         self.declare_parameter('stow_joint_tol', 0.12)     # STOW 关节 home 容差 (rad)
-        self.declare_parameter('task_watchdog', 85.0)      # 任务总时长上限 (s)
+        self.declare_parameter('task_watchdog', 125.0)     # 任务总时长上限 (s)
         # 目标合理性过滤（skip_align 无 aruco 时替代桌面 z 参考）
         self.declare_parameter('grasp_max_reach', 0.85)    # base 系水平可达上限 (m)
         self.declare_parameter('grasp_z_tol', 0.03)        # 相对 z 参考的容差 (m)
@@ -194,6 +195,7 @@ class ShelfWorkflowNode(Node):
         self.align_max_iter = self.get_parameter('align_max_iter').value
         self.skip_nominal = bool(self.get_parameter('skip_nominal').value)
         self.skip_align = bool(self.get_parameter('skip_align').value)
+        self.place_skip = bool(self.get_parameter('place_skip').value)
         self.align_dist = float(self.get_parameter('align_dist').value)
         self.align_dist_tol = float(
             self.get_parameter('align_dist_tol').value)
@@ -283,12 +285,9 @@ class ShelfWorkflowNode(Node):
             Empty, 'shelf/skip_align', self.skip_align_cb, 10)
         self.create_subscription(
             Empty, 'shelf/preset_home', self.preset_home_cb, 10)
-        # 深度停滞监测（诊断用）：订阅对齐深度，只记到达时刻
+        # 深度停滞监测（诊断用）：动态订阅——仅在检测/抓取窗口内订阅深度，
+        # 平时(导航/待命)不订阅，省去整帧深度反序列化开销。depth_mon_enable 为总允许位。
         self._depth_mon_sub = None
-        if self.depth_mon_enable:
-            self._depth_mon_sub = self.create_subscription(
-                Image, '/camera/camera/aligned_depth_to_color/image_raw',
-                self.depth_mon_cb, 1)
         # 关节状态（用于"臂稳定才规划下一动"）
         self.create_subscription(
             JointState, 'feedback/joint_states', self.joint_state_cb, 10)
@@ -336,6 +335,7 @@ class ShelfWorkflowNode(Node):
         self._joint_prev = None
         self._joint_stable_ticks = 0
         self._joint_last_feedback = 0.0
+        self._joint_cb_last = 0.0
         self._joint_stable = False
         self._align_stable_logged = 0.0
         self._latest_grasp_pt = None
@@ -486,6 +486,11 @@ class ShelfWorkflowNode(Node):
         self._depth_arrival = self.get_clock().now().nanoseconds * 1e-9
 
     def joint_state_cb(self, msg):
+        # 高频反馈节流：≤20Hz 处理即可(关节稳定判定 0.2s 采样)
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if now - self._joint_cb_last < 0.05:
+            return
+        self._joint_cb_last = now
         names = ['joint1', 'joint2', 'joint3', 'joint4',
                  'joint5', 'joint6', 'joint7']
         if self._joint_pos is None:
@@ -495,7 +500,7 @@ class ShelfWorkflowNode(Node):
                 idx = msg.name.index(name)
                 if idx < len(msg.position):
                     self._joint_pos[n] = msg.position[idx]
-        self._joint_last_feedback = self.get_clock().now().nanoseconds * 1e-9
+        self._joint_last_feedback = now
 
     def _joint_stability_update(self):
         """0.2s 采样关节：delta<0.01rad 连续 3 次判定稳定。"""
@@ -528,6 +533,11 @@ class ShelfWorkflowNode(Node):
     def _start_depth_monitor(self):
         if not self.depth_mon_enable:
             return
+        # 动态订阅：进入检测/抓取窗口才订阅深度（平时不订阅省 CPU）
+        if self._depth_mon_sub is None:
+            self._depth_mon_sub = self.create_subscription(
+                Image, '/camera/camera/aligned_depth_to_color/image_raw',
+                self.depth_mon_cb, 1)
         self._depth_arrival = self.get_clock().now().nanoseconds * 1e-9
         self._depth_mon_on = True
         self._depth_mon_start = self._depth_arrival
@@ -567,6 +577,10 @@ class ShelfWorkflowNode(Node):
                     f'(gap now {gap:.2f}s)')
 
     def _stop_depth_monitor(self):
+        # 动态退订：离开检测/抓取窗口即释放深度订阅
+        if self._depth_mon_sub is not None:
+            self.destroy_subscription(self._depth_mon_sub)
+            self._depth_mon_sub = None
         if not self._depth_mon_on:
             return
         self._depth_mon_on = False
@@ -1497,6 +1511,14 @@ class ShelfWorkflowNode(Node):
 
         if self.state == self.WAIT_RELEASE_CMD:
             if self._release_pending and not self._release_armed:
+                if self.place_skip:
+                    # skip 放置：无需 /place_pose，收到 release_command 立即触发
+                    self._release_pending = False
+                    self.get_logger().info(
+                        'place_skip=True: firing release immediately '
+                        '(skip place algorithm)')
+                    self._fire_release()
+                    return
                 self._arm_place_release()
             if self._release_armed:
                 # 等到 place_planner 使能后产出新 pose，再真正触发放物
@@ -1509,23 +1531,13 @@ class ShelfWorkflowNode(Node):
                     return
                 if (now - self._release_wait_start
                         > self.place_pose_wait_timeout):
-                    # 30s 仍无新 pose（识别/计算/相机延迟）→ 记为超时失败：
-                    # 原地松爪让 executor 回 IDLE，再收臂回 home 并上报失败
-                    if self._executor_state == self.EXECUTOR_WAIT_RELEASE \
-                            and not self._release_force_sent:
-                        self._release_force_sent = True
-                        self.release_force_pub.publish(Empty())
-                        self.get_logger().warning(
-                            'No place pose within %.0fs; force-opening '
-                            'gripper before abort'
-                            % self.place_pose_wait_timeout)
-                        return
-                    if self._executor_state == self.EXECUTOR_IDLE:
-                        self._release_pending = False
-                        self._release_armed = False
-                        self._abort_task(
-                            7, 'place planner produced no pose within '
-                               '%.0fs' % self.place_pose_wait_timeout)
+                    # 15s 内仍无可用 /place_pose → 回退硬编码 skip 放置
+                    self.get_logger().warning(
+                        'No place pose within %.0fs; falling back to SKIP '
+                        'place' % self.place_pose_wait_timeout)
+                    self._release_pending = False
+                    self._release_armed = False
+                    self._fire_release()
                     return
             return
 

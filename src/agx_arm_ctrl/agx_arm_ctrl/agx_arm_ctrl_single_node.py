@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*-coding:utf8-*-
 import time
+import subprocess
 import rclpy
 import math
 import re
@@ -79,6 +80,8 @@ class AgxArmRosNode(Node):
         ### AgxArmFactory
         self._reconnect_since = None
         self._reconnecting = False
+        self._reconnect_attempts = 0
+        self._not_conn_log_time = 0.0
         self._arm_driver = None
         self._init_agx_arm()
 
@@ -112,6 +115,7 @@ class AgxArmRosNode(Node):
     ### initialization methods
     def _declare_parameters(self):
         self.declare_parameter("can_port", "can0")
+        self.declare_parameter("can_bitrate", 1000000)
         self.declare_parameter("arm_type", "piper")
         self.declare_parameter("auto_enable", True)
         self.declare_parameter("fast_mode", False)
@@ -131,6 +135,7 @@ class AgxArmRosNode(Node):
 
     def _load_parameters(self):
         self.can_port = self.get_parameter("can_port").value
+        self.can_bitrate = int(self.get_parameter("can_bitrate").value)
         self.arm_type = self.get_parameter("arm_type").value
         self.auto_enable = self.get_parameter("auto_enable").value
         self.fast_mode = self.get_parameter("fast_mode").value
@@ -423,13 +428,32 @@ class AgxArmRosNode(Node):
             return False
         return True
 
+    def _arm_healthy(self) -> bool:
+        """基于反馈新鲜度判定臂健康：socket 活着且最近有有效关节反馈。
+
+        is_ok() 由 FPS 队列判定，臂停发后存在滞后；这里额外要求反馈 hz>0，
+        失连/无反馈时立即判不健康，从而进入 down/up+重连恢复。
+        """
+        try:
+            if not self.agx_arm.is_ok():
+                return False
+            js = self.agx_arm.get_joint_angles()
+        except Exception:  # noqa: BLE001
+            return False
+        if js is None or js.hz <= 0:
+            return False
+        return True
+
     def _check_can_control(self, check_gate: bool = True) -> bool:
         if not self.control_ready:
             # Startup warm-up: ignore incoming control commands until a valid
             # joint state stream is available.
             return False
         if not self._check_arm_ready():
-            self.get_logger().warn("Agx_arm is not connected, cannot control")
+            now_t = time.time()
+            if now_t - self._not_conn_log_time > 5.0:
+                self._not_conn_log_time = now_t
+                self.get_logger().warn("Agx_arm is not connected, cannot control")
             return False
         if not self.enable_flag:
             self.get_logger().warn("Agx_arm is not enabled, cannot control")
@@ -507,12 +531,36 @@ class AgxArmRosNode(Node):
         return True
 
     ### publisher thread
+    def _reset_can_link(self):
+        """断连恢复：对该 CAN 口 down/up 复位刷新（走 sudo 白名单）。"""
+        try:
+            self.get_logger().warn(
+                f'Resetting CAN link {self.can_port} (down/up) ...')
+            subprocess.run(
+                ['/usr/bin/sudo', '/sbin/ip', 'link', 'set',
+                 self.can_port, 'down'],
+                check=False, capture_output=True, timeout=10.0)
+            time.sleep(0.3)
+            subprocess.run(
+                ['/usr/bin/sudo', '/sbin/ip', 'link', 'set',
+                 self.can_port, 'up', 'type', 'can',
+                 'bitrate', str(self.can_bitrate)],
+                check=False, capture_output=True, timeout=10.0)
+            time.sleep(1.0)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(
+                f'CAN link reset failed (continue anyway): {exc}')
+
     def _reconnect_arm(self):
-        """失连自愈：断开重建 pyAgxArm 连接并重新使能电机。"""
+        """失连自愈：先 down/up 复位 CAN 口，再断开重建 pyAgxArm 连接并重新使能。"""
         if self._reconnecting:
             return
         self._reconnecting = True
-        self.get_logger().warn('Arm feedback lost; reconnecting arm connection...')
+        self._reconnect_attempts += 1
+        self._reset_can_link()
+        self.get_logger().warn(
+            f'Arm feedback lost; reconnecting arm connection... '
+            f'(attempt {self._reconnect_attempts})')
         try:
             try:
                 self.agx_arm.disconnect()
@@ -544,6 +592,7 @@ class AgxArmRosNode(Node):
                 self.enable_flag = True
                 self.control_ready = False
                 self._control_ready_logged = False
+                self._reconnect_attempts = 0
                 self.get_logger().info('Arm reconnected and enabled OK')
             else:
                 self.get_logger().error('Reconnect: arm enable failed')
@@ -558,8 +607,9 @@ class AgxArmRosNode(Node):
 
         # publishing loop
         while rclpy.ok():
-            if self.agx_arm.is_ok():
+            if self._arm_healthy():
                 self._reconnect_since = None
+                self._reconnect_attempts = 0
                 if not self.control_ready and self._check_arm_ready():
                     self.control_ready = True
                     if not self._control_ready_logged:
@@ -571,7 +621,7 @@ class AgxArmRosNode(Node):
                 self._publish_effector_status()
                 self._publish_leader_joint_states()
             else:
-                # 失连自愈：持续收不到反馈则重连+重新使能，避免永久空转
+                # 失连自愈：找不到就一直轮询重连（每 5s 试一次，直到恢复）
                 now = time.time()
                 if self._reconnect_since is None:
                     self._reconnect_since = now

@@ -65,10 +65,10 @@ class PlacePlanner(Node):
         # 兜底：从未收到过门控消息 → 视为使能，保持独立运行行为不变。
         self._plan_gate = True
         self._plan_gate_seen = False
-
-        self.create_subscription(
-            Image, self.get_parameter('depth_topic').value,
-            self.depth_callback, 10)
+        self._depth_topic = self.get_parameter('depth_topic').value
+        self._depth_sub = None
+        # 默认订阅(未收到门控也能独立运行)；收到 place_plan_enable=False 会动态退订省 CPU
+        self._set_depth_sub(True)
         self.create_subscription(
             CameraInfo, self.get_parameter('info_topic').value,
             self.info_callback, 10)
@@ -92,6 +92,9 @@ class PlacePlanner(Node):
         self.camera_info = msg
 
     def depth_callback(self, msg):
+        # 放置门控：非放物窗口不解码深度(省图像转换开销)
+        if self._plan_gate_seen and not self._plan_gate:
+            return
         self.depth_img = self.bridge.imgmsg_to_cv2(msg, 'passthrough')
         self.depth_stamp = msg.header.stamp
 
@@ -103,6 +106,28 @@ class PlacePlanner(Node):
         """shelf_workflow 放物门控：false 时跳过 RANSAC/选点/发布省 CPU。"""
         self._plan_gate_seen = True
         self._plan_gate = bool(msg.data)
+        # 动态订阅/退订深度：非放物窗口退订，省整帧反序列化开销
+        if self._plan_gate:
+            if self._depth_sub is None:
+                self._set_depth_sub(True)
+        else:
+            if self._depth_sub is not None:
+                self._set_depth_sub(False)
+
+    def _set_depth_sub(self, on):
+        """按门控动态创建/销毁深度订阅（省 CPU）。"""
+        if on:
+            if self._depth_sub is None:
+                self._depth_sub = self.create_subscription(
+                    Image, self._depth_topic, self.depth_callback, 10)
+        else:
+            if self._depth_sub is not None:
+                self.destroy_subscription(self._depth_sub)
+                self._depth_sub = None
+            # 清缓存：恢复时等新帧
+            self.depth_img = None
+            self.depth_stamp = None
+
 
     def _cloud_gate(self):
         return self._place_enabled

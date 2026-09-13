@@ -32,6 +32,7 @@ class GraspExecutor(Node):
     PLACE_LIFT = 10
     LIFT_VERIFY = 11
     CARTESIAN_APPROACH = 12
+    PLACE_SKIP_MOVE = 13
 
     BOX_PAIR_WINDOW = 2.0
 
@@ -66,6 +67,7 @@ class GraspExecutor(Node):
         self.declare_parameter('place_z_margin', 0.015)
         self.declare_parameter('place_pose_timeout', 30.0)
         self.declare_parameter('place_lower_timeout', 20.0)
+        self.declare_parameter('place_validate_timeout', 15.0)
         self.declare_parameter('place_max_retries', 5)
         self.declare_parameter(
             'filtered_cloud_topic', 'filtered_cloud')
@@ -87,6 +89,10 @@ class GraspExecutor(Node):
         self.declare_parameter('lift_approach', 1)
         # place_approach: 1=放置下降一步直达 home->target、回升直接回 home
         self.declare_parameter('place_approach', 1)
+        # place_skip: 放置跳过正常算法——直接移到"低层精对准硬编码关节位"(j1 用 home 的 j1)后松爪。
+        #   true : 收到 /manual_release 即走 skip（不依赖 /place_pose）
+        #   false: 先正常放置；规划失败重试 2 次仍失败 → 回退走 skip
+        self.declare_parameter('place_skip', False)
         # 直线接近(硬编码精对准模式): 收到 grasp 指令后按笛卡尔直线水平移到目标 x/y，
         # z 与姿态取当前(精对准位)；avoid_collisions=False；只校验 base_link 下 x/y。
         self.declare_parameter('direct_line_approach', True)
@@ -132,6 +138,8 @@ class GraspExecutor(Node):
             'place_pose_timeout').value
         self.place_lower_timeout = self.get_parameter(
             'place_lower_timeout').value
+        self.place_validate_timeout = float(self.get_parameter(
+            'place_validate_timeout').value)
         self.place_max_retries = int(self.get_parameter(
             'place_max_retries').value)
         self.home_joints = self.get_parameter('home_joints').value
@@ -154,6 +162,7 @@ class GraspExecutor(Node):
             'lift_approach').value)
         self.place_approach = int(self.get_parameter(
             'place_approach').value)
+        self.place_skip = bool(self.get_parameter('place_skip').value)
         self.direct_line_approach = bool(
             self.get_parameter('direct_line_approach').value)
         self.direct_xy_tol = float(
@@ -200,6 +209,7 @@ class GraspExecutor(Node):
         self._prev_tick_joints = None
         self._joint_stable_ticks = 0
         self._last_joint_feedback = 0.0
+        self._joint_cb_last = 0.0
         self._last_joint_delta = 0.0
         self._validation_sent = False
         self._stable_wait_logged = False
@@ -253,6 +263,15 @@ class GraspExecutor(Node):
         self._place_abort_open = False
         self._place_attempt = 0
         self._place_retry_state = None
+        self._place_validation_start = 0.0
+        self._place_skip_active = False
+        # SKIP 期间保持 octomap 清空：上次清空请求时间 / 是否已确认清空
+        self._skip_octo_clear_t = 0.0
+        self._skip_octo_cleared = False
+        # 低层精对准硬编码关节位(layer 1 的 LAYER_PRE_GRASP_JOINTS)，j1 用 home 的 j1
+        self._place_skip_joints = [
+            -0.0092, 0.703, 0.0147, 2.0302, 0.0034, -0.0134, -1.1184]
+        self._place_skip_joints[0] = float(self.home_joints[0])
         self.state_pub = self.create_publisher(
             Int32, 'grasp_executor_state', 10)
         self.map_update_pub = self.create_publisher(
@@ -507,6 +526,9 @@ class GraspExecutor(Node):
         self._place_rebuild_done = False
         self._place_validation_sent = False
         self._place_cycle_home = False
+        self._place_skip_active = False
+        self._skip_octo_clear_t = 0.0
+        self._skip_octo_cleared = False
         self._place_abort_open = False
         self._grasp_result_published = False
         self._grasp_only_drop = False
@@ -544,15 +566,20 @@ class GraspExecutor(Node):
         del msg
         if self.state != self.WAIT_RELEASE or self._place_validating:
             return
+        if self.place_skip:
+            # skip 放置：不需要 /place_pose，直接去硬编码精对准位后松爪
+            self._start_place_skip()
+            return
         now = self.get_clock().now().nanoseconds * 1e-9
         if (self._latest_place_pose is None
                 or now - self._latest_place_pose[0] > self.place_pose_timeout):
+            # 无新鲜 /place_pose（15s 内没有可用放置点）→ 直接走硬编码 skip
             self.get_logger().warning(
-                'No fresh /place_pose; staying in WAIT_RELEASE. '
-                'Retry /manual_release or use /manual_release_force')
+                'No fresh /place_pose; falling back to SKIP place')
             self._place_validating = False
-            self.triggered = False
+            self._place_retry_state = None
             self._auto_release_sent = False
+            self._start_place_skip()
             return
         p = self._latest_place_pose[1].pose
         self._place_frame = self._latest_place_pose[1].header.frame_id
@@ -586,6 +613,20 @@ class GraspExecutor(Node):
             f'grasp_offset={self.grasp_offset:.3f} '
             f'place_z={self._place_z:.3f}')
 
+    def _start_place_skip(self):
+        """进入 skip 放置：直接移到低层精对准硬编码关节位(j1=home)后松爪。"""
+        self._place_skip_active = True
+        self._skip_octo_clear_t = 0.0
+        self._skip_octo_cleared = False
+        self._place_validating = False
+        self._place_retry_state = None
+        self._place_cycle_home = False
+        self.triggered = False
+        self.state = self.PLACE_SKIP_MOVE
+        self.get_logger().info(
+            'Place SKIP: move to hardcoded pre-grasp joints '
+            f'(j1={self._place_skip_joints[0]:.4f} from home), then release')
+
     def manual_release_force_cb(self, msg):
         """Force release: open the gripper wherever the arm currently is.
 
@@ -603,6 +644,11 @@ class GraspExecutor(Node):
         self.gripper.feedback(msg.width, msg.force)
 
     def joint_feedback_cb(self, msg):
+        # 高频反馈节流：≤20Hz 处理即可(关节稳定判定 0.2s 采样)
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if now - self._joint_cb_last < 0.05:
+            return
+        self._joint_cb_last = now
         names = ['joint1', 'joint2', 'joint3', 'joint4',
                  'joint5', 'joint6', 'joint7']
         for n, name in enumerate(names):
@@ -610,7 +656,7 @@ class GraspExecutor(Node):
                 idx = msg.name.index(name)
                 if idx < len(msg.position):
                     self.current_joints[n] = msg.position[idx]
-        self._last_joint_feedback = self.get_clock().now().nanoseconds * 1e-9
+        self._last_joint_feedback = now
 
     def tick(self):
         self.state_pub.publish(Int32(data=self.state))
@@ -625,6 +671,23 @@ class GraspExecutor(Node):
             and not self._place_rebuild_done
             and not self._place_validation_sent)
         self.place_update_pub.publish(place_update)
+        # SKIP 全程保持 octomap 清空：进入即清，之后每 0.5s 重清一次，
+        # 保证 SKIP 期间没有任何点云刷新规划场景（跳过 octomap）。
+        if (self._place_skip_active
+                and self.state in (self.PLACE_SKIP_MOVE, self.PLACE_OPEN)):
+            now_skip = self.get_clock().now().nanoseconds * 1e-9
+            if self._skip_octo_clear_t == 0.0:
+                self._skip_octo_clear_t = now_skip
+                self._call_clear(verbose=False)
+            elif now_skip - self._skip_octo_clear_t >= 0.5:
+                if self._skip_octo_cleared:
+                    self._skip_octo_clear_t = now_skip
+                    self._call_clear(verbose=False)
+                elif not self._clear_pending:
+                    self._call_clear(verbose=False)
+            if (not self._skip_octo_cleared
+                    and self._clear_done_time >= self._skip_octo_clear_t):
+                self._skip_octo_cleared = True
         if self.publish_viz:
             if self.stored_pose is not None:
                 display = PoseStamped()
@@ -1148,7 +1211,7 @@ class GraspExecutor(Node):
                     else:
                         elapsed = (self.get_clock().now().nanoseconds * 1e-9
                                    - self.home_start_time)
-                        if elapsed > 90.0:
+                        if elapsed > 130.0:
                             self._mark('home_timeout')
                             self.get_logger().warning(
                                 'Home move timeout, '
@@ -1171,9 +1234,9 @@ class GraspExecutor(Node):
                 self.get_logger().info('[TESTFLOW] auto release')
                 self.manual_release_cb(EmptyMsg())
             if self._place_validating:
+                now_place = (
+                    self.get_clock().now().nanoseconds * 1e-9)
                 if not self._place_rebuild_done:
-                    now_place = (
-                        self.get_clock().now().nanoseconds * 1e-9)
                     if self._place_clear_time is None:
                         self._place_clear_time = now_place
                         self._call_clear()
@@ -1213,12 +1276,22 @@ class GraspExecutor(Node):
                         self._log_stable_wait()
                         return
                     self._place_validation_sent = True
+                    self._place_validation_start = now_place
                     self._mark('place_validate_sent')
                     self.arm.move_to_pose(
                         self._place_target_pose, self._place_frame,
                         plan_only=True)
                     return
                 if not self.arm.is_done():
+                    now_v = self.get_clock().now().nanoseconds * 1e-9
+                    if (now_v - self._place_validation_start
+                            > self.place_validate_timeout):
+                        self.get_logger().warning(
+                            'Place validation plan timed out; '
+                            'falling back to SKIP place')
+                        self._place_validating = False
+                        self._place_validation_sent = False
+                        self._start_place_skip()
                     return
                 self._place_validating = False
                 if self.arm.success:
@@ -1235,9 +1308,44 @@ class GraspExecutor(Node):
                 else:
                     self._mark('place_validate_failed')
                     self.get_logger().warning(
-                        'Place point unreachable; staying in WAIT_RELEASE. '
-                        'Retry /manual_release or use /manual_release_force')
+                        'Place point unreachable; falling back to SKIP place')
+                    self._place_validation_sent = False
+                    self._start_place_skip()
+            return
+        if self.state == self.PLACE_SKIP_MOVE:
+            if not self.triggered:
+                # SKIP 跳过 octomap：等首次清空确认(或超时)后再规划
+                now_skip = self.get_clock().now().nanoseconds * 1e-9
+                if self._skip_octo_clear_t == 0.0:
+                    return
+                if not self._skip_octo_cleared:
+                    if (now_skip - self._skip_octo_clear_t
+                            < self.rebuild_timeout):
+                        return
+                    self.get_logger().warning(
+                        'Place SKIP: octomap clear timeout; planning anyway')
+                if not self._joints_stable():
+                    self._log_stable_wait()
+                    return
+                self._mark('place_skip_sent')
+                self.get_logger().info(
+                    'Place SKIP: moving to pre-grasp joints (j1=home) '
+                    '(octomap kept clear)')
+                self.arm.move_to_joints(
+                    self._place_skip_joints,
+                    velocity_scaling=self.velocity_scaling)
+                self.triggered = True
+            elif self.arm.is_done():
+                if self.arm.success:
+                    self.get_logger().info(
+                        'Place SKIP: reached; opening gripper')
+                    self.state = self.PLACE_OPEN
                     self.triggered = False
+                else:
+                    self.get_logger().error(
+                        'Place SKIP move failed; going home holding; '
+                        'handle manually')
+                    self._place_fail_retry(self.PLACE_SKIP_MOVE)
             return
         if self.state == self.MOVE_TO_PLACE_ABOVE:
             if not self.triggered:
@@ -1297,7 +1405,7 @@ class GraspExecutor(Node):
                 elif elapsed > self.place_lower_timeout:
                     self.get_logger().warning(
                         f'Place reach timeout, error={error}; '
-                        f'retry {self._place_attempt}/{self.place_max_retries}')
+                        'falling back to SKIP place')
                     self._place_fail_retry(self.LOWER_TO_PLACE)
                     self.triggered = False
             return
@@ -1308,6 +1416,12 @@ class GraspExecutor(Node):
             elif self.gripper.done:
                 self._mark('place_opened')
                 self.get_logger().info('Object released at place spot')
+                if self._place_skip_active:
+                    # skip 放置：松爪后直接回 home（不经过 place_above 抬升）
+                    self._place_skip_active = False
+                    self._place_cycle_home = True
+                    self._enter_home()
+                    return
                 self.state = self.PLACE_LIFT
                 self.triggered = False
             return
@@ -1403,25 +1517,17 @@ class GraspExecutor(Node):
         self.state = self.IDLE
 
     def _place_fail_retry(self, failed_state):
-        """放回某步失败：重试（清 octomap→重建→重发该步）或用尽后回家等人工。"""
-        if self._place_attempt < self.place_max_retries:
-            self._place_attempt += 1
-            self._place_retry_state = failed_state
-            self._place_validating = True
-            self._place_rebuild_done = False
-            self._place_validation_sent = False
-            self._place_clear_time = None
-            self.state = self.WAIT_RELEASE
-            self.triggered = False
+        """放置失败：不重试，直接回退 skip（硬编码精对准位）松爪；
+        若 skip 也失败，则回家等人工。"""
+        if not self._place_skip_active:
             self.get_logger().warning(
-                f'Place attempt {self._place_attempt}/'
-                f'{self.place_max_retries} failed; clearing octomap '
-                'and retrying')
+                f'Place step {failed_state} failed; falling back to SKIP '
+                '(hardcoded pre-grasp pose + release)')
+            self._start_place_skip()
         else:
             self.get_logger().error(
-                f'Place failed after {self.place_max_retries} attempts; '
-                'going home holding; handle manually '
-                '(/manual_release or /manual_release_force)')
+                'Place failed even with SKIP; going home holding; '
+                'handle manually (/manual_release or /manual_release_force)')
             self._place_abort_open = True
             self._enter_home()
 

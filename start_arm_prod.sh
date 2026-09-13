@@ -46,22 +46,27 @@ while [ -z "$CAN_PORT" ]; do
         fi
         echo "  $iface: probing..."
         RESULT=$(timeout 8 python3 -c "
-import sys
+import sys, time
 from pyAgxArm import create_agx_arm_config, AgxArmFactory, ArmModel
-for ver in ('default', 'v112'):
+cfg = create_agx_arm_config(robot=ArmModel.NERO, comm='can', channel='$iface')
+arm = AgxArmFactory.create_arm(cfg)
+arm.connect()
+ok = False
+t0 = time.time()
+while time.time() - t0 < 3:
     try:
-        cfg = create_agx_arm_config(robot=ArmModel.NERO, comm='can',
-                                    channel='$iface', firmeware_version=ver)
-        arm = AgxArmFactory.create_arm(cfg)
-        arm.connect()
-        s = arm.get_joints_enable_status_list()
-        arm.disconnect()
-        if isinstance(s, list) and len(s) >= 7:
-            print('OK')
-            sys.exit(0)
+        if hasattr(arm, 'set_normal_mode'):
+            arm.set_normal_mode()
+        if arm.enable():
+            a = arm.get_joint_angles()
+            if a is not None and getattr(a, 'msg', None) is not None:
+                ok = True
+                break
     except Exception:
-        continue
-print('FAIL')
+        pass
+    time.sleep(0.05)
+arm.disconnect()
+print('OK' if ok else 'FAIL')
 " 2>/dev/null || echo 'FAIL')
         if [ "$RESULT" = "OK" ]; then
             CAN_PORT=$iface
@@ -137,8 +142,8 @@ ros2 run realsense2_camera realsense2_camera_node \
   --ros-args -r __node:=camera -r __ns:=/camera \
   -p align_depth.enable:=true \
   -p publish_tf:=false \
-  -p depth_module.profile:=640x480x15 \
-  -p rgb_camera.profile:=640x480x15 \
+  -p depth_module.profile:=640x480x6 \
+  -p rgb_camera.profile:=640x480x6 \
   -p enable_infra1:=false \
   -p enable_infra2:=false &
 CAM_PID=$!
@@ -194,8 +199,7 @@ ros2 run agx_arm_vision shelf_workflow \
   -p base_frame:=arm/base_link \
   -p end_effector_link:=arm/tcp_link \
   -p camera_frame:=arm/camera_color_optical_frame \
-  -p publish_viz:=false \
-  -p depth_mon_enable:=false &>/tmp/shelf.log &
+  -p publish_viz:=false &>/tmp/shelf.log &
 SHELF_PID=$!
 echo "  shelf_workflow PID=$SHELF_PID"
 
